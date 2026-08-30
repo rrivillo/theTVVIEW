@@ -1,0 +1,11 @@
+#EXTM3U
+#EXTVLCOPT:option_sin_extinf=1
+#EXTINF:-1 tvg-id="canal1.es" tvg-name="Canal Uno" tvg-logo="http://logo.example.com/1.png" group-title="Noticias",Canal Uno HD
+#EXTVLCOPT:http-user-agent=theTVVIEW/1.0
+#KODIPROP:inputstream=inputstream.adaptive
+http://stream.example.com/canal1
+#EXTINF:-1 group-title="Música" radio="true",Radio Pop
+http://stream.example.com/radiopop
+#EXTINF:-1 tvg-name="Simpson, Los" custom-tag="xyz",Los Simpson
+http://stream.example.com/simpson
+#EXTINF:-1,Entrada final sin URL

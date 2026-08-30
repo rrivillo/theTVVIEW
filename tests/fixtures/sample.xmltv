@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tv>
+  <channel id="canal1.es">
+    <display-name>Canal Uno</display-name>
+    <icon src="https://example.com/logos/canal1.png"/>
+  </channel>
+  <channel id="radio.pop">
+    <display-name>Radio Pop</display-name>
+    <icon src=""/>
+  </channel>
+  <programme start="20260825080000 +0200" stop="20260825090000 +0200" channel="canal1.es">
+    <title>Titulares</title>
+    <sub-title>Edición matinal</sub-title>
+    <desc>Noticias de la mañana.</desc>
+    <category lang="es">Noticias</category>
+    <category lang="es">Actualidad</category>
+  </programme>
+  <programme start="20260825090000 +0200" channel="canal1.es">
+    <title>Deportes</title>
+    <category lang="es">Deportes</category>
+  </programme>
+  <programme start="20260825083000 +0200" stop="20260825090000 +0200" channel="radio.pop">
+    <title>Canción seguida</title>
+  </programme>
+</tv>

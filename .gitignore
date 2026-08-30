@@ -1,0 +1,39 @@
+# Entorno virtual (en este proyecto vive en .env/)
+.env/
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Datos locales generados por la app
+data/playlists.json
+data/favorites.json
+data/epg_cache/
+
+# Archivos de sistema y editores
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Archivos específicos del proyecto
+peticion.txt
+.opencode/
