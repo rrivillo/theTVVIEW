@@ -11,6 +11,11 @@ TUI (curses) en Python para explorar y reproducir listas IPTV con guía EPG.
 - Reproductor multimedia instalado (mpv, mplayer o vlc).
 - Entorno virtual recomendado (el proyecto usa `.env/`).
 
+## Advertencia
+
+- Éste proyecto recibió asistencia de OpenCode, en su plan free. No lo hizo completo, pero sí ayudó.Sé que harías un mejor trabajo sin IA, así que, sé educado.
+
+
 ## Instalación
 
 ```bash
