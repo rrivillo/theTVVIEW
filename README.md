@@ -26,7 +26,7 @@ cd theTVVIEW
 # Crear entorno virtual (opcional pero recomendado)
 python -m venv .env
 source .env/bin/activate  # Linux/Mac
-# .env\Scripts\activate   # Windows
+# .env\Scripts\activate   # Windows (no he probado en esta plataforma. Usen bajo su propio riesgo). 
 
 # No hay dependencias externas, solo stdlib
 ```
