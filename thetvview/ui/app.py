@@ -140,8 +140,9 @@ class App:
         max_y, max_x = self.stdscr.getmaxyx()
         # Si la pantalla actual necesita search bar, descontar una fila
         has_search = bool(getattr(self.screen, "searching", False) or getattr(self.screen, "query", ""))
-        # Para ChannelsScreen con search visible, usar content_rect
-        if has_search and self.screen.__class__.__name__ == "ChannelsScreen":
+        if has_search and hasattr(self.screen, "visible_keys"):
+            return content_rect(max_y, max_x, has_search=True).h
+        if has_search and hasattr(self.screen, "visible_idx"):
             return content_rect(max_y, max_x, has_search=True).h
         return main_rect(max_y, max_x).h
 
@@ -571,6 +572,7 @@ class App:
             "\n"
             "Playlists: a Añadir · d Borrar · f Favoritos\n"
             "Canales:   / Buscar · g Grupos · f Favorito · e EPG\n"
+            "Grupos:    / Buscar · Enter abrir\n"
             "EPG:       r Recargar · Enter reproducir\n"
             "Resolución/Reproductor: ←/→ o ↑/↓ · Enter confirmar\n"
         )

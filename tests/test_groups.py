@@ -4,11 +4,12 @@ Cubre groups_of() y el filtrado de ChannelsScreen por grupo (incluido
 el caso "sin grupo") sin necesidad de curses.
 """
 
+import curses
 import unittest
 
 from thetvview.groups import groups_of
 from thetvview.models import Channel, Playlist
-from thetvview.ui.screens import ChannelsScreen
+from thetvview.ui.screens import ChannelsScreen, GroupsScreen
 
 
 def ch(name: str, group: str | None = None) -> Channel:
@@ -25,9 +26,19 @@ class _Status:
         self.message = message
 
 
+class _Footer:
+    def show(self, message: str, error: bool = False) -> None:
+        pass
+
+
 class _StubApp:
     favorites = _Fav()
     status = _Status()
+    footer = _Footer()
+    theme_name = "light"
+
+    def __init__(self, max_y: int = 24, max_x: int = 80) -> None:
+        self.stdscr = type("T", (), {"getmaxyx": lambda s: (max_y, max_x)})()
 
     def body_height(self) -> int:
         return 10
@@ -109,6 +120,123 @@ class TestChannelsScreenGroupFilter(unittest.TestCase):
         action = screen.handle_key(ord("g"))
         self.assertEqual(action["action"], "show_groups")
         self.assertIs(action["playlist"], self.playlist)
+
+
+class TestGroupsScreenSearch(unittest.TestCase):
+    def setUp(self):
+        self.playlist = Playlist(
+            name="Test",
+            channels=[
+                ch("Dep 1", "Deportes"),
+                ch("Dep 2 HD", "Deportes"),
+                ch("Nac 1", "Noticias"),
+                ch("Libre"),
+            ],
+        )
+        self.app = _StubApp()
+
+    def test_tecla_slash_activa_busqueda(self):
+        screen = GroupsScreen(self.app, self.playlist)
+        action = screen.handle_key(ord("/"))
+        self.assertIsNone(action)
+        self.assertTrue(screen.searching)
+
+    def test_filtra_grupos_por_nombre(self):
+        screen = GroupsScreen(self.app, self.playlist)
+        screen.searching = True
+        for c in "dep":
+            screen.handle_key(ord(c))
+        self.assertEqual(len(screen.visible_keys), 1)
+        self.assertEqual(screen.visible_keys[0], "Deportes")
+
+    def test_filtra_sin_grupo(self):
+        screen = GroupsScreen(self.app, self.playlist)
+        screen.searching = True
+        for c in "sin":
+            screen.handle_key(ord(c))
+        self.assertEqual(len(screen.visible_keys), 1)
+        self.assertIsNone(screen.visible_keys[0])
+
+    def test_enter_confirma_sale_busqueda(self):
+        screen = GroupsScreen(self.app, self.playlist)
+        screen.searching = True
+        for c in "dep":
+            screen.handle_key(ord(c))
+        screen.handle_key(curses.KEY_ENTER)
+        self.assertFalse(screen.searching)
+        self.assertEqual(len(screen.visible_keys), 1)
+
+    def test_esc_limpia_y_sale(self):
+        screen = GroupsScreen(self.app, self.playlist)
+        screen.searching = True
+        for c in "dep":
+            screen.handle_key(ord(c))
+        screen.handle_key(27)
+        self.assertFalse(screen.searching)
+        self.assertEqual(screen.query, "")
+        self.assertEqual(len(screen.visible_keys), len(screen.keys))
+
+    def test_backspace_borra(self):
+        screen = GroupsScreen(self.app, self.playlist)
+        screen.searching = True
+        for c in "dep":
+            screen.handle_key(ord(c))
+        self.assertEqual(len(screen.visible_keys), 1)
+        screen.handle_key(curses.KEY_BACKSPACE)
+        self.assertEqual(screen.query, "de")
+        self.assertEqual(len(screen.visible_keys), 1)
+        screen.handle_key(curses.KEY_BACKSPACE)
+        screen.handle_key(curses.KEY_BACKSPACE)
+        self.assertEqual(screen.query, "")
+        self.assertEqual(len(screen.visible_keys), len(screen.keys))
+
+    def test_case_insensitive(self):
+        screen = GroupsScreen(self.app, self.playlist)
+        screen.searching = True
+        for c in "DEPORTES":
+            screen.handle_key(ord(c))
+        self.assertEqual(len(screen.visible_keys), 1)
+        self.assertEqual(screen.visible_keys[0], "Deportes")
+
+    def test_shortcuts_cambia_con_searching(self):
+        screen = GroupsScreen(self.app, self.playlist)
+        self.assertIn("/ Buscar", screen.shortcuts())
+        screen.searching = True
+        self.assertIn("Escribir filtra", screen.shortcuts())
+
+    def test_reload_respeta_filtro(self):
+        screen = GroupsScreen(self.app, self.playlist)
+        screen.query = "dep"
+        screen.searching = True
+        screen.reload()
+        self.assertEqual(screen.query, "dep")
+        self.assertEqual(len(screen.visible_keys), 1)
+
+    def test_empty_result_no_explota(self):
+        screen = GroupsScreen(self.app, self.playlist)
+        screen.searching = True
+        for c in "xyz":
+            screen.handle_key(ord(c))
+        self.assertEqual(len(screen.visible_keys), 0)
+        self.assertIsNone(screen.current_group())
+
+    def test_current_group_sobre_visible_keys(self):
+        screen = GroupsScreen(self.app, self.playlist)
+        screen.searching = True
+        for c in "not":
+            screen.handle_key(ord(c))
+        self.assertEqual(screen.current_group(), "Noticias")
+
+    def test_navegacion_grid_en_busqueda(self):
+        """Teclas de dirección navegan sobre visible_keys."""
+        screen = GroupsScreen(self.app, self.playlist)
+        screen.handle_key(ord("/"))  # Activa searching=True
+        # Sin filtro, hay 3 grupos: Deportes, Noticias, None
+        screen.selected = 0
+        screen.handle_key(curses.KEY_DOWN)
+        self.assertEqual(screen.selected, 1)
+        screen.handle_key(curses.KEY_UP)
+        self.assertEqual(screen.selected, 0)
 
 
 if __name__ == "__main__":

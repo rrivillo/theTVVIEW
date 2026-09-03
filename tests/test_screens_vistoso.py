@@ -90,6 +90,53 @@ class TestGroupsScreenCard(unittest.TestCase):
         with mock.patch.object(colors, "pair", return_value=0):
             screen.render(stdscr)
 
+    def test_render_con_search_active(self):
+        stdscr = type("T", (), {
+            "getmaxyx": lambda s: (24, 80),
+            "addstr": lambda s, y, x, t, a=0: None,
+        })()
+        app = _StubApp()
+        pl = Playlist(name="P", channels=[
+            ch("A", "Deportes"), ch("B", "Noticias"), ch("C", "Deportes"),
+        ])
+        screen = GroupsScreen(app, pl)
+        screen.searching = True
+        screen.query = "dep"
+        screen._apply_filter()
+        with mock.patch.object(colors, "pair", return_value=0):
+            screen.render(stdscr)
+
+    def test_render_con_query_sin_resultados(self):
+        stdscr = type("T", (), {
+            "getmaxyx": lambda s: (24, 80),
+            "addstr": lambda s, y, x, t, a=0: None,
+        })()
+        app = _StubApp()
+        pl = Playlist(name="P", channels=[
+            ch("A", "Deportes"), ch("B", "Noticias"),
+        ])
+        screen = GroupsScreen(app, pl)
+        screen.query = "xyz"
+        screen._apply_filter()
+        with mock.patch.object(colors, "pair", return_value=0):
+            screen.render(stdscr)
+
+    def test_render_no_crash_10x40(self):
+        stdscr = type("T", (), {
+            "getmaxyx": lambda s: (10, 40),
+            "addstr": lambda s, y, x, t, a=0: None,
+        })()
+        app = _StubApp(max_y=10, max_x=40)
+        pl = Playlist(name="P", channels=[
+            ch("A", "Deportes"), ch("B", "Noticias"),
+        ])
+        screen = GroupsScreen(app, pl)
+        screen.searching = True
+        screen.query = "dep"
+        screen._apply_filter()
+        with mock.patch.object(colors, "pair", return_value=0):
+            screen.render(stdscr)
+
 
 class TestResolutionScreenPills(unittest.TestCase):
     def test_render_no_crash(self):

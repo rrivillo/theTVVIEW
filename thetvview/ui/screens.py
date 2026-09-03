@@ -803,7 +803,11 @@ class FavoritesScreen(Screen):
 
 
 class GroupsScreen(Screen):
-    """Grupos (group-title) de una playlist — vista cards."""
+    """Grupos (group-title) de una playlist — vista cards.
+
+    '/' activa búsqueda incremental: filtra mientras se escribe; Esc limpia,
+    Enter confirma la consulta y vuelve a navegación normal.
+    """
 
     title = "Grupos"
 
@@ -814,14 +818,32 @@ class GroupsScreen(Screen):
         self.counts: dict[str | None, int] = {}
         self.selected: int = 0
         self._first_row: int = 0
+        self.query: str = ""
+        self.searching: bool = False
+        self.visible_keys: list[str | None] = []
         self.reload()
 
     def reload(self) -> None:
         groups = groups_of(self.playlist.channels)
         self.keys = list(groups)
         self.counts = {k: len(v) for k, v in groups.items()}
-        if self.selected >= len(self.keys):
-            self.selected = max(0, len(self.keys) - 1)
+        self._apply_filter()
+
+    def _apply_filter(self, keep_selection: bool = False) -> None:
+        prev = self.current_group() if keep_selection else None
+        q = self.query.casefold()
+        self.visible_keys = [
+            k for k in self.keys
+            if not q or q in (k or "(sin grupo)").casefold()
+        ]
+        if prev is not None:
+            for pos, k in enumerate(self.visible_keys):
+                if k is prev:
+                    self.selected = pos
+                    self._clamp_scroll()
+                    return
+        if self.selected >= len(self.visible_keys):
+            self.selected = max(0, len(self.visible_keys) - 1)
         self._clamp_scroll()
 
     def _visible_rows(self, max_y: int) -> int:
@@ -838,23 +860,29 @@ class GroupsScreen(Screen):
         """Ajusta _first_row para que selected siempre sea visible."""
         max_y, max_x = self.app.stdscr.getmaxyx()
         cols = 2 if max_x >= 100 else 1
+        search_offset = 1 if (self.searching or self.query) else 0
         rows = self._visible_rows(max_y)
+        max_sel = max(0, len(self.visible_keys) - 1)
+        self.selected = max(0, min(self.selected, max_sel))
         sel_row = self.selected // cols
         if sel_row < self._first_row:
             self._first_row = sel_row
         elif sel_row >= self._first_row + rows:
             self._first_row = sel_row - rows + 1
+        self._first_row = max(0, self._first_row)
 
     def current_group(self) -> str | None:
-        if not self.keys:
+        if not self.visible_keys:
             return None
-        return self.keys[self.selected]
+        return self.visible_keys[self.selected]
 
     def shortcuts(self) -> str:
-        return "↑/↓/←/→ · Enter abrir · t Tema · Esc ←"
+        if self.searching:
+            return "Escribir filtra · Enter confirmar · Esc limpiar"
+        return "↑/↓/←/→ · Enter abrir · / Buscar · t Tema · Esc ←"
 
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
-        if not self.keys:
+        if not self.visible_keys:
             return False
         max_y, max_x = self.app.stdscr.getmaxyx()
         cols = 2 if max_x >= 100 else 1
@@ -863,8 +891,9 @@ class GroupsScreen(Screen):
         total_w = cols * card_w + (cols - 1) * gap
         start_x = max(0, (max_x - total_w) // 2)
         card_h = 4
-        start_y = 1
-        for i, _ in enumerate(self.keys):
+        search_offset = 1 if (self.searching or self.query) else 0
+        start_y = 1 + search_offset
+        for i, _ in enumerate(self.visible_keys):
             row = i // cols
             if row < self._first_row:
                 continue
@@ -877,19 +906,70 @@ class GroupsScreen(Screen):
                 return True
         return False
 
+    def _feed_search(self, key: int) -> dict | None:
+        if key in (curses.KEY_ENTER, 10, 13):
+            self.searching = False
+            self.app.footer.show("")
+            return None
+        if key in (27,):  # Esc: limpia la consulta y sale de búsqueda
+            self.searching = False
+            self.query = ""
+            self._apply_filter()
+            self.app.status.show("Búsqueda limpiada.")
+            self.app.footer.show("Búsqueda limpiada.")
+            return None
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            self.query = self.query[:-1]
+            self._apply_filter(keep_selection=True)
+            return None
+        if key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT,
+                   curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+            cols = 2 if self.app.stdscr.getmaxyx()[1] >= 100 else 1
+            max_sel = max(0, len(self.visible_keys) - 1)
+            if key == curses.KEY_UP:
+                self.selected = max(0, self.selected - cols)
+            elif key == curses.KEY_DOWN:
+                self.selected = min(max_sel, self.selected + cols)
+            elif key == curses.KEY_LEFT:
+                self.selected = max(0, self.selected - 1)
+            elif key == curses.KEY_RIGHT:
+                self.selected = min(max_sel, self.selected + 1)
+            elif key == curses.KEY_PPAGE:
+                rows = self._visible_rows(self.app.stdscr.getmaxyx()[0])
+                self.selected = max(0, self.selected - max(1, rows - 1) * cols)
+            elif key == curses.KEY_NPAGE:
+                rows = self._visible_rows(self.app.stdscr.getmaxyx()[0])
+                self.selected = min(max_sel, self.selected + max(1, rows - 1) * cols)
+            elif key == curses.KEY_HOME:
+                self.selected = 0
+            elif key == curses.KEY_END:
+                self.selected = max_sel
+            self._clamp_scroll()
+            return None
+        if 32 <= key < 127 or key > 160:
+            self.query += chr(key)
+            self._apply_filter(keep_selection=True)
+            return None
+        return None
+
     def handle_key(self, key: int) -> dict | None:
-        if not self.keys:
+        if self.searching:
+            return self._feed_search(key)
+        if not self.visible_keys:
             return None
         max_y, max_x = self.app.stdscr.getmaxyx()
         cols = 2 if max_x >= 100 else 1
         if key == curses.KEY_UP:
             self.selected = max(0, self.selected - cols)
         elif key == curses.KEY_DOWN:
-            self.selected = min(len(self.keys) - 1, self.selected + cols)
+            self.selected = min(len(self.visible_keys) - 1, self.selected + cols)
         elif key == curses.KEY_LEFT:
             self.selected = max(0, self.selected - 1)
         elif key == curses.KEY_RIGHT:
-            self.selected = min(len(self.keys) - 1, self.selected + 1)
+            self.selected = min(len(self.visible_keys) - 1, self.selected + 1)
+        elif key == ord("/"):
+            self.searching = True
+            return None
         elif key in (curses.KEY_ENTER, 10, 13):
             return {
                 "action": "open_group",
@@ -959,18 +1039,49 @@ class GroupsScreen(Screen):
                               "No hay grupos en esta playlist.", "")
             return
 
+        search_offset = 1 if (self.searching or self.query) else 0
+
+        # Búsqueda (fila y=1)
+        if self.searching or self.query:
+            cursor = "▌" if self.searching else ""
+            icon = f" {icons.ICON_SEARCH} "
+            counter = f" {len(self.visible_keys)}/{len(self.keys)} " if self.query else ""
+            inner = max(0, max_x - len(icon) - len(counter) - 2)
+            query_part = self.query[:inner] + cursor
+            pad = max(0, inner - len(query_part))
+            line = f"{icon}{query_part}{' ' * pad}{counter}"
+            pair = colors.PAIR_SEARCH if self.searching else colors.PAIR_STATUS
+            try:
+                stdscr.addstr(1, 0, line[:max_x].ljust(max_x)[:max_x], colors.pair(pair))
+            except curses.error:
+                pass
+        else:
+            try:
+                stdscr.addstr(1, 0, " " * max_x, colors.pair(colors.PAIR_NORMAL))
+            except curses.error:
+                pass
+
+        if not self.visible_keys and self.query:
+            msg = f"Sin resultados para '{self.query}'"
+            mx = max(0, (max_x - len(msg)) // 2)
+            try:
+                stdscr.addstr(max_y // 2, mx, msg[:max(0, max_x - 1)],
+                              colors.pair(colors.PAIR_EMPTY))
+            except curses.error:
+                pass
+            return
+
         cols = 2 if max_x >= 100 else 1
         card_w = max(28, (max_x - 2 * (cols - 1)) // cols)
         gap = 2
         total_w = cols * card_w + (cols - 1) * gap
         start_x = max(0, (max_x - total_w) // 2)
         card_h = 4
-        start_y = 1
+        start_y = 1 + search_offset
         visible_rows = self._visible_rows(max_y)
 
-        for i, key in enumerate(self.keys):
+        for i, key in enumerate(self.visible_keys):
             row = i // cols
-            # Solo renderizar filas visibles (dentro del viewport)
             if row < self._first_row:
                 continue
             if row >= self._first_row + visible_rows:
@@ -981,6 +1092,17 @@ class GroupsScreen(Screen):
             if cy + card_h > max_y - 2:
                 break
             self._render_card(stdscr, key, self.counts[key], cx, cy, card_w, i == self.selected)
+        # Indicador de paginación
+        total_rows = -(-len(self.visible_keys) // cols) if self.visible_keys else 0
+        if total_rows > visible_rows:
+            info = f" {self._first_row + 1}-{min(total_rows, self._first_row + visible_rows)}/{total_rows} "
+            try:
+                px = max(0, (max_x - len(info)) // 2)
+                py = max_y - 3
+                if py >= 1:
+                    stdscr.addstr(py, px, info, colors.pair(colors.PAIR_DIM) | curses.A_DIM)
+            except curses.error:
+                pass
 
 
 class ResolutionScreen(Screen):
