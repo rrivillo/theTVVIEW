@@ -21,6 +21,7 @@ from thetvview.epg_parser import Epg, parse_file
 from thetvview.groups import groups_of
 from thetvview.models import Channel, Playlist
 from thetvview.playlist_manager import PlaylistEntry, PlaylistError, PlaylistManager
+from thetvview.recents import RecentsManager
 
 from . import colors
 from . import icons
@@ -29,6 +30,10 @@ from .widgets import ScrollableList, render_empty_message, render_separator
 
 # Centinela: ChannelsScreen sin filtro de grupo (vs. filtro "sin grupo").
 _UNSET: object = object()
+
+# F5 para "actualizar lista" ('R' es el atajo principal; 'r' queda para
+# Recientes). Fallback numérico por si curses no define KEY_F5.
+_KEY_F5: int = getattr(curses, "KEY_F5", 269)
 
 
 class Screen:
@@ -131,8 +136,8 @@ class PlaylistsScreen(Screen):
 
     def shortcuts(self) -> str:
         if not self.entries:
-            return "a Añadir · t Tema · ? Ayuda · q Salir"
-        return "↑/↓/←/→ · Enter · a Añadir · d Borrar · f ★ · t Tema · ? Ayuda · q Salir"
+            return "a Añadir · r Recientes · t Tema · ? Ayuda · q Salir"
+        return "↑/↓/←/→ · Enter · a Añadir · d Borrar · R Actualizar · r Recientes · f ★ · t Tema · ? Ayuda · q Salir"
 
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
         if not self.entries:
@@ -162,6 +167,14 @@ class PlaylistsScreen(Screen):
         if not self.entries:
             if key == ord("a"):
                 return {"action": "add_playlist"}
+            return None
+        if key == ord("R") or key == _KEY_F5:
+            # El catálogo es un JSON local: relectura instantánea.
+            self.reload()
+            try:
+                self.app.footer.show(f"Catálogo actualizado: {len(self.entries)} listas.")
+            except Exception:
+                pass
             return None
         max_y, max_x = self.app.stdscr.getmaxyx()
         cols = self._cols(max_x)
@@ -358,14 +371,38 @@ class ChannelsScreen(Screen):
             return None
         return self.channels[self.visible_idx[self.list.selected]]
 
+    def refresh_from_playlist(self, fresh: Playlist) -> None:
+        """Sustituye el contenido por un re-parseo fresco de la misma fuente.
+
+        Preserva filtro de grupo, query de búsqueda y (si sigue
+        existiendo) el canal seleccionado por identidad (nombre+url).
+        No toca curses: testeable con unittest.
+        """
+        cur = self.current_channel()
+        ident = (cur.name, cur.url) if cur is not None else None
+        self.playlist = fresh
+        if self.group_filtered:
+            self.channels = [c for c in fresh.channels if (c.group or None) == self.group]
+        else:
+            self.channels = list(fresh.channels)
+        # Re-etiquetar conservando la query actual.
+        self._apply_filter()
+        if ident is not None:
+            for pos, i in enumerate(self.visible_idx):
+                c = self.channels[i]
+                if (c.name, c.url) == ident:
+                    self.list.selected = pos
+                    break
+        self.list.clamp()
+
     # --- Teclas ---------------------------------------------------------------
 
     def shortcuts(self) -> str:
         if self.searching:
-            return "Escribir filtra · Enter confirmar · Esc limpiar"
+            return "Escribir filtra · Enter confirmar · Ctrl-U limpiar · Esc salir"
         return (
             "↑/↓ · Enter ▶ · / Buscar · g Grupos · "
-            "f ★ · e EPG · t Tema · Esc ←"
+            "f ★ · e EPG · R Actualizar · r Recientes · p Reproductor · ? Ayuda · t Tema · Esc ←"
         )
 
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
@@ -453,6 +490,10 @@ class ChannelsScreen(Screen):
         if key == ord("/"):
             self.searching = True
             return None
+        if key == ord("R") or key == _KEY_F5:
+            # 'r' queda para Recientes (global); 'R'/F5 recarga la fuente
+            # porque los canales de una URL pueden cambiar sin aviso.
+            return {"action": "reload_playlist"}
         if key == ord("f"):
             channel = self.current_channel()
             if channel is None:
@@ -747,7 +788,7 @@ class FavoritesScreen(Screen):
         return self.channels[self.list.selected]
 
     def shortcuts(self) -> str:
-        return "↑/↓ · Enter ▶ · f ★ · t Tema · Esc ←"
+        return "↑/↓ · Enter ▶ · f ★ · p Reproductor · ? Ayuda · t Tema · Esc ←"
 
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
         max_y, max_x = self.app.stdscr.getmaxyx()
@@ -802,6 +843,61 @@ class FavoritesScreen(Screen):
             self.list.render(stdscr, 1, 0, self.app.body_height(), max_x)
 
 
+class RecentsScreen(Screen):
+    title = "Recientes"
+
+    def __init__(self, app) -> None:  # noqa: ANN001
+        super().__init__(app)
+        self.list = ScrollableList()
+        self.items = app.recents.load()
+        self.list.set_items([f"{i.name} ({i.player})" for i in self.items])
+
+    def current_item(self):
+        if not self.items:
+            return None
+        return self.items[self.list.selected]
+
+    def current_channel(self) -> Channel | None:
+        item = self.current_item()
+        if item is None:
+            return None
+        return Channel(name=item.name, url=item.url, group=item.group)
+
+    def shortcuts(self) -> str:
+        return "↑/↓ · Enter ▶ · f ★ · r Limpiar · ? Ayuda · t Tema · Esc ←"
+
+    def handle_key(self, key: int) -> dict | None:
+        rows = self.app.body_height()
+        if self.list.handle_key(key, rows):
+            return None
+        if key == ord("r"):
+            self.app.recents.clear()
+            self.items = []
+            self.list.set_items([])
+            self.app.status.show("Recientes limpiados.")
+            return None
+        if key == ord("f"):
+            ch = self.current_channel()
+            if ch is None:
+                self.app.status.show("No hay reciente para marcar.")
+                return None
+            return {"action": "toggle_favorite", "channel": ch}
+        if key in (curses.KEY_ENTER, 10, 13):
+            ch = self.current_channel()
+            if ch is None:
+                self.app.status.show("No hay reciente para abrir.")
+                return None
+            return {"action": "open_channel", "channel": ch}
+        return None
+
+    def render(self, stdscr: curses.window) -> None:
+        max_y, max_x = stdscr.getmaxyx()
+        if not self.items:
+            render_empty_message(stdscr, max_y // 2, max_x, "Sin recientes. reproduce algo primero.")
+        else:
+            self.list.render(stdscr, 1, 0, self.app.body_height(), max_x)
+
+
 class GroupsScreen(Screen):
     """Grupos (group-title) de una playlist — vista cards.
 
@@ -828,6 +924,17 @@ class GroupsScreen(Screen):
         self.keys = list(groups)
         self.counts = {k: len(v) for k, v in groups.items()}
         self._apply_filter()
+
+    def refresh_from_playlist(self, fresh: Playlist) -> None:
+        """Sustituye el contenido por un re-parseo fresco de la misma fuente.
+
+        Preserva query y grupo seleccionado (si sigue existiendo).
+        """
+        self.playlist = fresh
+        groups = groups_of(fresh.channels)
+        self.keys = list(groups)
+        self.counts = {k: len(v) for k, v in groups.items()}
+        self._apply_filter(keep_selection=True)
 
     def _apply_filter(self, keep_selection: bool = False) -> None:
         prev = self.current_group() if keep_selection else None
@@ -878,8 +985,8 @@ class GroupsScreen(Screen):
 
     def shortcuts(self) -> str:
         if self.searching:
-            return "Escribir filtra · Enter confirmar · Esc limpiar"
-        return "↑/↓/←/→ · Enter abrir · / Buscar · t Tema · Esc ←"
+            return "Escribir filtra · Enter confirmar · Ctrl-U limpiar · Esc salir"
+        return "↑/↓/←/→ · Enter abrir · / Buscar · R Actualizar · r Recientes · ? Ayuda · t Tema · Esc ←"
 
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
         if not self.visible_keys:
@@ -955,6 +1062,8 @@ class GroupsScreen(Screen):
     def handle_key(self, key: int) -> dict | None:
         if self.searching:
             return self._feed_search(key)
+        if key == ord("R") or key == _KEY_F5:
+            return {"action": "reload_playlist"}
         if not self.visible_keys:
             return None
         max_y, max_x = self.app.stdscr.getmaxyx()
@@ -1116,7 +1225,7 @@ class ResolutionScreen(Screen):
         self.selected: int = 0
 
     def shortcuts(self) -> str:
-        return "←/→ · Enter ▶ · t Tema · Esc ←"
+        return "←/→ · Enter ▶ · ? Ayuda · t Tema · Esc ←"
 
     def handle_key(self, key: int) -> dict | None:
         if key == curses.KEY_LEFT:
@@ -1191,7 +1300,7 @@ class PlayerScreen(Screen):
         self.selected: int = 0
 
     def shortcuts(self) -> str:
-        return "↑/↓ · Enter ▶ · t Tema · Esc ←"
+        return "↑/↓ · Enter ▶ · ? Ayuda · t Tema · Esc ←"
 
     def handle_key(self, key: int) -> dict | None:
         if not self.players:
@@ -1320,7 +1429,7 @@ class NowPlayingScreen(Screen):
                 self.health = ChannelHealthMonitor(channel, interval=10.0, timeout=2.0, auto_start=False)
 
     def shortcuts(self) -> str:
-        return "q Detener · reproductor externo en ejecución"
+        return "q Detener · ? Ayuda"
 
     def is_alive(self) -> bool:
         try:
@@ -1617,7 +1726,7 @@ class EpgScreen(Screen):
         self._list.set_items(self._rows())
 
     def shortcuts(self) -> str:
-        return "↑/↓ · Enter ▶ · r Recargar · t Tema · Esc ←"
+        return "↑/↓ · Enter ▶ · r Recargar · ? Ayuda · t Tema · Esc ←"
 
     def _rows(self) -> list[str]:
         if not self.programs:
@@ -1639,7 +1748,7 @@ class EpgScreen(Screen):
         rows = self.app.body_height()
         if self._list.handle_key(key, rows):
             return None
-        if key == ord("r"):
+        if key == ord("r") or key == ord("R") or key == _KEY_F5:
             # Re-carga: para URLs fuerza re-descarga; para paths re-lee fichero.
             self.app.ensure_epg(self.channel, force_refresh=True)
             self.refresh_programs()
@@ -1734,4 +1843,5 @@ def play_channel(app, channel, player_name: str | None = None) -> None:  # noqa:
     except Exception:
         pass
     app.push(NowPlayingScreen(app, channel, effective_name, proc))
+    app.prefs.set_last_player(effective_name)
     app.status.show(f"Reproduciendo '{channel.name}' con {effective_name.upper()} (pid {proc.pid}).")

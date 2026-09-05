@@ -742,3 +742,94 @@ class TabBar:
                 x += len(segment)
         except curses.error:
             pass
+
+
+class LoadingOverlay:
+    """Pantalla de 'Cargando…' para esperas de red/disco.
+
+    Uso típico: dibujar justo antes de una operación bloqueante
+    (re-parsear una playlist remota) y hacer refresh(), de modo que
+    el usuario vea feedback aunque la espera sea de segundos::
+
+        LoadingOverlay.render(stdscr, "Actualizando lista…", sub=source)
+        stdscr.refresh()
+        playlist = load_playlist_source(source)  # bloqueante con timeout
+
+    Solo stdlib + curses. Nunca lanza: todo addstr está protegido.
+    `frame` selecciona el spinner (0..3 -> | / - \\).
+    """
+
+    FRAMES = ("|", "/", "-", "\\")
+
+    @staticmethod
+    def render(
+        stdscr: curses.window,
+        message: str = "Cargando…",
+        sub: str = "",
+        frame: int = 0,
+    ) -> None:
+        max_y, max_x = stdscr.getmaxyx()
+        if max_y < 5 or max_x < 20:
+            # Ventana diminuta: una línea basta, sin box.
+            try:
+                spin = LoadingOverlay.FRAMES[frame % len(LoadingOverlay.FRAMES)]
+                stdscr.addstr(0, 0, f" {spin} {message}"[: max(0, max_x - 1)],
+                              colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD)
+            except curses.error:
+                pass
+            return
+        spin = LoadingOverlay.FRAMES[frame % len(LoadingOverlay.FRAMES)]
+        title = f" {spin} {message} "
+        sub = (sub or "").strip()
+        inner_w = max(len(title), len(sub)) + 4
+        box_w = min(max_x - 4, max(30, inner_w), 64)
+        box_h = 5 if sub else 4
+        by = max(1, (max_y - box_h) // 2)
+        bx = max(0, (max_x - box_w) // 2)
+
+        border = colors.pair(colors.PAIR_MODAL_BORDER)
+        try:
+            stdscr.addstr(by, bx,
+                          icons.BOX_D_TL + icons.BOX_D_H * (box_w - 2) + icons.BOX_D_TR,
+                          border)
+            for r in range(1, box_h - 1):
+                stdscr.addstr(by + r, bx, icons.BOX_D_V, border)
+                stdscr.addstr(by + r, bx + box_w - 1, icons.BOX_D_V, border)
+            stdscr.addstr(by + box_h - 1, bx,
+                          icons.BOX_D_BL + icons.BOX_D_H * (box_w - 2) + icons.BOX_D_BR,
+                          border)
+        except curses.error:
+            pass
+        try:
+            tx = bx + max(1, (box_w - len(title)) // 2)
+            stdscr.addstr(by + 1, tx, title[: max(0, box_w - 2)],
+                          colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD)
+        except curses.error:
+            pass
+        if sub:
+            try:
+                sx = bx + max(1, (box_w - len(sub)) // 2)
+                stdscr.addstr(by + 2, sx, sub[: max(0, box_w - 2)],
+                              colors.pair(colors.PAIR_DIM) | curses.A_DIM)
+            except curses.error:
+                pass
+        # Barra animada simple (progreso indeterminado).
+        try:
+            bar_w = max(8, box_w - 8)
+            pos = frame % bar_w
+            bar = "─" * pos + "●" + "─" * max(0, bar_w - pos - 1)
+            bxx = bx + max(1, (box_w - bar_w) // 2)
+            stdscr.addstr(by + box_h - 2, bxx, bar[:bar_w],
+                          colors.pair(colors.PAIR_ACCENT))
+        except curses.error:
+            pass
+
+
+def render_loading(
+    stdscr: curses.window,
+    message: str = "Cargando…",
+    sub: str = "",
+    frame: int = 0,
+) -> None:
+    """Atajo funcional sobre LoadingOverlay.render (para tests y App)."""
+    LoadingOverlay.render(stdscr, message, sub=sub, frame=frame)

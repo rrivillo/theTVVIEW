@@ -25,6 +25,9 @@ class AppCase(unittest.TestCase):
         patches = [
             mock.patch.object(ui_app.config, "PLAYLISTS_JSON", base / "playlists.json"),
             mock.patch.object(ui_app.config, "FAVORITES_JSON", base / "favorites.json"),
+            mock.patch.object(ui_app.config, "PREFS_JSON", base / "prefs.json"),
+            mock.patch.object(ui_app.config, "RECENTS_JSON", base / "recents.json"),
+            mock.patch.object(ui_app.config, "THEME_JSON", base / "theme.json"),
         ]
         for p in patches:
             p.start()

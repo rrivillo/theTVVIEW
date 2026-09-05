@@ -1,4 +1,4 @@
-"""Tests comprehensivos contra la playlist real IPTVSV.m3u (1714 canales, 43 grupos).
+"""Tests comprehensivos contra la playlist real IPTVSV.m3u (1755 canales, 43 grupos).
 
 Cubre: parsing M3U, detección de resoluciones, agrupación por grupos,
 favoritos, player (EXTVLCOPT), y UX (búsqueda, navegación, formato de labels).
@@ -69,7 +69,7 @@ class TestRealM3UParsing(unittest.TestCase):
         cls.pl = _load()
 
     def test_total_canales(self) -> None:
-        self.assertEqual(len(self.pl.channels), 1714)
+        self.assertEqual(len(self.pl.channels), 1755)
 
     def test_todos_los_canales_tienen_url(self) -> None:
         for ch in self.pl.channels:
@@ -199,29 +199,29 @@ class TestRealGroups(unittest.TestCase):
         for g in esperados:
             self.assertIn(g, self.groups, f"Grupo '{g}' no encontrado")
 
-    def test_grupo_el_salvador_tcs_tiene_11(self) -> None:
-        self.assertEqual(len(self.groups["El Salvador - TCS"]), 11)
+    def test_grupo_el_salvador_tcs_tiene_12(self) -> None:
+        self.assertEqual(len(self.groups["El Salvador - TCS"]), 12)
 
-    def test_grupo_honduras_tiene_39(self) -> None:
-        self.assertEqual(len(self.groups["Honduras"]), 39)
+    def test_grupo_honduras_tiene_41(self) -> None:
+        self.assertEqual(len(self.groups["Honduras"]), 41)
 
-    def test_grupo_guatemala_tiene_45(self) -> None:
-        self.assertEqual(len(self.groups["Guatemala"]), 45)
+    def test_grupo_guatemala_tiene_47(self) -> None:
+        self.assertEqual(len(self.groups["Guatemala"]), 47)
 
-    def test_grupo_costa_rica_tiene_36(self) -> None:
-        self.assertEqual(len(self.groups["Costa Rica"]), 36)
+    def test_grupo_costa_rica_tiene_38(self) -> None:
+        self.assertEqual(len(self.groups["Costa Rica"]), 38)
 
-    def test_grupo_mexico_tiene_46(self) -> None:
-        self.assertEqual(len(self.groups["México"]), 46)
+    def test_grupo_mexico_tiene_45(self) -> None:
+        self.assertEqual(len(self.groups["México"]), 45)
 
     def test_grupo_espana_tiene_152(self) -> None:
         self.assertEqual(len(self.groups["España"]), 152)
 
-    def test_grupo_entretenimiento_tiene_154(self) -> None:
-        self.assertEqual(len(self.groups["Entretenimiento / Cine / Series"]), 154)
+    def test_grupo_entretenimiento_tiene_164(self) -> None:
+        self.assertEqual(len(self.groups["Entretenimiento / Cine / Series"]), 164)
 
-    def test_grupo_cine_premium_tiene_105(self) -> None:
-        self.assertEqual(len(self.groups["Cine / Películas Premium"]), 105)
+    def test_grupo_cine_premium_tiene_106(self) -> None:
+        self.assertEqual(len(self.groups["Cine / Películas Premium"]), 106)
 
     def test_grupo_musica_tiene_89(self) -> None:
         self.assertEqual(len(self.groups["Música"]), 89)
@@ -567,14 +567,14 @@ class TestRealUXSearch(unittest.TestCase):
         for ch in visibles:
             self.assertIn("eo-blocked", ch.name.lower())
 
-    def test_buscar_mpv(self) -> None:
+    def test_buscar_opc(self) -> None:
         screen = ChannelsScreen(self.app, self.pl)
-        screen.query = "MPV"
+        screen.query = "Opc"
         screen._apply_filter()
         visibles = [screen.channels[i] for i in screen.visible_idx]
-        self.assertGreater(len(visibles), 0)
+        self.assertGreater(len(visibles), 100)
         for ch in visibles:
-            self.assertIn("MPV", ch.name)
+            self.assertIn("opc", ch.name.lower())
 
 
 class TestRealUXNavigation(unittest.TestCase):
@@ -660,16 +660,16 @@ class TestRealUXGroupFilter(unittest.TestCase):
 
     def test_filtro_grupo_honduras(self) -> None:
         screen = ChannelsScreen(self.app, self.pl, group="Honduras")
-        self.assertEqual(len(screen.channels), 39)
+        self.assertEqual(len(screen.channels), 41)
         self.assertTrue(all(c.group == "Honduras" for c in screen.channels))
 
     def test_filtro_grupo_mexico(self) -> None:
         screen = ChannelsScreen(self.app, self.pl, group="México")
-        self.assertEqual(len(screen.channels), 46)
+        self.assertEqual(len(screen.channels), 45)
 
     def test_filtro_grupo_deportes(self) -> None:
         screen = ChannelsScreen(self.app, self.pl, group="Deportes")
-        self.assertEqual(len(screen.channels), 64)
+        self.assertEqual(len(screen.channels), 68)
 
     def test_busqueda_dentro_del_grupo(self) -> None:
         screen = ChannelsScreen(self.app, self.pl, group="El Salvador - TCS")
@@ -744,8 +744,18 @@ class TestRealM3UPatterns(unittest.TestCase):
         self.assertGreater(len(geo), 30)
 
     def test_canales_con_mpv_en_nombre(self) -> None:
+        """Upstream quitó el marcador (MPV) de la lista; el fix se verifica
+        con un canal sintético (la cobertura vive en TestRealResolutions)."""
+        pl = parse_text(
+            "#EXTM3U\n"
+            '#EXTINF:-1 group-title="X",TVO Canal 23 SD [No 24/7](MPV)\n'
+            "http://example.com/a.m3u8\n"
+        )
+        self.assertEqual(len(pl.channels), 1)
+        self.assertEqual(detect(pl.channels[0]), "SD")
+        self.assertEqual(base_name(pl.channels[0]), "TVO Canal 23")
         mpv = [ch for ch in self.pl.channels if "(MPV)" in ch.name]
-        self.assertGreater(len(mpv), 70)
+        self.assertEqual(mpv, [])
 
     def test_canales_con_calidad_parentesis(self) -> None:
         """Canales con (720p), (1080p) en el nombre."""
@@ -798,7 +808,7 @@ class TestRealM3UPatterns(unittest.TestCase):
     def test_grupo_con_slash(self) -> None:
         """Grupos con / como 'Cine / Películas'."""
         cine = [ch for ch in self.pl.channels if ch.group == "Cine / Películas"]
-        self.assertEqual(len(cine), 74)
+        self.assertEqual(len(cine), 75)
 
     def test_grupo_con_ampersand(self) -> None:
         """Grupo con & como 'Discovery Home & Health'."""

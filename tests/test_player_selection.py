@@ -32,11 +32,17 @@ class _Status:
         self.was_error = error
 
 
+class _PrefsStub:
+    def set_last_player(self, name: str | None) -> None:
+        pass
+
+
 class _StubApp:
     """Lo mínimo que PlayerScreen/play_channel necesitan sin curses."""
 
     def __init__(self) -> None:
         self.status = _Status()
+        self.prefs = _PrefsStub()
         self.stack: list = []
         self.epg = None  # sin EPG cargado
 
@@ -112,12 +118,15 @@ class TestPlayChannel(unittest.TestCase):
 
 class TestAppActions(unittest.TestCase):
     def setUp(self):
-        # Aísla el estado en disco del catálogo/favoritos.
+        # Aísla el estado en disco del catálogo/favoritos y preferencias.
         self._tmp = tempfile.TemporaryDirectory()
         base = Path(self._tmp.name)
         patches = [
             mock.patch.object(ui_app.config, "PLAYLISTS_JSON", base / "playlists.json"),
             mock.patch.object(ui_app.config, "FAVORITES_JSON", base / "favorites.json"),
+            mock.patch.object(ui_app.config, "PREFS_JSON", base / "prefs.json"),
+            mock.patch.object(ui_app.config, "RECENTS_JSON", base / "recents.json"),
+            mock.patch.object(ui_app.config, "THEME_JSON", base / "theme.json"),
         ]
         for p in patches:
             p.start()

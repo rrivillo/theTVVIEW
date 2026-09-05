@@ -24,6 +24,8 @@ EPG_CACHE_DIR: Path = DATA_DIR / "epg_cache"
 PLAYLISTS_JSON: Path = DATA_DIR / "playlists.json"
 FAVORITES_JSON: Path = DATA_DIR / "favorites.json"
 THEME_JSON: Path = DATA_DIR / "theme.json"
+PREFS_JSON: Path = DATA_DIR / "prefs.json"
+RECENTS_JSON: Path = DATA_DIR / "recents.json"
 
 SUPPORTED_PLAYERS: tuple[str, ...] = ("mpv", "mplayer", "vlc")
 
@@ -166,6 +168,8 @@ def _candidate_paths(name: str) -> list[Path]:
 def ensure_dirs() -> None:
     """Crea los directorios de datos si no existen (idempotente)."""
     EPG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    PREFS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    RECENTS_JSON.parent.mkdir(parents=True, exist_ok=True)
 
 
 def load_theme() -> str:
