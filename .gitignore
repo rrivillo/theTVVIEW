@@ -46,3 +46,6 @@ peticion.txt
 # Playlists reales del usuario (datos privados)
 tests/fixtures/iptvsv_real.m3u
 AGENTS.md
+
+# SDD Xtream (documento local, no versionar)
+SDD — Soporte de fuentes Xtream para visor IPTV asistido por IA.md
