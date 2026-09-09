@@ -23,6 +23,10 @@ data/playlists.json
 data/favorites.json
 data/epg_cache/
 data/playlist_cache/
+data/prefs.json
+data/recents.json
+data/ux_last.json
+data/xtream_cache/
 
 # Archivos de sistema y editores
 .DS_Store
