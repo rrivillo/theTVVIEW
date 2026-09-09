@@ -80,13 +80,15 @@ class TestEnsureEpgRecycle(unittest.TestCase):
     def test_url_hint_se_usa_como_defecto_si_no_hay_fuente_previa(self):
         self.app.epg = None
         self.app.epg_source = None
-        # Simula la respuesta del prompt: devuelve el default sugerido.
-        with mock.patch(
-            "thetvview.ui.app.prompt_text", return_value=None
+        # El modal precarga el default sugerido en el campo.
+        with mock.patch.object(
+            self.app, "_prompt_form", return_value=None
         ) as prompt:
             self.app.ensure_epg(ch(), url_hint="https://epg.example.com/g.xml.gz")
-        label = prompt.call_args.args[2]
-        self.assertIn("https://epg.example.com/g.xml.gz", label)
+        self.assertEqual(
+            prompt.call_args.kwargs.get("initial", {}).get("path"),
+            "https://epg.example.com/g.xml.gz",
+        )
 
     def test_force_refresh_recarga_con_la_misma_fuente(self):
         self.app.epg_source = "https://epg.example.com/guia.xml"

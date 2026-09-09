@@ -1,12 +1,26 @@
-"""Tests de player.py: construcción de comando y lanzamiento seguro."""
+"""Tests de player.py: construcción de comando y lanzamiento seguro.
+
+Todos los testeos que involucran reproductores se hacen en modo headless
+(command_for/launch con headless=True) o con subprocess.Popen mockeado:
+nunca se abre ventana ni se requiere DISPLAY/Wayland en CI.
+"""
 
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from thetvview.models import Channel
-from thetvview.player import PlayerError, _codec_h264_args, _option_args, command_for
+from thetvview.player import (
+    PlayerError,
+    _codec_h264_args,
+    _headless_args,
+    _option_args,
+    command_for,
+    explain_early_exit,
+)
 
 
 def _channel(**opts) -> Channel:
@@ -198,7 +212,68 @@ class TestCommandFor(unittest.TestCase):
         self.assertEqual(args, [])
 
 
+class TestHeadless(unittest.TestCase):
+    """El modo headless añade drivers nulos/dummy y nunca abre GUI."""
+
+    def test_headless_args_por_reproductor(self) -> None:
+        self.assertEqual(_headless_args("mpv"), ["--vo=null", "--ao=null"])
+        self.assertEqual(
+            _headless_args("vlc"),
+            ["--intf", "dummy", "--vout", "dummy", "--aout", "dummy"],
+        )
+        self.assertEqual(_headless_args("mplayer"), ["-vo", "null", "-ao", "null"])
+        self.assertEqual(_headless_args("desconocido"), [])
+
+    def test_por_defecto_no_es_headless(self) -> None:
+        cmd = command_for(_channel(), "mpv", player_path="/usr/bin/mpv")
+        self.assertNotIn("--vo=null", cmd)
+        self.assertNotIn("--ao=null", cmd)
+        self.assertIn("--gpu-api=opengl", cmd)
+
+    def test_mpv_headless_sin_ventana_ni_gpu(self) -> None:
+        cmd = command_for(_channel(), "mpv", player_path="/usr/bin/mpv", headless=True)
+        self.assertIn("--vo=null", cmd)
+        self.assertIn("--ao=null", cmd)
+        # --vo=null no necesita GPU: no forzar opengl sin display.
+        self.assertNotIn("--gpu-api=opengl", cmd)
+        self.assertEqual(cmd[-1], "http://stream.example.com/live")
+
+    def test_vlc_headless_es_dummy(self) -> None:
+        cmd = command_for(_channel(), "vlc", player_path="/usr/bin/vlc", headless=True)
+        for flag in ("--intf", "dummy", "--vout", "dummy", "--aout", "dummy"):
+            self.assertIn(flag, cmd)
+        self.assertEqual(cmd[-1], "http://stream.example.com/live")
+
+    def test_mplayer_headless_es_null(self) -> None:
+        cmd = command_for(
+            _channel(), "mplayer", player_path="/usr/bin/mplayer", headless=True
+        )
+        self.assertIn("-vo", cmd)
+        self.assertIn("null", cmd)
+        self.assertIn("-ao", cmd)
+        self.assertEqual(cmd[-1], "http://stream.example.com/live")
+
+    def test_headless_va_tras_el_binario(self) -> None:
+        cmd = command_for(_channel(), "mpv", player_path="/usr/bin/mpv", headless=True)
+        self.assertEqual(cmd[0], "/usr/bin/mpv")
+        self.assertEqual(cmd[1:3], ["--vo=null", "--ao=null"])
+
+    def test_headless_con_extvlcopt(self) -> None:
+        ch = _channel(extra_options=[("EXTVLCOPT", "http-user-agent=MiApp/1.0")])
+        cmd = command_for(ch, "mpv", player_path="/usr/bin/mpv", headless=True)
+        self.assertIn("--vo=null", cmd)
+        self.assertIn("--user-agent=MiApp/1.0", cmd)
+        self.assertEqual(cmd[-1], ch.url)
+
+
 class TestLaunch(unittest.TestCase):
+    """Lanzamiento siempre headless en tests: Popen mockeado o fake binario.
+
+    Nunca se ejecuta un reproductor real con GUI: o bien se intercepta
+    subprocess.Popen y se inspecciona el argv, o bien se usa un script
+    falso que sale al instante (sin display ni red).
+    """
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -207,7 +282,72 @@ class TestLaunch(unittest.TestCase):
         self.fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.fake.chmod(stat.S_IRWXU)
 
-    def test_launch_devuelve_proceso_y_usa_argv(self) -> None:
+    def test_launch_headless_no_abre_gui_usa_argv(self) -> None:
+        from thetvview import player
+
+        with (
+            mock.patch.object(
+                player.config,
+                "find_player",
+                side_effect=lambda name: str(self.fake) if name == "mpv" else None,
+            ),
+            mock.patch.object(player.subprocess, "Popen") as popen,
+        ):
+            player.launch(_channel(), player_name="mpv", headless=True)
+        popen.assert_called_once()
+        cmd = popen.call_args[0][0]
+        kwargs = popen.call_args[1]
+        self.assertIsInstance(cmd, list)  # argv en lista, sin shell
+        self.assertIn("--vo=null", cmd)
+        self.assertIn("--ao=null", cmd)
+        self.assertNotIn("--gpu-api=opengl", cmd)
+        self.assertEqual(cmd[-1], "http://stream.example.com/live")
+        self.assertNotIn("shell", kwargs)  # nunca shell=True
+        self.assertIs(kwargs.get("stdin"), subprocess.DEVNULL)
+        self.assertIs(kwargs.get("stdout"), subprocess.DEVNULL)
+        self.assertIs(kwargs.get("stderr"), subprocess.DEVNULL)
+
+    def test_launch_por_defecto_no_es_headless(self) -> None:
+        from thetvview import player
+
+        with (
+            mock.patch.object(
+                player.config,
+                "find_player",
+                side_effect=lambda name: str(self.fake) if name == "mpv" else None,
+            ),
+            mock.patch.object(player.subprocess, "Popen") as popen,
+        ):
+            player.launch(_channel(), player_name="mpv")
+        cmd = popen.call_args[0][0]
+        self.assertNotIn("--vo=null", cmd)
+        self.assertIn("--gpu-api=opengl", cmd)
+
+    def test_launch_headless_vlc_y_mplayer(self) -> None:
+        from thetvview import player
+
+        for name, expected in (
+            ("vlc", ["--intf", "dummy"]),
+            ("mplayer", ["-vo", "null"]),
+        ):
+            with self.subTest(player=name):
+                with (
+                    mock.patch.object(
+                        player.config,
+                        "find_player",
+                        side_effect=lambda n, _name=name: (
+                            str(self.fake) if n == _name else None
+                        ),
+                    ),
+                    mock.patch.object(player.subprocess, "Popen") as popen,
+                ):
+                    player.launch(_channel(), player_name=name, headless=True)
+                cmd = popen.call_args[0][0]
+                for flag in expected:
+                    self.assertIn(flag, cmd)
+
+    def test_launch_headless_integracion_fake_binary(self) -> None:
+        """End-to-end headless contra binario falso (sale al instante)."""
         from thetvview import player
 
         original = player.config.find_player
@@ -217,24 +357,42 @@ class TestLaunch(unittest.TestCase):
 
         player.config.find_player = fake_find  # type: ignore[assignment]
         try:
-            proc = player.launch(_channel())
+            proc = player.launch(_channel(), headless=True)
             proc.wait(timeout=10)
             self.assertEqual(proc.returncode, 0)
             self.assertIsInstance(proc.args, list)  # argv en lista, sin shell
+            self.assertIn("--vo=null", proc.args)
         finally:
             player.config.find_player = original  # type: ignore[assignment]
 
     def test_launch_sin_players_lanza_error(self) -> None:
         from thetvview import player
 
+        original = player.config.find_player
         player.config.find_player = lambda name: None  # type: ignore[assignment]
         try:
             with self.assertRaises(PlayerError):
-                player.launch(_channel())
+                player.launch(_channel(), headless=True)
         finally:
-            player.config.find_player = (  # type: ignore[assignment]
-                lambda name: "/bin/true"
-            )
+            player.config.find_player = original  # type: ignore[assignment]
+
+
+class TestExplainEarlyExit(unittest.TestCase):
+    def test_sigue_vivo_no_explica(self) -> None:
+        self.assertIsNone(explain_early_exit(None, 0.5))
+
+    def test_salida_limpia_no_explica(self) -> None:
+        self.assertIsNone(explain_early_exit(0, 0.5))
+
+    def test_muerte_tardia_no_explica(self) -> None:
+        self.assertIsNone(explain_early_exit(1, 30.0))
+
+    def test_muerte_al_instante_explica_proveedor(self) -> None:
+        msg = explain_early_exit(1, 0.8)
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertIn("1", msg)
+        self.assertIn("401", msg)
 
 
 if __name__ == "__main__":

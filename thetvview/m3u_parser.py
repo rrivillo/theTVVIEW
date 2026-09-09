@@ -18,12 +18,16 @@ TODO(m3u_parser) — diferidos deliberadamente:
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import re
 import socket
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
+from . import config
 from .models import Channel, Playlist
 
 # Atributos dobles "clave=valor" dentro del EXTINF (solo comillas dobles en v1).
@@ -39,6 +43,30 @@ _KNOWN_ATTRS: dict[str, str] = {
 
 # Tags que se acumulan en extra_options (pares ordenados, admite repetidos).
 _OPTION_TAGS = ("#EXTVLCOPT:", "#KODIPROP:")
+
+# Extensiones de lista aceptadas (solo stdlib, sin preguntar al usuario).
+# .ts se incluye porque muchos proveedores Xtream sirven streams/listados
+# MPEG-TS; a nivel de usuario sigue siendo "una lista", sin tecnicismos.
+PLAYLIST_EXTENSIONS: tuple[str, ...] = (".m3u", ".m3u8", ".ts")
+
+
+def _is_ts_source(source: str | None) -> bool:
+    """True si el origen apunta a un .ts (path o URL, con o sin query)."""
+    if not source:
+        return False
+    return source.strip().lower().split("?", 1)[0].endswith(".ts")
+
+
+def is_valid_playlist_source(source: str) -> bool:
+    """True si `source` es una lista válida: URL http(s) o fichero
+    .m3u/.m3u8/.ts. Las URLs http(s) siempre se aceptan (el servidor puede
+    servir M3U con cualquier nombre, p. ej. get.php?output=ts)."""
+    s = (source or "").strip()
+    if not s:
+        return False
+    if s.lower().startswith(("http://", "https://")):
+        return True
+    return s.lower().split("?", 1)[0].endswith(PLAYLIST_EXTENSIONS)
 
 
 def _clean_group(raw: str | None) -> str | None:
@@ -152,12 +180,49 @@ def parse_text(text: str, source: str | None = None, name: str | None = None) ->
             current_options = []
 
     # EXTINF final sin URL: descartado por contrato.
+    if not playlist.channels and _is_ts_source(source):
+        # Fuente .ts sin entradas M3U: sigue siendo una lista válida de
+        # un solo stream (sin preguntar nada al usuario).
+        # 1) Si el texto trae una URL suelta (sin EXTINF), úsala.
+        # 2) Si es binario MPEG-TS u otro texto sin URL, el stream es el
+        #    propio origen.
+        single_url: str | None = None
+        for raw_line in text.splitlines():
+            line = raw_line.strip().strip("\x00").strip()
+            if not line or line.startswith("#"):
+                continue
+            low = line.lower()
+            if low.startswith(("http://", "https://", "rtmp://", "rtsp://", "udp://", "ffmpeg://")):
+                single_url = line
+                break
+            # Ruta local suelta: solo si es texto imprimible con pinta de
+            # path/URL de stream (evita usar basura binaria como URL).
+            if (
+                line.isprintable()
+                and len(line) < 512
+                and "\x00" not in line
+                and (
+                    low.split("?", 1)[0].endswith(PLAYLIST_EXTENSIONS + (".mp4", ".mkv", ".avi"))
+                    or line.startswith(("/", "./", "../", "~"))
+                )
+            ):
+                single_url = line
+                break
+        playlist.channels.append(
+            Channel(
+                name=playlist.name,
+                url=single_url or (source or playlist.name),
+            )
+        )
     return playlist
 
 
 def parse_file(path: str | Path) -> Playlist:
-    """Parsea un archivo M3U/M3U8 local a un Playlist.
+    """Parsea un archivo M3U/M3U8/TS local a un Playlist.
 
+    Los .ts son listas válidas: si traen M3U se parsean normal; si son
+    un stream suelto o binario MPEG-TS se devuelven como lista de un
+    solo canal apuntando al propio origen.
     Nunca lanza por contenido malformado; solo por errores de E/S.
     """
     p = Path(path)
@@ -168,23 +233,94 @@ def parse_file(path: str | Path) -> Playlist:
     return parse_text(text, source=str(p), name=p.stem)
 
 
-DEFAULT_TIMEOUT: float = 10.0
+DEFAULT_TIMEOUT: float = 30.0
+
+# Cache en disco para listas remotas (como el EPG): evita re-descargar
+# un get.php de varios MB en cada apertura. TTL 6h por defecto.
+DEFAULT_TTL_HOURS: float = 6.0
+
+# Sin límite de tamaño: las listas grandes (p. ej. 50k canales) se
+# descargan completas por chunks y se cachean en disco con TTL; el lag
+# de la TUI con listas grandes se evita por otro lado (render solo de
+# lo visible + favoritas en memoria, sin IO por canal).
+_CHUNK_SIZE: int = 512 * 1024
+
+_GZIP_MAGIC = b"\x1f\x8b"
 
 
-def parse_url(url: str, timeout: float = DEFAULT_TIMEOUT) -> Playlist:
-    """Descarga y parsea un M3U/M3U8 remoto (solo http/https).
+def _cache_path_for(url: str, cache_dir: Path) -> Path:
+    """Nombre seguro y determinista para la entrada de cache de una URL."""
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    base = url.split("?", 1)[0].lower()
+    suffix = ".ts" if base.endswith(".ts") else ".m3u"
+    return cache_dir / f"playlist_{digest}{suffix}"
 
-    Lanza ValueError para URLs no soportadas u OSError con mensaje
-    amigable ante fallos de red/HTTP. Nunca cuelga: siempre hay timeout.
+
+def _is_fresh(path: Path, ttl_seconds: float, now: float | None = None) -> bool:
+    """True si el archivo de cache existe y su edad es menor que el TTL."""
+    if not path.is_file():
+        return False
+    ref = time.time() if now is None else now
+    try:
+        return (ref - path.stat().st_mtime) < ttl_seconds
+    except OSError:
+        return False
+
+
+def _decompress_and_decode(data: bytes, url_hint: str) -> str:
+    """Descomprime gzip (por magia o sufijo .gz) y decodifica a texto."""
+    looks_gz = url_hint.lower().split("?", 1)[0].endswith(".gz") or data[:2] == _GZIP_MAGIC
+    if looks_gz:
+        try:
+            data = gzip.decompress(data)
+        except (OSError, EOFError) as exc:
+            raise OSError(f"La playlist descargada no es un gzip válido: {exc}") from exc
+    return data.decode("utf-8-sig", errors="replace")
+
+
+def _playlist_name_for(url: str) -> str:
+    name = Path(url.split("?", 1)[0]).stem or url
+    return name
+
+
+def fetch_bytes(url: str, timeout: float = DEFAULT_TIMEOUT,
+                max_bytes: int | None = None) -> bytes:
+    """Descarga los bytes crudos de una playlist (solo http/https).
+
+    - Envía `Accept-Encoding: gzip` y descomprime el transporte gzip.
+    - Siempre con timeout; sin límite de tamaño por defecto: lee por
+      chunks hasta EOF para soportar listas grandes sin picos de memoria
+      por el truco de `read(n+1)`.
+    - `max_bytes` queda como parámetro obsoleto por compatibilidad:
+      si se pasa un entero, se respeta como tope (lanza OSError
+      amigable al superarlo); por defecto (None) no hay tope.
+    - Lanza ValueError para URLs no soportadas u OSError amigable.
     """
     url = url.strip()
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError(f"URL no soportada (solo http/https): '{url}'")
 
-    req = urllib.request.Request(url, headers={"User-Agent": "theTVVIEW/1.0"})
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "theTVVIEW/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
+            encoding = (resp.headers.get("Content-Encoding") or "").lower()
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                piece = resp.read(_CHUNK_SIZE)
+                if not piece:
+                    break
+                chunks.append(piece)
+                total += len(piece)
+                if max_bytes is not None and total > max_bytes:
+                    raise OSError(
+                        f"La playlist supera el límite de {max_bytes // (1024 * 1024)} MB; "
+                        "el servidor devolvió una lista demasiado grande."
+                    )
+            raw = b"".join(chunks)
     except urllib.error.HTTPError as exc:
         raise OSError(
             f"El servidor respondió {exc.code} {exc.reason} al descargar la playlist."
@@ -199,5 +335,87 @@ def parse_url(url: str, timeout: float = DEFAULT_TIMEOUT) -> Playlist:
     except TimeoutError as exc:  # timeouts que urlopen propaga directamente
         raise OSError(f"Tiempo de espera agotado ({timeout:g}s) al descargar la playlist.") from exc
 
-    name = Path(url.split("?", 1)[0]).stem or url
-    return parse_text(raw.decode("utf-8-sig", errors="replace"), source=url, name=name)
+    if encoding == "gzip":
+        try:
+            raw = gzip.decompress(raw)
+        except (OSError, EOFError) as exc:
+            raise OSError(f"La playlist descargada no es un gzip válido: {exc}") from exc
+    return raw
+
+
+def parse_url(url: str, timeout: float = DEFAULT_TIMEOUT) -> Playlist:
+    """Descarga y parsea un M3U/M3U8/TS remoto (solo http/https).
+
+    Las URLs .ts son listas válidas (p. ej. get.php?output=ts o
+    /live/u/p/123.ts): si no traen M3U se devuelven como lista de un
+    solo canal. Lanza ValueError para URLs no soportadas u OSError con mensaje
+    amigable ante fallos de red/HTTP. Nunca cuelga: siempre hay timeout.
+
+    Nota: para uso en la TUI se prefiere `load_url` (con cache TTL),
+    que evita re-descargar listas grandes en cada apertura.
+    """
+    url = url.strip()
+    raw = fetch_bytes(url, timeout=timeout)
+    name = _playlist_name_for(url)
+    return parse_text(_decompress_and_decode(raw, url), source=url, name=name)
+
+
+def load_url(
+    url: str,
+    ttl_hours: float = DEFAULT_TTL_HOURS,
+    timeout: float = DEFAULT_TIMEOUT,
+    *,
+    force_refresh: bool = False,
+    cache_dir: Path | None = None,
+) -> Playlist:
+    """Descarga una playlist por URL usando cache local con TTL.
+
+    - Si hay copia en cache con menos de `ttl_hours`, se usa sin red
+      (apertura instantánea, ideal para get.php lentos).
+    - Si no, se descarga (con timeout), se guarda en cache y se parsea.
+    - Con `ttl_hours <= 0` o `force_refresh=True` siempre re-descarga.
+    - Si la descarga falla pero hay cache previa (aunque caducada),
+      se devuelve la cache como fallback en vez de romper ("a veces
+      no funciona" por paneles saturados).
+    - `cache_dir` permite tests; por defecto es config.PLAYLIST_CACHE_DIR.
+
+    Errores de red/HTTP sin cache disponible se propagan como OSError
+    con mensaje amigable; URLs no http(s) lanzan ValueError.
+    """
+    url = url.strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError(f"URL no soportada (solo http/https): '{url}'")
+    directory = config.PLAYLIST_CACHE_DIR if cache_dir is None else Path(cache_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = _cache_path_for(url, directory)
+    name = _playlist_name_for(url)
+
+    fresh = ttl_hours > 0 and not force_refresh and _is_fresh(path, ttl_hours * 3600)
+    if fresh:
+        try:
+            text = _decompress_and_decode(path.read_bytes(), url)
+            return parse_text(text, source=url, name=name)
+        except (OSError, ValueError):
+            pass  # cache corrupta: re-descargar
+
+    try:
+        raw = fetch_bytes(url, timeout=timeout)
+    except (OSError, ValueError):
+        # Fallback stale: el panel a veces cae o tarda; mejor abrir
+        # la última copia conocida que no abrir nada.
+        if path.is_file():
+            try:
+                text = _decompress_and_decode(path.read_bytes(), url)
+                return parse_text(text, source=url, name=name)
+            except (OSError, ValueError):
+                pass
+        raise
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_bytes(raw)
+        tmp.replace(path)
+    except OSError:
+        pass  # si no se puede cachear, igual se parsea lo descargado
+
+    return parse_text(_decompress_and_decode(raw, url), source=url, name=name)

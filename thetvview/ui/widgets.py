@@ -489,6 +489,157 @@ class SearchBar:
             pass
 
 
+class SearchModal:
+    """Modal centrado para búsqueda incremental (canales y grupos).
+
+    Sustituye a la antigua barra superior: al pulsar ``/`` el campo de
+    texto aparece en un diálogo centrado con borde doble + sombra, con
+    contador live ``coincidencias/total`` y pista de teclas.
+
+    La lógica de filtrado sigue viviendo en la pantalla
+    (``query``/``searching``/``_apply_filter``); este widget solo dibuja.
+    Uso::
+
+        SearchModal.render(stdscr, title="Buscar canal",
+                           query=screen.query, matched=len(screen.visible_idx),
+                           total=len(screen.channels))
+
+    Todo addstr está protegido contra curses.error y terminales pequeñas.
+    """
+
+    DEFAULT_HINT = "Enter confirmar · Esc limpiar · Ctrl-U borrar"
+
+    def __init__(self, title: str = "Buscar", hint: str | None = None) -> None:
+        self.title = title
+        self.hint = hint if hint is not None else self.DEFAULT_HINT
+
+    @staticmethod
+    def visible_query(query: str, avail: int) -> str:
+        """Cola visible del query cuando excede el ancho (pura, testeable)."""
+        if avail <= 0:
+            return ""
+        if len(query) <= avail:
+            return query
+        return query[-avail:]
+
+    @staticmethod
+    def format_counter(matched: int, total: int) -> str:
+        """Texto del contador live (puro, testeable)."""
+        return f" {matched}/{total} "
+
+    def calc_rect(self, max_y: int, max_x: int) -> tuple[int, int, int, int]:
+        """Calcula (y, x, h, w) del modal centrado."""
+        w = max(30, min(max_x - 4, 56))
+        h = 7
+        # Si la terminal es muy baja, compactar a 6 filas.
+        if max_y < 12:
+            h = 6
+        y = max(1, (max_y - h) // 2)
+        x = max(0, (max_x - w) // 2)
+        return y, x, h, w
+
+    def cursor_pos(self, max_y: int, max_x: int, query: str) -> tuple[int, int] | None:
+        """Posición del cursor hardware dentro del campo (o None)."""
+        y, x, h, w = self.calc_rect(max_y, max_x)
+        field_w = max(4, w - 8)
+        visible = self.visible_query(query, field_w)
+        row = y + 2
+        col = x + 4 + len(f"{icons.ICON_SEARCH} ") + len(visible)
+        if row >= max_y - 1 or col >= max_x - 1:
+            return None
+        return row, col
+
+    def render(
+        self,
+        stdscr: curses.window,
+        query: str = "",
+        matched: int = 0,
+        total: int = 0,
+    ) -> tuple[int, int] | None:
+        """Dibuja el modal y devuelve la posición del cursor hardware."""
+        max_y, max_x = stdscr.getmaxyx()
+        if max_y < 8 or max_x < 30:
+            return None
+        y, x, h, w = self.calc_rect(max_y, max_x)
+
+        # Sombra (1 fila/col offset, dim) — mismo lenguaje que Modal/FormModal.
+        try:
+            for sy in range(y + 1, min(y + h + 1, max_y - 1)):
+                stdscr.addstr(sy, min(x + 1, max_x - 1),
+                              " " * max(0, min(w, max_x - x - 2)),
+                              colors.pair(colors.PAIR_MUTED) | curses.A_DIM)
+        except curses.error:
+            pass
+
+        # Borde doble.
+        border_attr = colors.pair(colors.PAIR_MODAL_BORDER)
+        try:
+            stdscr.addstr(y, x, icons.BOX_D_TL + icons.BOX_D_H * (w - 2) + icons.BOX_D_TR, border_attr)
+            for row in range(1, h - 1):
+                stdscr.addstr(y + row, x, icons.BOX_D_V, border_attr)
+                stdscr.addstr(y + row, x + w - 1, icons.BOX_D_V, border_attr)
+            stdscr.addstr(y + h - 1, x, icons.BOX_D_BL + icons.BOX_D_H * (w - 2) + icons.BOX_D_BR, border_attr)
+        except curses.error:
+            pass
+
+        # Título centrado en el borde superior.
+        title_str = f" {self.title} "
+        tx = x + max(0, (w - len(title_str)) // 2)
+        try:
+            stdscr.addstr(y, tx, title_str[:max(0, w - 2)],
+                          colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        # Campo de texto: " ⌕ <query>▌ ".
+        field_w = max(4, w - 8)
+        visible = self.visible_query(query, field_w)
+        cursor = "▌"
+        icon = f"{icons.ICON_SEARCH} "
+        line = f"{icon}{visible}{cursor}"
+        try:
+            stdscr.addstr(y + 2, x + 3, line[:max(0, w - 6)],
+                          colors.pair(colors.PAIR_SEARCH) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        # Contador live alineado a la derecha de la fila siguiente.
+        counter = self.format_counter(matched, total)
+        crow = y + 3
+        if crow < y + h - 1:
+            try:
+                stdscr.addstr(crow, x + max(2, w - len(counter) - 2),
+                              counter[:max(0, w - 4)],
+                              colors.pair(colors.PAIR_STATUS))
+            except curses.error:
+                pass
+
+        # Pista de teclas (tenue). En terminal compacta se omite si no cabe.
+        hrow = y + 4
+        if hrow < y + h - 1:
+            try:
+                stdscr.addstr(hrow, x + 2, self.hint[:max(0, w - 4)],
+                              colors.pair(colors.PAIR_DIM) | curses.A_DIM)
+            except curses.error:
+                pass
+
+        return self.cursor_pos(max_y, max_x, query)
+
+    @staticmethod
+    def render_modal(
+        stdscr: curses.window,
+        *,
+        title: str = "Buscar",
+        query: str = "",
+        matched: int = 0,
+        total: int = 0,
+        hint: str | None = None,
+    ) -> tuple[int, int] | None:
+        """Atajo funcional sin instanciar (para pantallas y tests)."""
+        modal = SearchModal(title=title, hint=hint or SearchModal.DEFAULT_HINT)
+        return modal.render(stdscr, query=query, matched=matched, total=total)
+
+
 class Modal:
     """Diálogo modal centrado con borde doble, sombra y botones."""
 
@@ -612,6 +763,291 @@ class Modal:
                     attr = colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD | curses.A_REVERSE
                 else:
                     attr = colors.pair(colors.PAIR_PRIMARY)
+                stdscr.addstr(by, offset, (txt + sep)[:max(0, w - (offset - x))], attr)
+                offset += len(txt) + len(sep)
+        except curses.error:
+            pass
+
+
+class FormModal:
+    """Modal con varios campos de texto + botones (p. ej. Añadir playlist).
+
+    Uso::
+
+        modal = FormModal("Añadir playlist",
+                          [("name", "Nombre"), ("source", "Ruta o URL")])
+        # en el bucle de App:
+        modal.render(stdscr)
+        res = modal.handle_key(key)  # "ok" | "cancel" | None
+        if res == "ok":
+            data = modal.data()  # {"name": ..., "source": ...}
+
+    - ``fields``: lista de ``(key, label)`` o ``(key, label, secret)``.
+      ``secret`` enmascara con ``*`` (contraseñas).
+    - ``initial``: valores precargados por key.
+    - Navegación: ↑/↓ o Tab cambia de campo, ←/→ en botones,
+      Enter en campo salta al siguiente (o a Guardar si es el último),
+      Enter en [Guardar] devuelve "ok", Esc cancela.
+    - Lógica pura en ``handle_key`` (testeable sin curses iniciado).
+    """
+
+    def __init__(
+        self,
+        title: str,
+        fields: list[tuple] | None = None,
+        buttons: list[str] | None = None,
+        initial: dict[str, str] | None = None,
+    ) -> None:
+        self.title = title
+        self.fields: list[tuple[str, str, bool]] = []
+        for spec in fields or []:
+            if len(spec) == 3:
+                key, label, secret = spec
+            else:
+                key, label = spec[0], spec[1]
+                secret = False
+            self.fields.append((str(key), str(label), bool(secret)))
+        self.buttons = buttons or ["Guardar", "Cancelar"]
+        self.values: dict[str, str] = {
+            key: str((initial or {}).get(key, "")) for key, _, _ in self.fields
+        }
+        self.focus: int = 0  # 0..len(fields)-1 campos, resto botones
+        self.error: str = ""
+        self._maxlen = 240
+
+    @property
+    def _total(self) -> int:
+        return len(self.fields) + len(self.buttons)
+
+    def _focus_is_field(self) -> bool:
+        return 0 <= self.focus < len(self.fields)
+
+    def _button_index(self) -> int:
+        return max(0, self.focus - len(self.fields))
+
+    def data(self) -> dict[str, str]:
+        """Valores actuales: strip en normales, sin strip en secretas."""
+        secrets = {key for key, _, secret in self.fields if secret}
+        return {k: (v if k in secrets else v.strip()) for k, v in self.values.items()}
+
+    def _secret_key(self) -> str | None:
+        for key, _, secret in self.fields:
+            if secret:
+                return key
+        return None
+
+    def raw_data(self) -> dict[str, str]:
+        return dict(self.values)
+
+    def handle_key(self, key: int) -> str | None:
+        """Procesa una tecla. Devuelve "ok", "cancel" o None."""
+        nfields = len(self.fields)
+        total = self._total
+        if total <= 0:
+            return None
+        # Cancelar siempre con Esc
+        if key == 27:
+            return "cancel"
+        # Tab / Shift-Tab (curses envía 9 y 353)
+        if key in (9,):
+            self.focus = (self.focus + 1) % total
+            self.error = ""
+            return None
+        if key == curses.KEY_BTAB:
+            self.focus = (self.focus - 1) % total
+            self.error = ""
+            return None
+        if key == curses.KEY_UP:
+            self.focus = (self.focus - 1) % total
+            self.error = ""
+            return None
+        if key == curses.KEY_DOWN:
+            self.focus = (self.focus + 1) % total
+            self.error = ""
+            return None
+        if key in (curses.KEY_LEFT,):
+            if not self._focus_is_field():
+                self._move_button(-1)
+                return None
+            return None
+        if key in (curses.KEY_RIGHT,):
+            if not self._focus_is_field():
+                self._move_button(1)
+                return None
+            return None
+        if key in (curses.KEY_ENTER, 10, 13):
+            if self._focus_is_field():
+                # Enter en campo: avanza al siguiente foco; si es el último
+                # campo, salta al botón de guardar (índice 0 de botones).
+                if self.focus == nfields - 1:
+                    self.focus = nfields  # primer botón (Guardar)
+                else:
+                    self.focus += 1
+                return None
+            # Foco en botón
+            label = self.buttons[self._button_index()].strip().lower()
+            if label.startswith("guardar") or label.startswith("aceptar") or label == "ok":
+                return "ok"
+            return "cancel"
+        # Edición solo en campos
+        if self._focus_is_field():
+            fkey = self.fields[self.focus][0]
+            cur = self.values[fkey]
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                self.values[fkey] = cur[:-1]
+                self.error = ""
+                return None
+            if key == curses.KEY_DC:  # Supr: limpiar campo
+                self.values[fkey] = ""
+                self.error = ""
+                return None
+            if 32 <= key < 127 or key > 160:
+                try:
+                    ch = chr(key)
+                except (ValueError, OverflowError):
+                    return None
+                if len(cur) < self._maxlen:
+                    self.values[fkey] = cur + ch
+                    self.error = ""
+                return None
+        return None
+
+    def _move_button(self, delta: int) -> None:
+        nfields = len(self.fields)
+        nbuttons = len(self.buttons)
+        idx = (self._button_index() + delta) % nbuttons
+        self.focus = nfields + idx
+        self.error = ""
+
+    def _calc_rect(self, max_y: int, max_x: int) -> tuple[int, int, int, int]:
+        """Calcula (y, x, h, w) del modal centrado."""
+        label_w = max((len(lbl) for _, lbl, _ in self.fields), default=0)
+        field_w = min(40, max(20, max_x - label_w - 12))
+        inner_w = max(len(self.title) + 6, label_w + field_w + 6, 44)
+        btn_line = "  ".join(f"[{b}]" for b in self.buttons)
+        inner_w = max(inner_w, len(btn_line) + 6)
+        if self.error:
+            inner_w = max(inner_w, len(self.error) + 6)
+        inner_w = min(inner_w, max(20, max_x - 4))
+        # alto: campos + error opcional + botones + huecos
+        inner_h = len(self.fields) + 4 + (1 if self.error else 0)
+        total_h = inner_h + 2
+        total_w = inner_w + 2
+        y = max(0, (max_y - total_h) // 2)
+        x = max(0, (max_x - total_w) // 2)
+        return y, x, total_h, total_w
+
+    def cursor_pos(self, max_y: int, max_x: int) -> tuple[int, int] | None:
+        """Posición (y, x) del cursor hardware si el foco es un campo."""
+        if not self._focus_is_field():
+            return None
+        y, x, _, w = self._calc_rect(max_y, max_x)
+        label_w = max((len(lbl) for _, lbl, _ in self.fields), default=0)
+        field_w = w - label_w - 7
+        fkey = self.fields[self.focus][0]
+        val = self.values[fkey]
+        avail = max(4, field_w)
+        visible = val[-avail:] if len(val) > avail else val
+        row = y + 2 + self.focus
+        col = x + 3 + label_w + 2 + len(visible)
+        if row >= max_y - 1 or col >= max_x - 1:
+            return None
+        return row, col
+
+    def render(self, stdscr: curses.window) -> None:
+        max_y, max_x = stdscr.getmaxyx()
+        if max_y < 8 or max_x < 30:
+            return
+        y, x, h, w = self._calc_rect(max_y, max_x)
+
+        # Sombra
+        try:
+            for sy in range(y + 1, min(y + h + 1, max_y - 1)):
+                stdscr.addstr(sy, min(x + 1, max_x - 1),
+                              " " * max(0, min(w, max_x - x - 2)),
+                              colors.pair(colors.PAIR_MUTED) | curses.A_DIM)
+        except curses.error:
+            pass
+
+        # Borde doble
+        border_attr = colors.pair(colors.PAIR_MODAL_BORDER)
+        try:
+            stdscr.addstr(y, x, icons.BOX_D_TL + icons.BOX_D_H * (w - 2) + icons.BOX_D_TR, border_attr)
+            for row in range(1, h - 1):
+                stdscr.addstr(y + row, x, icons.BOX_D_V, border_attr)
+                stdscr.addstr(y + row, x + w - 1, icons.BOX_D_V, border_attr)
+            stdscr.addstr(y + h - 1, x, icons.BOX_D_BL + icons.BOX_D_H * (w - 2) + icons.BOX_D_BR, border_attr)
+        except curses.error:
+            pass
+
+        # Título
+        title_str = f" {self.title} "
+        tx = x + max(0, (w - len(title_str)) // 2)
+        try:
+            stdscr.addstr(y, tx, title_str[:max(0, w - 2)],
+                          colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        # Campos: etiqueta + caja de edición
+        label_w = max((len(lbl) for _, lbl, _ in self.fields), default=0)
+        field_w = w - label_w - 7
+        for i, (fkey, label, secret) in enumerate(self.fields):
+            row = y + 2 + i
+            if row >= y + h - 2:
+                break
+            active = (self.focus == i)
+            try:
+                stdscr.addstr(row, x + 2, f" {label}:".ljust(label_w + 2)[:label_w + 2],
+                              (colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD)
+                              if active else colors.pair(colors.PAIR_NORMAL))
+            except curses.error:
+                pass
+            val = self.values[fkey]
+            shown = ("*" * len(val)) if secret else val
+            avail = max(4, field_w)
+            visible = shown[-avail:] if len(shown) > avail else shown
+            cursor = "▌" if active else " "
+            box = f"{visible}{cursor}".ljust(avail)[:avail]
+            try:
+                stdscr.addstr(row, x + 3 + label_w + 2, box,
+                              colors.pair(colors.PAIR_SEARCH) | curses.A_BOLD
+                              if active else colors.pair(colors.PAIR_STATUS))
+            except curses.error:
+                pass
+
+        # Error inline (si hay)
+        brow = y + 2 + len(self.fields)
+        if self.error:
+            if brow < y + h - 1:
+                try:
+                    stdscr.addstr(brow, x + 2, self.error[:max(0, w - 4)],
+                                  colors.pair(colors.PAIR_DANGER) | curses.A_BOLD)
+                except curses.error:
+                    pass
+            brow += 1
+        else:
+            # Pista de navegación
+            if brow < y + h - 1:
+                try:
+                    stdscr.addstr(brow, x + 2, "Tab/↑↓ campo · Enter siguiente · Esc cancela"[:max(0, w - 4)],
+                                  colors.pair(colors.PAIR_DIM) | curses.A_DIM)
+                except curses.error:
+                    pass
+            brow += 1
+
+        # Botones
+        by = y + h - 2
+        if by <= y or by >= max_y - 1:
+            return
+        try:
+            offset = x + max(2, (w - (sum(len(f"[{b}]") for b in self.buttons) + 2 * (len(self.buttons) - 1))) // 2)
+            for i, b in enumerate(self.buttons):
+                txt = f"[{b}]"
+                sep = "  " if i < len(self.buttons) - 1 else ""
+                focused = (not self._focus_is_field() and self._button_index() == i)
+                attr = (colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD | curses.A_REVERSE) if focused \
+                    else colors.pair(colors.PAIR_PRIMARY)
                 stdscr.addstr(by, offset, (txt + sep)[:max(0, w - (offset - x))], attr)
                 offset += len(txt) + len(sep)
         except curses.error:

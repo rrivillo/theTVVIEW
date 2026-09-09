@@ -43,12 +43,22 @@ def load_epg_source(source: str, *, force_refresh: bool = False) -> Epg:
     return parse_file(source)
 
 
-def load_playlist_source(source: str) -> Playlist:
-    """Parsea una fuente M3U (path local o URL http(s))."""
+def load_playlist_source(source: str, *, force_refresh: bool = False) -> Playlist:
+    """Parsea una fuente IPTV (path local o URL http(s)).
+
+    Acepta .m3u/.m3u8 y también .ts como lista válida (un solo stream),
+    sin pedir nada extra al usuario.
+
+    Las URLs remotas usan cache en disco con TTL (6h): la primera vez
+    descarga (hasta 30s de timeout para paneles lentos tipo get.php),
+    las siguientes abren instantáneo desde cache. Si el servidor falla
+    pero hay cache previa, se devuelve la cache en vez de romper.
+    Con `force_refresh=True` se re-descarga siempre (botón Recargar).
+    """
     from thetvview import m3u_parser
 
     if source.lower().startswith(("http://", "https://")):
-        return m3u_parser.parse_url(source)
+        return m3u_parser.load_url(source, force_refresh=force_refresh)
     return m3u_parser.parse_file(source)
 
 
@@ -91,6 +101,44 @@ def prompt_text(stdscr: curses.window, status: StatusBar, label: str) -> str | N
                 buffer = buffer[:-1]
             elif 32 <= key < 127 or key > 160:
                 # Limitar longitud total para no desbordar
+                if len(buffer) < 240:
+                    buffer += chr(key)
+    finally:
+        curses.curs_set(0)
+        status.show("")
+
+
+def prompt_password(stdscr: curses.window, status: StatusBar, label: str) -> str | None:
+    """Input modal para password sin eco. None si se cancela (Esc)."""
+    buffer = ""
+    curses.curs_set(1)
+    try:
+        while True:
+            max_y, max_x = stdscr.getmaxyx()
+            row = max(0, max_y - 1)
+            prefix = f" {label} "
+            avail = max(4, max_x - len(prefix) - 2)
+            # Mostrar asteriscos en lugar de caracteres
+            visible = "*" * len(buffer[-avail:]) if len(buffer) > avail else "*" * len(buffer)
+            cursor = "▌"
+            line = f"{prefix}{visible}{cursor}".ljust(max_x - 1)[: max_x - 1]
+            try:
+                stdscr.addstr(row, 0, line, colors.pair(colors.PAIR_SEARCH) | curses.A_BOLD)
+                if max_y >= 3:
+                    stdscr.addstr(max_y - 2, 0, "─" * (max_x - 1), colors.pair(colors.PAIR_BORDER))
+            except curses.error:
+                pass
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key == curses.KEY_RESIZE:
+                continue
+            if key in (27,):  # Esc
+                return None
+            if key in (curses.KEY_ENTER, 10, 13):
+                return buffer
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                buffer = buffer[:-1]
+            elif 32 <= key < 127 or key > 160:
                 if len(buffer) < 240:
                     buffer += chr(key)
     finally:
@@ -152,7 +200,7 @@ _HELP_HERE: dict[str, list[tuple[str, str]]] = {
         ("key", "R  actualizar el catálogo (releer playlists.json)."),
         ("key", "u  deshacer el último borrado."),
         ("key", "f  ver tus canales favoritos."),
-        ("tip", "Consejo: una lista es un fichero o una dirección URL .m3u."),
+        ("tip", "Consejo: una lista es un fichero o URL (.m3u, .m3u8, .ts)."),
     ],
     "ChannelsScreen": [
         ("key", "Enter  ver el canal seleccionado."),
@@ -224,7 +272,7 @@ def build_help_lines(screen) -> list[tuple[str, str]]:
         ("body", "El camino habitual es: Lista → Canales → Enter para ver."),
         ("key", "Esc  volver a la pantalla anterior."),
         ("key", "?  abrir o cerrar esta ayuda."),
-        ("key", "q  salir de la app."),
+        ("key", "q  salir de la app (pide confirmar)."),
         ("blank", ""),
         ("section", "Teclas que valen en todas partes"),
         ("key", "t  cambiar entre tema claro y oscuro."),
@@ -251,14 +299,14 @@ def build_help_lines(screen) -> list[tuple[str, str]]:
         ("body", "Reproduciendo: q detiene y vuelve a la lista."),
         ("blank", ""),
         ("section", "Cómo buscar (Canales y Grupos)"),
-        ("body", "1. Pulsa / y escribe: la lista se filtra sola."),
-        ("body", "2. Pulsa Enter para quedarte con el filtro."),
-        ("body", "3. Pulsa Esc para borrar la búsqueda."),
+        ("body", "1. Pulsa / y escribe en el modal: la lista se filtra sola."),
+        ("body", "2. Pulsa Enter para quedarte con el filtro y cerrar."),
+        ("body", "3. Pulsa Esc para borrar la búsqueda, Ctrl-U para vaciar."),
         ("blank", ""),
         ("section", "Si algo no funciona"),
         ("tip", "Sin reproductor: instala mpv, vlc o mplayer."),
         ("tip", "Sin guía: pulsa e y escribe la ruta o URL del XMLTV."),
-        ("tip", "Lista vacía: revisa que el fichero .m3u tenga canales."),
+        ("tip", "Lista vacía: revisa que el fichero tenga canales (.ts vale)."),
         ("tip", "Ventana pequeña: agrándala (mínimo 40 × 10)."),
         ("blank", ""),
         ("tip", "Para cerrar esta ayuda: pulsa Esc, q o ?."),
@@ -277,6 +325,40 @@ def build_help_text(screen) -> str:
         else:
             out.append(text)
     return "\n".join(out)
+
+
+# --- Confirmación de salida -------------------------------------------------
+
+QUIT_TITLE = "Salir"
+QUIT_MESSAGE = "¿Seguro que deseas salir de la aplicación?"
+QUIT_BUTTONS = ["Sí", "No"]
+
+
+def interpret_quit_choice(res: str | None, key: int) -> bool | None:
+    """Decide el modal de salida de forma pura (testeable sin curses).
+
+    Devuelve True si hay que salir, False si hay que quedarse,
+    None si el modal debe seguir abierto (navegación entre botones).
+
+    - ``res`` es lo que devuelve ``Modal.handle_key`` (botón en
+      minúsculas, "cancel" o None).
+    - ``key`` es la tecla cruda (para atajos Esc/q/s/n).
+    """
+    # Atajos directos de teclado (funcionan sin navegar botones).
+    if key in (ord("s"), ord("S"), ord("y"), ord("Y")):
+        return True
+    if key in (ord("n"), ord("N")):
+        return False
+    # Esc / q dentro del modal siempre cancelan (quedarse).
+    if key in (27, ord("q"), ord("Q")):
+        return False
+    if res == "cancel":
+        return False
+    if res in ("sí", "si", "s", "yes", "y"):
+        return True
+    if res in ("no", "n"):
+        return False
+    return None
 
 
 class App:
@@ -323,14 +405,10 @@ class App:
     # --- Layout ---------------------------------------------------------------
 
     def body_height(self) -> int:
-        from .layout import main_rect, content_rect
+        from .layout import main_rect
         max_y, max_x = self.stdscr.getmaxyx()
-        # Si la pantalla actual necesita search bar, descontar una fila
-        has_search = bool(getattr(self.screen, "searching", False) or getattr(self.screen, "query", ""))
-        if has_search and hasattr(self.screen, "visible_keys"):
-            return content_rect(max_y, max_x, has_search=True).h
-        if has_search and hasattr(self.screen, "visible_idx"):
-            return content_rect(max_y, max_x, has_search=True).h
+        # La búsqueda vive en un modal centrado (overlay) y ya no reserva
+        # una fila superior: el contenido usa siempre el alto completo.
         return main_rect(max_y, max_x).h
 
     # --- Resoluciones ---------------------------------------------------------
@@ -386,12 +464,130 @@ class App:
     # --- Acciones -----------------------------------------------------------
 
     def add_playlist(self) -> None:
-        name = prompt_text(self.stdscr, self.status, "Nombre:")
-        if not name:
+        """Selector de tipo de fuente: lista IPTV o Xtream."""
+        from .widgets import Modal
+
+        modal = Modal("Tipo de fuente", "¿Qué tipo de fuente quieres añadir?", ["M3U / M3U8 / TS", "Xtream API"])
+        modal.selected_button = 0
+        stdscr = self.stdscr
+        while True:
+            stdscr.erase()
+            self.header.render(stdscr, self.screen.title, len(self.stack))
+            self.screen.render(stdscr)
+            self._render_footer(stdscr)
+            modal.render(stdscr)
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key == curses.KEY_RESIZE:
+                continue
+            res = modal.handle_key(key)
+            if res in ("cancelar", "cancel", None):
+                if key in (27, ord("q"), curses.KEY_LEFT, curses.KEY_BACKSPACE):
+                    self.footer.show("Cancelado.")
+                    return
+                if res is None:
+                    continue
+                self.footer.show("Cancelado.")
+                return
+            if res in ("m3u / m3u8", "m3u / m3u8 / ts"):
+                self._add_m3u_playlist()
+                return
+            if res == "xtream api":
+                self._add_xtream_source()
+                return
+
+    def _prompt_form(
+        self,
+        title: str,
+        fields: list[tuple],
+        initial: dict[str, str] | None = None,
+    ) -> dict[str, str] | None:
+        """Formulario modal centrado multi-campo. None si se cancela (Esc).
+
+        Sustituye a los antiguos ``prompt_text`` en la barra inferior:
+        dibuja el fondo (header + pantalla + footer), encima el FormModal,
+        soporta KEY_RESIZE, terminal pequeña y cursor hardware en el campo
+        activo. Valida que ningún campo quede vacío y muestra el error
+        dentro del propio modal.
+        """
+        from .widgets import FormModal
+
+        modal = FormModal(title, fields, initial=initial)
+        stdscr = self.stdscr
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        try:
+            while True:
+                max_y, max_x = stdscr.getmaxyx()
+                if max_y < 10 or max_x < 40:
+                    # Terminal diminuta: no dibujar modal, solo aviso.
+                    stdscr.erase()
+                    msg = "Ventana demasiado pequeña"
+                    try:
+                        stdscr.addstr(max_y // 2, max(0, (max_x - len(msg)) // 2), msg)
+                    except curses.error:
+                        pass
+                    stdscr.refresh()
+                    key = stdscr.getch()
+                    if key in (27, ord("q")):
+                        self.footer.show("Cancelado.")
+                        return None
+                    continue
+                stdscr.erase()
+                self.header.render(stdscr, self.screen.title, len(self.stack))
+                self.screen.render(stdscr)
+                self._render_footer(stdscr)
+                modal.render(stdscr)
+                # Cursor hardware sobre el campo activo.
+                try:
+                    pos = modal.cursor_pos(max_y, max_x)
+                    if pos is not None:
+                        stdscr.move(*pos)
+                        curses.curs_set(1)
+                    else:
+                        curses.curs_set(0)
+                except curses.error:
+                    pass
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key == curses.KEY_RESIZE:
+                    continue
+                res = modal.handle_key(key)
+                if res is None:
+                    continue
+                if res == "cancel":
+                    self.footer.show("Cancelado.")
+                    return None
+                # res == "ok": validar campos obligatorios
+                data = modal.data()
+                # La contraseña Xtream puede quedar vacía solo si el campo
+                # no es secret; en general exigimos todo no vacío salvo
+                # que el caller marque opcionales vía initial=None especial.
+                missing = [lbl for key_, lbl, _ in modal.fields
+                           if not modal.values.get(key_, "").strip()]
+                if missing:
+                    modal.error = f"Falta: {missing[0]}"
+                    continue
+                return data
+        finally:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+
+    def _add_m3u_playlist(self) -> None:
+        """Añadir playlist IPTV con modal centrado (Nombre + Ruta o URL).
+
+        Acepta .m3u/.m3u8/.ts sin distinciones visibles para el usuario."""
+        data = self._prompt_form(
+            "Añadir playlist",
+            [("name", "Nombre"), ("source", "Ruta o URL")],
+        )
+        if not data:
             return
-        source = prompt_text(self.stdscr, self.status, "Ruta o URL:")
-        if not source:
-            return
+        name, source = data["name"], data["source"]
         try:
             self.playlists.add(name, source)
         except PlaylistError as exc:
@@ -399,6 +595,66 @@ class App:
             return
         self.screen.reload()
         self.status.show(f"Playlist '{name}' añadida.")
+
+    def _add_xtream_source(self) -> None:
+        """Xtream con un solo modal (nombre/servidor/usuario/contraseña)."""
+        data = self._prompt_form(
+            "Añadir Xtream",
+            [
+                ("name", "Nombre"),
+                ("server", "Servidor URL"),
+                ("user", "Usuario"),
+                ("password", "Contraseña", True),
+            ],
+        )
+        if not data:
+            return
+        # _prompt_form ya strippea nombre/servidor/usuario; la contraseña
+        # se devuelve sin strip (puede llevar espacios).
+        name = data["name"]
+        server = data["server"]
+        user = data["user"]
+        password = data.get("password", "")
+
+        # Test de conexión
+        from thetvview.xtream_config import XtreamConfig
+        from thetvview.xtream_provider import authenticate
+        from thetvview.xtream_security import normalize_server_url
+
+        try:
+            normalized = normalize_server_url(server)
+        except Exception as exc:
+            self.status.show(f"URL inválida: {exc}", error=True)
+            return
+
+        cfg = XtreamConfig(server_url=normalized, username=user, password=password)
+        self.show_loading("Probando conexión…", sub=normalized)
+        try:
+            info = authenticate(cfg, force_refresh=True)
+        except Exception as exc:
+            from thetvview.xtream_errors import friendly_message
+            self.status.show(
+                f"No se pudo añadir '{name}': {friendly_message(exc)}",
+                error=True,
+            )
+            return
+
+        # Auth OK: mostrar info y guardar
+        user_info = info.get("user_info", {})
+        status = user_info.get("status", "Active")
+        exp_date = user_info.get("exp_date", "")
+        msg = f"Conexión OK (estado: {status}"
+        if exp_date:
+            msg += f", expira: {exp_date}"
+        msg += "). Guardando…"
+
+        try:
+            self.playlists.add_xtream(name, normalized, user, password)
+        except PlaylistError as exc:
+            self.status.show(str(exc), error=True)
+            return
+        self.screen.reload()
+        self.status.show(msg)
 
     def remove_playlist(self, name: str) -> None:
         entry = self.playlists.get(name)
@@ -458,6 +714,43 @@ class App:
         else:
             self.status.show(f"'{name}' no existe.", error=True)
 
+    def confirm_quit(self) -> bool:
+        """Modal de confirmación de salida. True = salir, False = quedarse.
+
+        Botones ["Sí", "No"] con "No" preseleccionado por seguridad.
+        Atajos: s/y = Sí, n = No, Esc/q = No. ←/→/Tab navegan,
+        Enter confirma el botón enfocado. Soporta KEY_RESIZE.
+        """
+        from .widgets import Modal
+
+        modal = Modal(QUIT_TITLE, QUIT_MESSAGE, list(QUIT_BUTTONS))
+        modal.selected_button = 1  # "No" por defecto
+        stdscr = self.stdscr
+        while True:
+            stdscr.erase()
+            self.header.render(stdscr, self.screen.title, len(self.stack))
+            self.screen.render(stdscr)
+            self._render_footer(stdscr)
+            modal.render(stdscr)
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key == curses.KEY_RESIZE:
+                continue
+            # Atajos directos sin necesidad de navegar botones.
+            if key in (ord("s"), ord("S"), ord("y"), ord("Y")):
+                return True
+            if key in (ord("n"), ord("N")):
+                self.footer.show("Salida cancelada.")
+                return False
+            res = modal.handle_key(key)
+            decision = interpret_quit_choice(res, key)
+            if decision is True:
+                return True
+            if decision is False:
+                self.footer.show("Salida cancelada.")
+                return False
+            # None: era navegación entre botones, seguir en el modal.
+
     def toggle_favorite(self, channel: Channel) -> None:
         try:
             added = self.favorites.toggle(channel)
@@ -496,10 +789,12 @@ class App:
         """
         if self.epg is None:
             default = self.epg_source or (url_hint or "").strip()
-            label = f"XMLTV (ruta o URL .xml/.gz){' [' + default + ']' if default else ''}:"
-            path = prompt_text(self.stdscr, self.status, label)
-            if not path and default:
-                path = default
+            data = self._prompt_form(
+                "Cargar EPG",
+                [("path", "XMLTV ruta o URL")],
+                initial={"path": default},
+            )
+            path = (data or {}).get("path", "").strip() or default
             if not path:
                 return []
             try:
@@ -578,7 +873,7 @@ class App:
         name = getattr(playlist, "name", "lista") or "lista"
         self.show_loading(f"Actualizando '{name}'…", sub=source)
         try:
-            fresh = load_playlist_source(source)
+            fresh = load_playlist_source(source, force_refresh=True)
         except (OSError, ValueError) as exc:
             self.status.show(str(exc), error=True)
             return
@@ -780,9 +1075,12 @@ class App:
                             self.screen.stop_health()
                         except Exception:
                             pass
-                        ch_name = self.screen.channel.name
+                        try:
+                            msg = self.screen.exit_summary()
+                        except Exception:
+                            msg = f"'{self.screen.channel.name}' finalizado."
                         self.pop()
-                        self.footer.show(f"'{ch_name}' finalizado.")
+                        self.footer.show(msg)
                 except Exception:
                     pass
                 continue
@@ -796,7 +1094,8 @@ class App:
                         if action:
                             self.handle_action(action)
                         continue
-                    if not self.pop():
+                    # 'q' = salir de la app con confirmación (Esc = volver).
+                    if self.confirm_quit():
                         return
                     continue
                 if key == ord("t"):

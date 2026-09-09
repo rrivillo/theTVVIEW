@@ -368,7 +368,11 @@ class TestRealResolutions(unittest.TestCase):
 
 
 class TestRealPlayerCommands(unittest.TestCase):
-    """Construcción de comandos de player con canales reales que tienen EXTVLCOPT."""
+    """Comandos headless con canales reales que tienen EXTVLCOPT.
+
+    Todos los comandos se construyen con headless=True: nunca se abre
+    ventana ni se requiere DISPLAY/Wayland en CI.
+    """
 
     def setUp(self) -> None:
         self.pl = _load()
@@ -376,8 +380,11 @@ class TestRealPlayerCommands(unittest.TestCase):
 
     def test_comando_mpv_basico(self) -> None:
         ch = next(ch for ch in self.con_opts if ch.name == "Canal 2 TCS SD")
-        cmd = command_for(ch, "mpv", player_path="/usr/bin/mpv")
+        cmd = command_for(ch, "mpv", player_path="/usr/bin/mpv", headless=True)
         self.assertEqual(cmd[0], "/usr/bin/mpv")
+        # Headless: sin ventana ni audio real.
+        self.assertIn("--vo=null", cmd)
+        self.assertIn("--ao=null", cmd)
         # Verificar args de codec h264 están presentes
         self.assertIn("--vd=ffh264", cmd)
         # Verificar user-agent y referrer en cualquier posición
@@ -388,16 +395,20 @@ class TestRealPlayerCommands(unittest.TestCase):
 
     def test_comando_vlc_mismo_canal(self) -> None:
         ch = next(ch for ch in self.con_opts if ch.name == "Canal 2 TCS SD")
-        cmd = command_for(ch, "vlc", player_path="/usr/bin/vlc")
+        cmd = command_for(ch, "vlc", player_path="/usr/bin/vlc", headless=True)
         self.assertEqual(cmd[0], "/usr/bin/vlc")
+        self.assertIn("--intf", cmd)
+        self.assertIn("dummy", cmd)
         self.assertTrue(any("--http-user-agent=" in a for a in cmd))
         self.assertTrue(any("--http-referrer=" in a for a in cmd))
         self.assertTrue(any("--input-title-format=" in a for a in cmd))
 
     def test_comando_mplayer_mismo_canal(self) -> None:
         ch = next(ch for ch in self.con_opts if ch.name == "Canal 2 TCS SD")
-        cmd = command_for(ch, "mplayer", player_path="/usr/bin/mplayer")
+        cmd = command_for(ch, "mplayer", player_path="/usr/bin/mplayer", headless=True)
         self.assertEqual(cmd[0], "/usr/bin/mplayer")
+        self.assertIn("-vo", cmd)
+        self.assertIn("-ao", cmd)
         self.assertIn("-user-agent", cmd)
         # mplayer usa args separados: -user-agent VALUE
         idx = cmd.index("-user-agent")
@@ -406,10 +417,28 @@ class TestRealPlayerCommands(unittest.TestCase):
     def test_todos_los_canales_con_opciones_generan_comando(self) -> None:
         """Todos los canales con EXTVLCOPT deben generar comandos válidos."""
         for ch in self.con_opts[:50]:
-            cmd = command_for(ch, "mpv", player_path="/usr/bin/mpv")
+            cmd = command_for(ch, "mpv", player_path="/usr/bin/mpv", headless=True)
             self.assertEqual(cmd[0], "/usr/bin/mpv")
+            self.assertIn("--vo=null", cmd)
             self.assertEqual(cmd[-1], ch.url)
             self.assertTrue(any("--title" in a for a in cmd))
+
+    def test_launch_headless_no_requiere_display(self) -> None:
+        """launch(headless=True) usa Popen mockeado con flags dummy/null."""
+        from thetvview import player
+
+        ch = next(ch for ch in self.con_opts if ch.name == "Canal 2 TCS SD")
+        with (
+            mock.patch.object(
+                player.config, "find_player", return_value="/usr/bin/mpv"
+            ),
+            mock.patch.object(player.subprocess, "Popen") as popen,
+        ):
+            player.launch(ch, player_name="mpv", headless=True)
+        cmd = popen.call_args[0][0]
+        self.assertIn("--vo=null", cmd)
+        self.assertIn("--ao=null", cmd)
+        self.assertEqual(cmd[-1], ch.url)
 
     def test_kodiprop_se_ignora_con_aviso(self) -> None:
         """KODIPROP se ignora en mpv (no soportado)."""
@@ -865,13 +894,14 @@ class TestRealIntegration(unittest.TestCase):
             self.assertEqual(ch.group, "Honduras")
 
     def test_variantes_y_player(self) -> None:
-        """Flujo: detectar variantes -> seleccionar -> construir comando."""
+        """Flujo headless: detectar variantes -> seleccionar -> construir comando."""
         target = next(ch for ch in self.pl.channels if ch.name == "Canal 2 TCS SD")
         variants = variants_of(self.pl.channels, target)
         self.assertGreater(len(variants), 1)
         best = variants[-1]
-        cmd = command_for(best, "mpv", player_path="/usr/bin/mpv")
+        cmd = command_for(best, "mpv", player_path="/usr/bin/mpv", headless=True)
         self.assertEqual(cmd[0], "/usr/bin/mpv")
+        self.assertIn("--vo=null", cmd)
         self.assertEqual(cmd[-1], best.url)
 
     def test_todos_los_grupos_tienen_canales_parseables(self) -> None:
@@ -879,7 +909,7 @@ class TestRealIntegration(unittest.TestCase):
         groups = groups_of(self.pl.channels)
         for g, chs in groups.items():
             for ch in chs[:3]:
-                cmd = command_for(ch, "mpv", player_path="/usr/bin/mpv")
+                cmd = command_for(ch, "mpv", player_path="/usr/bin/mpv", headless=True)
                 self.assertEqual(cmd[-1], ch.url, f"Error en grupo '{g}', canal '{ch.name}'")
 
 

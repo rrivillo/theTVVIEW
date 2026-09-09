@@ -251,7 +251,8 @@ class PlaylistsScreen(Screen):
 
         inner_w = max(0, card_w - 4)
         name = entry.name[:inner_w]
-        name_line = f" {icons.ICON_TV} {name}"
+        icon = icons.ICON_XTREAM if entry.kind == "xtream" else icons.ICON_TV
+        name_line = f" {icon} {name}"
         try:
             stdscr.addstr(card_y + 1, card_x + 1, name_line[:inner_w], text_attr | curses.A_BOLD)
         except curses.error:
@@ -318,7 +319,7 @@ class PlaylistsScreen(Screen):
 class ChannelsScreen(Screen):
     """Lista de canales de una playlist abierta.
 
-    '/' activa búsqueda incremental: filtra mientras se escribe; Esc limpia,
+    '/' abre el modal de búsqueda: filtra mientras se escribe; Esc limpia,
     Enter confirma la consulta y vuelve a navegación normal.
     """
 
@@ -340,25 +341,75 @@ class ChannelsScreen(Screen):
         self.searching = False
         # Índices (sobre self.channels) de los canales visibles tras filtrar.
         self.visible_idx: list[int] = []
+        # Snapshot de favoritas + flag de estrella del título: se calculan
+        # en _apply_filter (una sola pasada en memoria) para no hacer IO
+        # por canal ni por frame con listas grandes.
+        self._fav_urls: set[str] = set()
+        self._has_fav: bool = False
         self._apply_filter()
 
     # --- Filtrado -------------------------------------------------------------
 
+    def _refresh_fav_snapshot(self, channels: list[Channel] | None = None) -> set[str]:
+        """Un solo acceso cacheado a favoritas (un stat como mucho).
+
+        Si el manager no expone `favorite_urls` (dobles de test con solo
+        `is_favorite`), se construye el set por canal.
+        """
+        mgr = self.app.favorites
+        get_urls = getattr(mgr, "favorite_urls", None)
+        if callable(get_urls):
+            try:
+                urls = set(get_urls())
+            except Exception:
+                urls = set()
+        else:
+            urls = set()
+            pool = channels if channels is not None else self.channels
+            is_fav = getattr(mgr, "is_favorite", None)
+            if callable(is_fav):
+                try:
+                    urls = {ch.url for ch in pool if is_fav(ch)}
+                except Exception:
+                    urls = set()
+        self._fav_urls = urls
+        return urls
+
     def _label_for(self, idx: int) -> str:
         ch = self.channels[idx]
-        return format_channel_name(
-            ch, favorite=self.app.favorites.is_favorite(ch)
-        )
+        return format_channel_name(ch, favorite=ch.url in self._fav_urls)
 
     def _apply_filter(self, keep_selection: bool = False) -> None:
         prev = self.current_channel() if keep_selection else None
+        channels = self.channels
+        fav_urls = self._refresh_fav_snapshot(channels)
         q = self.query.casefold()
-        self.visible_idx = [
-            i
-            for i, ch in enumerate(self.channels)
-            if not q or q in ch.name.casefold() or (ch.group and q in ch.group.casefold())
-        ]
-        self.list.set_items([self._label_for(i) for i in self.visible_idx], keep_selection=True)
+        if not q:
+            self.visible_idx = list(range(len(channels)))
+            labels = [
+                format_channel_name(ch, favorite=ch.url in fav_urls)
+                for ch in channels
+            ]
+        else:
+            visible: list[int] = []
+            labels: list[str] = []
+            append_v = visible.append
+            append_l = labels.append
+            for i, ch in enumerate(channels):
+                name_cf = ch.name.casefold()
+                grp = ch.group
+                if q in name_cf or (grp and q in grp.casefold()):
+                    append_v(i)
+                    append_l(format_channel_name(ch, favorite=ch.url in fav_urls))
+            self.visible_idx = visible
+        has_fav = False
+        if fav_urls:
+            for ch in channels:
+                if ch.url in fav_urls:
+                    has_fav = True
+                    break
+        self._has_fav = has_fav
+        self.list.set_items(labels, keep_selection=True)
         if prev is not None:
             for pos, i in enumerate(self.visible_idx):
                 if self.channels[i] is prev:
@@ -410,7 +461,7 @@ class ChannelsScreen(Screen):
         max_y, max_x = self.app.stdscr.getmaxyx()
         show_detail = max_x >= 80
         sidebar_w = max(28, int(max_x * 0.6)) if show_detail else max_x
-        list_start_y = 2
+        list_start_y = 1
         body_h = max(1, max_y - list_start_y - 2)
         if my < list_start_y or my >= list_start_y + body_h:
             return False
@@ -440,6 +491,10 @@ class ChannelsScreen(Screen):
                 self.app.footer.show(msg)
             except Exception:
                 pass
+            return None
+        if key in (21,):  # Ctrl-U: borrar el contenido del modal sin cerrarlo
+            self.query = ""
+            self._apply_filter(keep_selection=True)
             return None
         if key in (curses.KEY_BACKSPACE, 127, 8):
             self.query = self.query[:-1]
@@ -527,7 +582,7 @@ class ChannelsScreen(Screen):
         grp = ""
         if self.group_filtered:
             grp = f" · [{self.group}]" if self.group else " · [sin grupo]"
-        star = " ★" if any(self.app.favorites.is_favorite(c) for c in self.channels) else ""
+        star = " ★" if self._has_fav else ""
         return f"{self.playlist.name}{grp}{suffix}{star}"
 
     def _render_detail_panel(self, stdscr: curses.window, x: int, y: int, w: int, h: int) -> None:
@@ -546,7 +601,7 @@ class ChannelsScreen(Screen):
 
         # Nombre del canal
         icon = icons.ICON_RADIO if ch.radio else icons.ICON_TV
-        fav = " ★" if self.app.favorites.is_favorite(ch) else ""
+        fav = " ★" if ch.url in self._fav_urls else ""
         name_line = f" {icon} {ch.name}{fav}"
         try:
             stdscr.addstr(row, x, name_line[:w], colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD)
@@ -674,6 +729,17 @@ class ChannelsScreen(Screen):
 
     def render(self, stdscr: curses.window) -> None:
         max_y, max_x = stdscr.getmaxyx()
+        # Si las favoritas cambiaron fuera (p. ej. al volver de
+        # FavoritesScreen), re-etiquetar una vez; en memoria y barato.
+        get_urls = getattr(self.app.favorites, "favorite_urls", None)
+        urls = self._fav_urls
+        if callable(get_urls):
+            try:
+                urls = set(get_urls())
+            except Exception:
+                urls = self._fav_urls
+        if urls != self._fav_urls:
+            self._apply_filter(keep_selection=True)
         self.title = self._title_text()
         from .layout import sidebar_rect, detail_rect
 
@@ -686,8 +752,7 @@ class ChannelsScreen(Screen):
             sidebar_w = sb.w
             detail_x = dr.x
             detail_w = dr.w
-            search_y = 1
-            list_start_y = 2
+            list_start_y = 1
             body_h = max(1, max_y - list_start_y - 2)
             sidebar_w = min(sidebar_w, max_x)
             detail_w = max(1, max_x - sidebar_w - 1)
@@ -698,39 +763,15 @@ class ChannelsScreen(Screen):
             sidebar_w = sb.w
             detail_x = dr.x
             detail_w = max(22, dr.w)  # min 22 en compacto
-            search_y = 1
-            list_start_y = 2
+            list_start_y = 1
             body_h = max(1, max_y - list_start_y - 2)
             sidebar_w = min(sidebar_w, max_x)
             detail_w = max(22, max_x - sidebar_w - 1)
         else:
             show_detail = False
-            search_y = 1
-            list_start_y = 2
+            list_start_y = 1
             body_h = max(1, max_y - list_start_y - 2)
             sidebar_w = max_x
-
-        # Búsqueda (usa SearchBar-like rendering mejorado)
-        if self.searching or self.query:
-            cursor = "▌" if self.searching else ""
-            icon = f" {icons.ICON_SEARCH} "
-            counter = f" {len(self.visible_idx)}/{len(self.channels)} " if self.query else ""
-            inner = max(0, sidebar_w - len(icon) - len(counter) - 2)
-            query_part = self.query[:inner] + cursor
-            # Rellenar para que counter quede a la derecha
-            pad = max(0, inner - len(query_part))
-            line = f"{icon}{query_part}{' ' * pad}{counter}"
-            pair = colors.PAIR_SEARCH if self.searching else colors.PAIR_STATUS
-            try:
-                stdscr.addstr(search_y, 0, line[:sidebar_w].ljust(sidebar_w)[:sidebar_w], colors.pair(pair))
-            except curses.error:
-                pass
-        else:
-            # Si no hay búsqueda, limpiar fila 1 para no dejar residuos
-            try:
-                stdscr.addstr(search_y, 0, " " * sidebar_w, colors.pair(colors.PAIR_NORMAL))
-            except curses.error:
-                pass
 
         # Lista de canales (izquierda)
         if not self.visible_idx and not self.query:
@@ -765,6 +806,17 @@ class ChannelsScreen(Screen):
             except curses.error:
                 pass
             self._render_detail_panel(stdscr, detail_x, list_start_y, detail_w, body_h)
+
+        # Modal de búsqueda (overlay centrado, filtra en vivo el fondo).
+        if self.searching:
+            from .widgets import SearchModal
+            SearchModal.render_modal(
+                stdscr,
+                title="Buscar canal",
+                query=self.query,
+                matched=len(self.visible_idx),
+                total=len(self.channels),
+            )
 
 
 class FavoritesScreen(Screen):
@@ -901,7 +953,7 @@ class RecentsScreen(Screen):
 class GroupsScreen(Screen):
     """Grupos (group-title) de una playlist — vista cards.
 
-    '/' activa búsqueda incremental: filtra mientras se escribe; Esc limpia,
+    '/' abre el modal de búsqueda: filtra mientras se escribe; Esc limpia,
     Enter confirma la consulta y vuelve a navegación normal.
     """
 
@@ -967,7 +1019,6 @@ class GroupsScreen(Screen):
         """Ajusta _first_row para que selected siempre sea visible."""
         max_y, max_x = self.app.stdscr.getmaxyx()
         cols = 2 if max_x >= 100 else 1
-        search_offset = 1 if (self.searching or self.query) else 0
         rows = self._visible_rows(max_y)
         max_sel = max(0, len(self.visible_keys) - 1)
         self.selected = max(0, min(self.selected, max_sel))
@@ -998,8 +1049,7 @@ class GroupsScreen(Screen):
         total_w = cols * card_w + (cols - 1) * gap
         start_x = max(0, (max_x - total_w) // 2)
         card_h = 4
-        search_offset = 1 if (self.searching or self.query) else 0
-        start_y = 1 + search_offset
+        start_y = 1
         for i, _ in enumerate(self.visible_keys):
             row = i // cols
             if row < self._first_row:
@@ -1024,6 +1074,10 @@ class GroupsScreen(Screen):
             self._apply_filter()
             self.app.status.show("Búsqueda limpiada.")
             self.app.footer.show("Búsqueda limpiada.")
+            return None
+        if key in (21,):  # Ctrl-U: borrar el contenido del modal sin cerrarlo
+            self.query = ""
+            self._apply_filter(keep_selection=True)
             return None
         if key in (curses.KEY_BACKSPACE, 127, 8):
             self.query = self.query[:-1]
@@ -1148,28 +1202,6 @@ class GroupsScreen(Screen):
                               "No hay grupos en esta playlist.", "")
             return
 
-        search_offset = 1 if (self.searching or self.query) else 0
-
-        # Búsqueda (fila y=1)
-        if self.searching or self.query:
-            cursor = "▌" if self.searching else ""
-            icon = f" {icons.ICON_SEARCH} "
-            counter = f" {len(self.visible_keys)}/{len(self.keys)} " if self.query else ""
-            inner = max(0, max_x - len(icon) - len(counter) - 2)
-            query_part = self.query[:inner] + cursor
-            pad = max(0, inner - len(query_part))
-            line = f"{icon}{query_part}{' ' * pad}{counter}"
-            pair = colors.PAIR_SEARCH if self.searching else colors.PAIR_STATUS
-            try:
-                stdscr.addstr(1, 0, line[:max_x].ljust(max_x)[:max_x], colors.pair(pair))
-            except curses.error:
-                pass
-        else:
-            try:
-                stdscr.addstr(1, 0, " " * max_x, colors.pair(colors.PAIR_NORMAL))
-            except curses.error:
-                pass
-
         if not self.visible_keys and self.query:
             msg = f"Sin resultados para '{self.query}'"
             mx = max(0, (max_x - len(msg)) // 2)
@@ -1178,6 +1210,15 @@ class GroupsScreen(Screen):
                               colors.pair(colors.PAIR_EMPTY))
             except curses.error:
                 pass
+            if self.searching:
+                from .widgets import SearchModal
+                SearchModal.render_modal(
+                    stdscr,
+                    title="Buscar grupo",
+                    query=self.query,
+                    matched=len(self.visible_keys),
+                    total=len(self.keys),
+                )
             return
 
         cols = 2 if max_x >= 100 else 1
@@ -1186,7 +1227,7 @@ class GroupsScreen(Screen):
         total_w = cols * card_w + (cols - 1) * gap
         start_x = max(0, (max_x - total_w) // 2)
         card_h = 4
-        start_y = 1 + search_offset
+        start_y = 1
         visible_rows = self._visible_rows(max_y)
 
         for i, key in enumerate(self.visible_keys):
@@ -1212,6 +1253,16 @@ class GroupsScreen(Screen):
                     stdscr.addstr(py, px, info, colors.pair(colors.PAIR_DIM) | curses.A_DIM)
             except curses.error:
                 pass
+        # Modal de búsqueda (overlay centrado, filtra en vivo el fondo).
+        if self.searching:
+            from .widgets import SearchModal
+            SearchModal.render_modal(
+                stdscr,
+                title="Buscar grupo",
+                query=self.query,
+                matched=len(self.visible_keys),
+                total=len(self.keys),
+            )
 
 
 class ResolutionScreen(Screen):
@@ -1436,6 +1487,25 @@ class NowPlayingScreen(Screen):
             return self.proc.poll() is None
         except Exception:
             return False
+
+    def exit_summary(self) -> str:
+        """Mensaje de cierre según cómo murió el reproductor.
+
+        Si murió al instante con código != 0, explica la causa probable
+        (stream que no abrió: proveedor/URL) en vez del "finalizado"
+        genérico que ocultaba el problema.
+        """
+        try:
+            returncode = self.proc.poll()
+        except Exception:
+            returncode = None
+        try:
+            hint = player.explain_early_exit(returncode, self.elapsed_seconds())
+        except Exception:
+            hint = None
+        if hint:
+            return f"'{self.channel.name}' no abrió. {hint}"
+        return f"'{self.channel.name}' finalizado."
 
     def stop_health(self) -> None:
         """Detiene el hilo de sonda de salud (idempotente, no bloquea)."""
@@ -1808,7 +1878,15 @@ class EpgScreen(Screen):
 
 
 def open_playlist(app, entry: PlaylistEntry) -> None:
-    """Carga y parsea una entrada del catálogo, empujando ChannelsScreen."""
+    """Carga y parsea una entrada del catálogo, empujando ChannelsScreen.
+
+    Para fuentes Xtream: pide password si no está en memoria, autentica,
+    descarga canales y los normaliza a Channel.
+    """
+    if entry.kind == "xtream":
+        _open_xtream_playlist(app, entry)
+        return
+
     from .app import load_playlist_source
 
     source = entry.source.strip()
@@ -1821,6 +1899,86 @@ def open_playlist(app, entry: PlaylistEntry) -> None:
     if not playlist.channels:
         app.status.show(f"'{entry.name}' no contiene canales.", error=True)
         return
+    app.push(ChannelsScreen(app, playlist))
+
+
+def _open_xtream_playlist(app, entry: PlaylistEntry) -> None:
+    """Abre una fuente Xtream: auth + carga de canales + normalización."""
+    # Obtener credenciales (password en memoria)
+    creds = app.playlists.get_credentials(entry.name)
+    if creds is None:
+        # Pedir password con modal centrado (campo secreto).
+        data = app._prompt_form(
+            "Xtream · contraseña",
+            [("password", f"Contraseña ({entry.name})", True)],
+        )
+        password = (data or {}).get("password", "")
+        if not password:
+            app.status.show("Cancelado: se necesita contraseña.", error=True)
+            return
+        app.playlists.set_password(entry.name, password)
+        creds = app.playlists.get_credentials(entry.name)
+        if creds is None:
+            app.status.show("Error al configurar credenciales.", error=True)
+            return
+
+    server_url, username, password = creds
+
+    # Autenticar y cargar
+    from thetvview.xtream_config import XtreamConfig
+    from thetvview.xtream_provider import (
+        authenticate,
+        get_live_categories,
+        get_live_streams,
+    )
+    from thetvview.xtream_models import normalize_live_stream, build_category_map
+
+    cfg = XtreamConfig(server_url=server_url, username=username, password=password)
+    app.show_loading("Conectando…", sub=server_url)
+    try:
+        authenticate(cfg)
+    except Exception as exc:
+        from thetvview.xtream_errors import friendly_message
+        app.status.show(
+            f"No se pudo abrir '{entry.name}': {friendly_message(exc)}",
+            error=True,
+        )
+        return
+
+    # Cargar categorías y canales
+    try:
+        categories = get_live_categories(cfg)
+        streams = get_live_streams(cfg)
+    except Exception as exc:
+        from thetvview.xtream_errors import friendly_message
+        app.status.show(
+            f"No se pudo cargar '{entry.name}': {friendly_message(exc)}",
+            error=True,
+        )
+        return
+
+    cat_map = build_category_map(categories)
+
+    # Normalizar a Channel
+    channels = []
+    for s in streams:
+        ch = normalize_live_stream(s, server_url, username, password)
+        cat_name = cat_map.get(str(s.category_id))
+        if cat_name:
+            ch.group = cat_name
+        channels.append(ch)
+
+    if not channels:
+        app.status.show(f"'{entry.name}' no contiene canales.", error=True)
+        return
+
+    playlist = Playlist(
+        name=entry.name,
+        channels=channels,
+        source=entry.source,
+    )
+    source_key = entry.source.strip()
+    app.playlist_cache[source_key] = playlist
     app.push(ChannelsScreen(app, playlist))
 
 

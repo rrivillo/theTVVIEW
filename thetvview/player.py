@@ -25,6 +25,36 @@ class PlayerError(Exception):
     """Error amigable al lanzar un reproductor."""
 
 
+# Segundos bajo los cuales una muerte del reproductor se considera
+# "al instante" (el stream ni siquiera llegó a abrir).
+EARLY_EXIT_SECONDS: float = 4.0
+
+
+def explain_early_exit(returncode: int | None, elapsed_seconds: float) -> str | None:
+    """Explica una muerte prematura del reproductor, o None si fue normal.
+
+    - returncode None: sigue vivo (no hay nada que explicar).
+    - returncode 0 o duración normal: fin normal, sin mensaje extra.
+    - Otro código en <EARLY_EXIT_SECONDS: el stream no abrió. En la
+      práctica casi siempre es el proveedor (401/línea caducada o
+      bloqueada, URL caída), no el comando local.
+    """
+    if returncode is None:
+        return None
+    try:
+        elapsed = float(elapsed_seconds)
+    except (TypeError, ValueError):
+        return None
+    if returncode == 0 or elapsed >= EARLY_EXIT_SECONDS:
+        return None
+    return (
+        f"Se cerró al instante (código {returncode}): el stream no llegó "
+        "a abrir. Suele ser el proveedor (401/línea caducada o bloqueada, "
+        "URL caída). Prueba otro canal; si fallan todos, pide al proveedor "
+        "que revise la línea."
+    )
+
+
 # Claves EXTVLCOPT que traducimos, por reproductor (claves canónicas).
 #   mpv/mplayer: flag separado del valor; vlc: flag con '=' incrustado.
 # Convenciones reales: "http-user-agent" y "http-referrer" son las claves
@@ -82,6 +112,25 @@ def _codec_h264_args(player_name: str) -> list[str]:
             "--avcodec-hw=any",
             "--avcodec-codec=h264",
         ]
+    return []
+
+
+def _headless_args(player_name: str) -> list[str]:
+    """Argumentos headless por reproductor (sin ventana ni display).
+
+    Pensados para tests/CI y entornos sin GUI: no abren ventana,
+    no requieren DISPLAY/Wayland y no tocan el audio real.
+
+    - mpv: --vo=null (salida de vídeo nula) + --ao=null (audio nulo).
+    - vlc: --intf dummy (equivale a cvlc) + --vout dummy + --aout dummy.
+    - mplayer: -vo null -ao null (drivers nulos, no necesitan X11).
+    """
+    if player_name == "mpv":
+        return ["--vo=null", "--ao=null"]
+    if player_name == "vlc":
+        return ["--intf", "dummy", "--vout", "dummy", "--aout", "dummy"]
+    if player_name == "mplayer":
+        return ["-vo", "null", "-ao", "null"]
     return []
 
 
@@ -150,11 +199,23 @@ def _option_args(
     return args, warnings
 
 
-def command_for(channel: Channel, player_name: str, player_path: str | None = None) -> list[str]:
+def command_for(
+    channel: Channel,
+    player_name: str,
+    player_path: str | None = None,
+    headless: bool = False,
+) -> list[str]:
     """Construye la línea de comando (lista argv) para reproducir `channel`.
 
     Lanza PlayerError si el reproductor no está disponible o no está
     soportado. Nunca incluye metadatos no validados sin lista blanca.
+
+    Args:
+        channel: canal a reproducir.
+        player_name: 'mpv', 'mplayer' o 'vlc'.
+        player_path: ruta al binario (si None, se resuelve con find_player).
+        headless: si True, añade drivers nulos/dummy para tests o
+            entornos sin display (no abre ventana ni requiere GUI).
     """
     path = player_path or config.find_player(player_name)
     if not path:
@@ -192,6 +253,8 @@ def command_for(channel: Channel, player_name: str, player_path: str | None = No
         # Prefijo ffmpeg:// fuerza el manejo via libavformat que resuelve
         # correctamente URLs relativas contra la base.
         # Detecta tanto .m3u8 (HLS) como .m3u (playlists genéricos).
+        # Los streams .ts se reproducen directos (ya van con -demuxer lavf),
+        # sin prefijo ffmpeg://.
         url_lower = url.lower()
         if not url_lower.startswith("ffmpeg://") and (
             url_lower.endswith(".m3u8") or url_lower.endswith(".m3u")
@@ -202,19 +265,25 @@ def command_for(channel: Channel, player_name: str, player_path: str | None = No
     title_args = _title_args(channel, player_name)
     # gpu-api=opengl: prioriza OpenGL como API de renderizado de video.
     # Si OpenGL no está disponible, mpv hace fallback automático a
-    # Vulkan u otras APIs soportadas.
-    gpu_args = ["--gpu-api=opengl"] if player_name == "mpv" else []
-    return [path, *codec_args, *gpu_args, *args, *title_args, url]
+    # Vulkan u otras APIs soportadas. En headless se omite: --vo=null
+    # no necesita GPU y forzar opengl podría fallar sin display.
+    gpu_args = ["--gpu-api=opengl"] if player_name == "mpv" and not headless else []
+    headless_args = _headless_args(player_name) if headless else []
+    return [path, *headless_args, *codec_args, *gpu_args, *args, *title_args, url]
 
 
 def launch(
-    channel: Channel, player_name: str | None = None
+    channel: Channel, player_name: str | None = None, headless: bool = False
 ) -> subprocess.Popen[bytes]:
     """Lanza el reproductor para `channel` y devuelve el proceso.
 
     Si no se indica `player_name`, usa el primero detectado en orden de
     preferencia (config.SUPPORTED_PLAYERS). Bloquea solo lo que tarda el
     fork/exec; la TUI queda libre mientras el reproductor esté abierto.
+
+    Args:
+        headless: si True, construye el comando con drivers nulos/dummy
+            (ver _headless_args) para tests/CI sin display.
     """
     candidates = (
         (player_name,) if player_name else config.SUPPORTED_PLAYERS
@@ -223,7 +292,7 @@ def launch(
     for name in candidates:
         path = config.find_player(name)
         if path:
-            cmd = command_for(channel, name, player_path=path)
+            cmd = command_for(channel, name, player_path=path, headless=headless)
             return subprocess.Popen(  # noqa: S603 - argv sin shell
                 cmd,
                 stdin=subprocess.DEVNULL,

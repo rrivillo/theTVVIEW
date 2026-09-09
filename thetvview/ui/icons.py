@@ -13,6 +13,7 @@ ICON_RADIO = "♪"
 ICON_PLAY = "▶"
 ICON_LIVE = "●"
 ICON_LIVE_OFF = "○"
+ICON_XTREAM = "◈"  # fuente Xtream/IPTV
 
 # --- Favoritos -------------------------------------------------------------
 ICON_STAR = "★"

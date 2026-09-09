@@ -21,11 +21,13 @@ from pathlib import Path
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 DATA_DIR: Path = PROJECT_ROOT / "data"
 EPG_CACHE_DIR: Path = DATA_DIR / "epg_cache"
+PLAYLIST_CACHE_DIR: Path = DATA_DIR / "playlist_cache"
 PLAYLISTS_JSON: Path = DATA_DIR / "playlists.json"
 FAVORITES_JSON: Path = DATA_DIR / "favorites.json"
 THEME_JSON: Path = DATA_DIR / "theme.json"
 PREFS_JSON: Path = DATA_DIR / "prefs.json"
 RECENTS_JSON: Path = DATA_DIR / "recents.json"
+XTREAM_CACHE_DIR: Path = DATA_DIR / "xtream_cache"
 
 SUPPORTED_PLAYERS: tuple[str, ...] = ("mpv", "mplayer", "vlc")
 
@@ -168,6 +170,8 @@ def _candidate_paths(name: str) -> list[Path]:
 def ensure_dirs() -> None:
     """Crea los directorios de datos si no existen (idempotente)."""
     EPG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    PLAYLIST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    XTREAM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     PREFS_JSON.parent.mkdir(parents=True, exist_ok=True)
     RECENTS_JSON.parent.mkdir(parents=True, exist_ok=True)
 

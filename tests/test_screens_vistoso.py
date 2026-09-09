@@ -55,7 +55,7 @@ class TestPlaylistsScreenCard(unittest.TestCase):
         app = _StubApp(max_y=10, max_x=40)
         app.playlists = mock.Mock()
         app.playlists.load = mock.Mock(return_value=[
-            type("E", (), {"name": "Test", "source": "http://x/a.m3u"})()
+            type("E", (), {"name": "Test", "source": "http://x/a.m3u", "kind": "m3u"})()
         ])
         screen = PlaylistsScreen(app)
         with mock.patch.object(colors, "pair", return_value=0):
@@ -69,7 +69,7 @@ class TestPlaylistsScreenCard(unittest.TestCase):
         app = _StubApp(max_y=30, max_x=120)
         app.playlists = mock.Mock()
         app.playlists.load = mock.Mock(return_value=[
-            type("E", (), {"name": "Test", "source": "http://x/a.m3u"})()
+            type("E", (), {"name": "Test", "source": "http://x/a.m3u", "kind": "m3u"})()
         ])
         screen = PlaylistsScreen(app)
         with mock.patch.object(colors, "pair", return_value=0):
