@@ -137,7 +137,7 @@ class PlaylistsScreen(Screen):
     def shortcuts(self) -> str:
         if not self.entries:
             return "a Añadir · r Recientes · t Tema · ? Ayuda · q Salir"
-        return "↑/↓/←/→ · Enter · a Añadir · d Borrar · R Actualizar · r Recientes · f ★ · t Tema · ? Ayuda · q Salir"
+        return "↑/↓/←/→ · Enter · a Añadir · d Borrar · C Contraseña Xtream · R Actualizar · r Recientes · f ★ · t Tema · ? Ayuda · q Salir"
 
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
         if not self.entries:
@@ -203,6 +203,17 @@ class PlaylistsScreen(Screen):
                 self.app.footer.show("No hay playlists que borrar.")
                 return None
             return {"action": "remove_playlist", "name": entry.name}
+        elif key in (ord("c"), ord("C")):
+            entry = self.current_entry()
+            if entry is None:
+                return None
+            if entry.kind != "xtream":
+                try:
+                    self.app.footer.show("Solo las listas Xtream tienen contraseña.")
+                except Exception:
+                    pass
+                return None
+            return {"action": "change_password", "name": entry.name}
         elif key == ord("f"):
             return {"action": "show_favorites"}
         elif key in (curses.KEY_ENTER, 10, 13):
@@ -220,8 +231,10 @@ class PlaylistsScreen(Screen):
                      card_x: int, card_y: int, card_w: int, selected: bool) -> None:
         """Renderiza una card individual de playlist."""
         max_y = stdscr.getmaxyx()[0]
+        # Amarillo para M3U/html, púrpura para Xtream.
+        sel_pair = colors.selection_pair_for_kind(getattr(entry, "kind", "m3u"))
         border_attr = colors.pair(colors.PAIR_PRIMARY if selected else colors.PAIR_BORDER)
-        text_attr = colors.pair(colors.PAIR_SELECTED if selected else colors.PAIR_NORMAL)
+        text_attr = colors.pair(sel_pair if selected else colors.PAIR_NORMAL)
         dim_attr = colors.pair(colors.PAIR_DIM)
 
         card_h = 5
@@ -232,7 +245,7 @@ class PlaylistsScreen(Screen):
         if selected:
             try:
                 for r in range(card_h):
-                    stdscr.addstr(card_y + r, card_x, " " * card_w, colors.pair(colors.PAIR_SELECTED))
+                    stdscr.addstr(card_y + r, card_x, " " * card_w, colors.pair(sel_pair))
             except curses.error:
                 pass
 
@@ -336,7 +349,9 @@ class ChannelsScreen(Screen):
             self.channels = [c for c in playlist.channels if (c.group or None) == self.group]
         else:
             self.channels = list(playlist.channels)
-        self.list = ScrollableList()
+        self.list = ScrollableList(
+            selected_pair=colors.selection_pair_for_kind(getattr(playlist, "kind", "m3u"))
+        )
         self.query = ""
         self.searching = False
         # Índices (sobre self.channels) de los canales visibles tras filtrar.
@@ -432,6 +447,9 @@ class ChannelsScreen(Screen):
         cur = self.current_channel()
         ident = (cur.name, cur.url) if cur is not None else None
         self.playlist = fresh
+        self.list.set_selected_pair(
+            colors.selection_pair_for_kind(getattr(fresh, "kind", "m3u"))
+        )
         if self.group_filtered:
             self.channels = [c for c in fresh.channels if (c.group or None) == self.group]
         else:
@@ -1147,8 +1165,9 @@ class GroupsScreen(Screen):
     def _render_card(self, stdscr: curses.window, name: str | None, count: int,
                      card_x: int, card_y: int, card_w: int, selected: bool) -> None:
         max_y = stdscr.getmaxyx()[0]
+        sel_pair = colors.selection_pair_for_kind(getattr(self.playlist, "kind", "m3u"))
         border_attr = colors.pair(colors.PAIR_PRIMARY if selected else colors.PAIR_BORDER)
-        text_attr = colors.pair(colors.PAIR_SELECTED if selected else colors.PAIR_NORMAL)
+        text_attr = colors.pair(sel_pair if selected else colors.PAIR_NORMAL)
         accent_attr = colors.pair(colors.PAIR_ACCENT)
 
         card_h = 4
@@ -1159,7 +1178,7 @@ class GroupsScreen(Screen):
         if selected:
             try:
                 for r in range(card_h):
-                    stdscr.addstr(card_y + r, card_x, " " * card_w, colors.pair(colors.PAIR_SELECTED))
+                    stdscr.addstr(card_y + r, card_x, " " * card_w, colors.pair(sel_pair))
             except curses.error:
                 pass
 
@@ -1895,6 +1914,7 @@ def open_playlist(app, entry: PlaylistEntry) -> None:
     except (OSError, ValueError) as exc:
         app.status.show(str(exc), error=True)
         return
+    playlist.kind = entry.kind
     app.playlist_cache[source] = playlist
     if not playlist.channels:
         app.status.show(f"'{entry.name}' no contiene canales.", error=True)
@@ -1903,11 +1923,16 @@ def open_playlist(app, entry: PlaylistEntry) -> None:
 
 
 def _open_xtream_playlist(app, entry: PlaylistEntry) -> None:
-    """Abre una fuente Xtream: auth + carga de canales + normalización."""
-    # Obtener credenciales (password en memoria)
+    """Abre una fuente Xtream: auth + carga de canales + normalización.
+
+    La contraseña está guardada en disco (solo Xtream); solo se pide
+    si falta (listas viejas sin password). Si falla el auth, usa 'C'
+    en el catálogo para cambiarla.
+    """
+    # Obtener credenciales (password guardado en disco, solo Xtream)
     creds = app.playlists.get_credentials(entry.name)
     if creds is None:
-        # Pedir password con modal centrado (campo secreto).
+        # Solo listas viejas sin password: pedir una vez y guardar.
         data = app._prompt_form(
             "Xtream · contraseña",
             [("password", f"Contraseña ({entry.name})", True)],
@@ -1976,6 +2001,7 @@ def _open_xtream_playlist(app, entry: PlaylistEntry) -> None:
         name=entry.name,
         channels=channels,
         source=entry.source,
+        kind="xtream",
     )
     source_key = entry.source.strip()
     app.playlist_cache[source_key] = playlist

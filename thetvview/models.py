@@ -49,3 +49,4 @@ class Playlist:
     channels: list[Channel] = field(default_factory=list)
     source: str | None = None  # path o URL de origen
     epg_url: str | None = None  # x-tvg-url de la cabecera #EXTM3U
+    kind: str = "m3u"  # "m3u" | "xtream": color de selección (amarillo/púrpura)

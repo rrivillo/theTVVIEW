@@ -17,10 +17,15 @@ from . import icons
 class ScrollableList:
     """Lista con scroll y selección; renderiza solo lo visible."""
 
-    def __init__(self, items: list[str] | None = None) -> None:
+    def __init__(self, items: list[str] | None = None, selected_pair: int | None = None) -> None:
         self.items: list[str] = items or []
         self.selected = 0
         self.top = 0
+        self.selected_pair = selected_pair if selected_pair is not None else colors.PAIR_SELECTED
+
+    def set_selected_pair(self, pair_id: int) -> None:
+        """Cambia el color de la fila seleccionada (p. ej. por tipo de lista)."""
+        self.selected_pair = pair_id
 
     def set_items(self, items: list[str], keep_selection: bool = False) -> None:
         self.items = items
@@ -103,7 +108,7 @@ class ScrollableList:
             text = self.items[idx][: max(0, width - 2)]
             if idx == self.selected:
                 prefix = " ▸ "
-                attr = colors.pair(colors.PAIR_SELECTED)
+                attr = colors.pair(self.selected_pair)
             else:
                 prefix = "   "
                 attr = colors.pair(colors.PAIR_NORMAL)

@@ -11,7 +11,8 @@ class XtreamConfig:
 
     - server_url: URL base del servidor (normalizada al guardar).
     - username: identificador de usuario.
-    - password: nunca se persiste en disco; solo en memoria de sesión.
+    - password: en runtime va aquí; PlaylistManager la persiste en
+      playlists.json solo para listas Xtream (nunca para M3U).
     """
 
     server_url: str

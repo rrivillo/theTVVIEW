@@ -19,6 +19,21 @@ from .xtream_errors import AuthenticationError, InvalidSourceError, ProviderErro
 from .xtream_security import build_api_url, build_stream_url, normalize_server_url
 
 
+# --- Helpers ----------------------------------------------------------------
+
+import dataclasses as _dc
+
+
+def _safe_dataclass_init(cls, raw: dict):
+    """Construye un dataclass filtrando keys que el cls no acepta.
+
+    Evita TypeError si la API Xtream devuelve campos extra no previstos.
+    """
+    valid = {f.name for f in _dc.fields(cls)}
+    filtered = {k: v for k, v in raw.items() if k in valid}
+    return cls(**filtered)
+
+
 # --- TTLs de cache (en segundos) -------------------------------------------
 
 CATEGORY_TTL: float = 24 * 3600   # 24 h
@@ -33,8 +48,14 @@ class XtreamCategory:
     """Categoría del proveedor (live, vod o series)."""
 
     category_id: str
-    name: str
+    name: str = ""
     parent_id: int = 0
+    category_name: str = ""
+
+    def __post_init__(self) -> None:
+        # Algunos paneles usan category_name en vez de name
+        if not self.name and self.category_name:
+            self.name = self.category_name
 
 
 @dataclass
@@ -55,6 +76,7 @@ class XtreamStream:
     direct_source: str = ""
     tv_archive_duration: int = 0
     # Campos adicionales que la API pueda traer
+    thumbnail: str = ""
     rating: str | None = None
     rating_5based: float | None = None
     backdrop_path: list[str] = field(default_factory=list)
@@ -190,14 +212,14 @@ def get_live_categories(cfg: XtreamConfig, *, force_refresh: bool = False) -> li
     if not force_refresh and _is_fresh(cp, CATEGORY_TTL):
         cached = _read_cache(cp)
         if cached is not None:
-            return [XtreamCategory(**c) for c in cached]
+            return [_safe_dataclass_init(XtreamCategory, c) for c in cached]
 
     url = build_api_url(cfg.server_url, cfg.username, cfg.password, "get_live_categories")
     data = api_call(url)
     if not isinstance(data, list):
         return []
 
-    cats = [XtreamCategory(**c) for c in data if isinstance(c, dict)]
+    cats = [_safe_dataclass_init(XtreamCategory, c) for c in data if isinstance(c, dict)]
     _write_cache(cp, [c.__dict__ for c in cats])
     return cats
 
@@ -215,7 +237,7 @@ def get_live_streams(
     if not force_refresh and _is_fresh(cp, CHANNEL_TTL):
         cached = _read_cache(cp)
         if cached is not None:
-            streams = [XtreamStream(**s) for s in cached if isinstance(s, dict)]
+            streams = [_safe_dataclass_init(XtreamStream, s) for s in cached if isinstance(s, dict)]
             if category_id is not None:
                 cat_str = str(category_id)
                 streams = [s for s in streams if str(s.category_id) == cat_str]
@@ -227,7 +249,7 @@ def get_live_streams(
     if not isinstance(data, list):
         return []
 
-    streams = [XtreamStream(**s) for s in data if isinstance(s, dict)]
+    streams = [_safe_dataclass_init(XtreamStream, s) for s in data if isinstance(s, dict)]
     _write_cache(cp, [s.__dict__ for s in streams])
     return streams
 
@@ -240,14 +262,14 @@ def get_vod_categories(cfg: XtreamConfig, *, force_refresh: bool = False) -> lis
     if not force_refresh and _is_fresh(cp, CATEGORY_TTL):
         cached = _read_cache(cp)
         if cached is not None:
-            return [XtreamCategory(**c) for c in cached]
+            return [_safe_dataclass_init(XtreamCategory, c) for c in cached]
 
     url = build_api_url(cfg.server_url, cfg.username, cfg.password, "get_vod_categories")
     data = api_call(url)
     if not isinstance(data, list):
         return []
 
-    cats = [XtreamCategory(**c) for c in data if isinstance(c, dict)]
+    cats = [_safe_dataclass_init(XtreamCategory, c) for c in data if isinstance(c, dict)]
     _write_cache(cp, [c.__dict__ for c in cats])
     return cats
 
@@ -265,7 +287,7 @@ def get_vod_streams(
     if not force_refresh and _is_fresh(cp, CHANNEL_TTL):
         cached = _read_cache(cp)
         if cached is not None:
-            streams = [XtreamStream(**s) for s in cached if isinstance(s, dict)]
+            streams = [_safe_dataclass_init(XtreamStream, s) for s in cached if isinstance(s, dict)]
             if category_id is not None:
                 cat_str = str(category_id)
                 streams = [s for s in streams if str(s.category_id) == cat_str]
@@ -277,7 +299,7 @@ def get_vod_streams(
     if not isinstance(data, list):
         return []
 
-    streams = [XtreamStream(**s) for s in data if isinstance(s, dict)]
+    streams = [_safe_dataclass_init(XtreamStream, s) for s in data if isinstance(s, dict)]
     _write_cache(cp, [s.__dict__ for s in streams])
     return streams
 
@@ -290,14 +312,14 @@ def get_series_categories(cfg: XtreamConfig, *, force_refresh: bool = False) -> 
     if not force_refresh and _is_fresh(cp, CATEGORY_TTL):
         cached = _read_cache(cp)
         if cached is not None:
-            return [XtreamCategory(**c) for c in cached]
+            return [_safe_dataclass_init(XtreamCategory, c) for c in cached]
 
     url = build_api_url(cfg.server_url, cfg.username, cfg.password, "get_series_categories")
     data = api_call(url)
     if not isinstance(data, list):
         return []
 
-    cats = [XtreamCategory(**c) for c in data if isinstance(c, dict)]
+    cats = [_safe_dataclass_init(XtreamCategory, c) for c in data if isinstance(c, dict)]
     _write_cache(cp, [c.__dict__ for c in cats])
     return cats
 
@@ -315,7 +337,7 @@ def get_series(
     if not force_refresh and _is_fresh(cp, CHANNEL_TTL):
         cached = _read_cache(cp)
         if cached is not None:
-            streams = [XtreamStream(**s) for s in cached if isinstance(s, dict)]
+            streams = [_safe_dataclass_init(XtreamStream, s) for s in cached if isinstance(s, dict)]
             if category_id is not None:
                 cat_str = str(category_id)
                 streams = [s for s in streams if str(s.category_id) == cat_str]
@@ -327,7 +349,7 @@ def get_series(
     if not isinstance(data, list):
         return []
 
-    streams = [XtreamStream(**s) for s in data if isinstance(s, dict)]
+    streams = [_safe_dataclass_init(XtreamStream, s) for s in data if isinstance(s, dict)]
     _write_cache(cp, [s.__dict__ for s in streams])
     return streams
 

@@ -197,6 +197,7 @@ _HELP_HERE: dict[str, list[tuple[str, str]]] = {
         ("key", "Enter  abrir la lista seleccionada y ver sus canales."),
         ("key", "a  añadir una lista nueva (te pide nombre y ruta o URL)."),
         ("key", "d  borrar la lista seleccionada (pide confirmar)."),
+        ("key", "C  cambiar la contraseña guardada (solo listas Xtream)."),
         ("key", "R  actualizar el catálogo (releer playlists.json)."),
         ("key", "u  deshacer el último borrado."),
         ("key", "f  ver tus canales favoritos."),
@@ -656,13 +657,79 @@ class App:
         self.screen.reload()
         self.status.show(msg)
 
+    def change_xtream_password(self, name: str) -> None:
+        """Cambia la contraseña guardada de una lista Xtream (solo Xtream).
+
+        Pide la nueva contraseña con campo secreto, la valida probando
+        autenticación contra el servidor y, si es válida, la persiste.
+        Para listas M3U muestra error amigable y no hace nada.
+        """
+        entry = self.playlists.get(name)
+        if entry is None:
+            self.status.show(f"'{name}' no existe.", error=True)
+            return
+        if not entry.is_xtream:
+            self.status.show(
+                "Solo las listas Xtream tienen contraseña.", error=True
+            )
+            return
+        data = self._prompt_form(
+            "Cambiar contraseña Xtream",
+            [("password", f"Nueva contraseña ({entry.name})", True)],
+        )
+        if not data:
+            return
+        new_password = data.get("password", "")
+        if not new_password:
+            self.status.show("Cancelado: contraseña vacía.", error=True)
+            return
+        # Validar contra el servidor antes de guardar.
+        from thetvview.xtream_config import XtreamConfig
+        from thetvview.xtream_provider import authenticate
+
+        cfg = XtreamConfig(
+            server_url=entry.server_url,
+            username=entry.username,
+            password=new_password,
+        )
+        self.show_loading("Verificando contraseña…", sub=entry.server_url)
+        try:
+            authenticate(cfg, force_refresh=True)
+        except Exception as exc:
+            from thetvview.xtream_errors import friendly_message
+
+            self.status.show(
+                f"No se pudo cambiar: {friendly_message(exc)}",
+                error=True,
+            )
+            return
+        if not self.playlists.update_password(name, new_password):
+            self.status.show(f"'{name}' no existe.", error=True)
+            return
+        try:
+            self.screen.reload()
+        except Exception:
+            pass
+        self.status.show(f"Contraseña de '{name}' actualizada.")
+
     def remove_playlist(self, name: str) -> None:
         entry = self.playlists.get(name)
         if entry is None:
             self.status.show(f"'{name}' no existe.", error=True)
             return
         self._undo_stack.clear()
-        self._undo_stack.append({"action": "restore_playlist", "entry": {"name": entry.name, "source": entry.source}})
+        saved: dict[str, str] = {
+            "name": entry.name,
+            "source": entry.source,
+            "kind": entry.kind,
+            "server_url": entry.server_url,
+            "username": entry.username,
+        }
+        # Preservar password Xtream para poder restaurar (solo Xtream).
+        if entry.is_xtream:
+            creds = self.playlists.get_credentials(entry.name)
+            saved["password"] = creds[2] if creds else entry.password
+        self._undo_stack.append({"action": "restore_playlist", "entry": saved})
         self._confirm_remove_playlist(name)
 
     def _confirm_remove_playlist(self, name: str) -> None:
@@ -879,6 +946,10 @@ class App:
             return
         old_n = len(playlist.channels)
         new_n = len(fresh.channels)
+        try:
+            fresh.kind = getattr(playlist, "kind", "m3u") or "m3u"
+        except Exception:
+            pass
         self.playlist_cache[source] = fresh
         for s in self.stack:
             pl = getattr(s, "playlist", None)
@@ -918,12 +989,22 @@ class App:
                 if entry is None:
                     return
                 try:
-                    self.playlists.add(entry["name"], entry["source"])
+                    if entry.get("kind") == "xtream":
+                        self.playlists.add_xtream(
+                            entry["name"],
+                            entry.get("server_url", ""),
+                            entry.get("username", ""),
+                            entry.get("password", ""),
+                        )
+                    else:
+                        self.playlists.add(entry["name"], entry["source"])
                 except PlaylistError as exc:
                     self.status.show(str(exc), error=True)
                     return
                 self.screen.reload()
                 self.status.show(f"Playlist '{entry['name']}' restaurada.")
+            case "change_password":
+                self.change_xtream_password(action["name"])
             case "open_playlist":
                 open_playlist(self, action["entry"])
             case "show_favorites":

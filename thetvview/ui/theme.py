@@ -126,6 +126,18 @@ def init_colors(theme_name: str = "light") -> None:
     curses.init_pair(colors.PAIR_FOCUS,     _fg("focus"), bg)
     curses.init_pair(colors.PAIR_SCROLLBAR, _fg("scrollbar"), bg)
 
+    # Selección por tipo de lista: amarillo (M3U/html) y púrpura (Xtream).
+    # El fg hereda selected_fg del tema para mantener contraste; el bg es
+    # fijo por tipo para que no cambie con light/dark.
+    try:
+        if curses.COLOR_PAIRS > colors.PAIR_SELECTED_XTREAM:
+            curses.init_pair(colors.PAIR_SELECTED_M3U,
+                             _fg("selected_fg"), _color256(220, curses.COLOR_YELLOW))
+            curses.init_pair(colors.PAIR_SELECTED_XTREAM,
+                             _fg("selected_fg"), _color256(135, curses.COLOR_MAGENTA))
+    except curses.error:
+        pass
+
 
 def attr(role: str, *modifiers: str) -> int:
     """Devuelve el atributo curses para un rol semántico.
@@ -146,6 +158,8 @@ def attr(role: str, *modifiers: str) -> int:
         "accent":      colors.PAIR_ACCENT,
         "title_fg":    colors.PAIR_TITLE,
         "selected":    colors.PAIR_SELECTED,
+        "selected_m3u": colors.PAIR_SELECTED_M3U,
+        "selected_xtream": colors.PAIR_SELECTED_XTREAM,
         "current":     colors.PAIR_CURRENT,
         "error":       colors.PAIR_ERROR,
         "search":      colors.PAIR_SEARCH,

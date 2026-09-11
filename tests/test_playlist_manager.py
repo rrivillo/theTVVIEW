@@ -70,18 +70,28 @@ class TestPlaylistManager(unittest.TestCase):
         self.assertEqual(entry.server_url, "http://x.com")
         self.assertEqual(entry.username, "user1")
         self.assertTrue(entry.is_xtream)
-        # Password is in-memory only, accessible via get_credentials
+        # Password se guarda (solo Xtream), accesible vía get_credentials
         creds = self.mgr.get_credentials("Mi Xtream")
         self.assertEqual(creds, ("http://x.com", "user1", "pass1"))
 
-    def test_add_xtream_persists_without_password(self) -> None:
+    def test_add_xtream_persists_password(self) -> None:
         self.mgr.add_xtream("X1", "http://x.com", "u", "secret")
         mgr2 = PlaylistManager(self.path)
         loaded = mgr2.get("X1")
         assert loaded is not None
         self.assertEqual(loaded.server_url, "http://x.com")
         self.assertEqual(loaded.username, "u")
-        self.assertEqual(loaded.password, "")  # password not persisted
+        self.assertEqual(loaded.password, "secret")  # password persistido (solo Xtream)
+        # Y disponible sin pedir de nuevo
+        self.assertEqual(mgr2.get_credentials("X1"), ("http://x.com", "u", "secret"))
+
+    def test_add_xtream_persists_without_password(self) -> None:
+        # Compat: alias del nuevo comportamiento (se conserva por nombre).
+        self.mgr.add_xtream("X1b", "http://x.com", "u", "secret")
+        mgr2 = PlaylistManager(self.path)
+        loaded = mgr2.get("X1b")
+        assert loaded is not None
+        self.assertEqual(loaded.password, "secret")
 
     def test_add_xtream_duplicate_fails(self) -> None:
         self.mgr.add_xtream("dup", "http://x.com", "u", "p")
@@ -97,12 +107,30 @@ class TestPlaylistManager(unittest.TestCase):
     def test_set_password(self) -> None:
         self.mgr.add_xtream("X1", "http://x.com", "u", "")
         self.assertTrue(self.mgr.set_password("X1", "secret"))
-        # Simular recarga: password se pierde
+        # Ahora persiste: recarga y sigue disponible sin pedir de nuevo.
         mgr2 = PlaylistManager(self.path)
-        mgr2.set_password("X1", "restored")
         creds = mgr2.get_credentials("X1")
         self.assertIsNotNone(creds)
-        self.assertEqual(creds[2], "restored")
+        assert creds is not None
+        self.assertEqual(creds[2], "secret")
+
+    def test_update_password_persists(self) -> None:
+        self.mgr.add_xtream("X1", "http://x.com", "u", "old")
+        self.assertTrue(self.mgr.update_password("X1", "new"))
+        mgr2 = PlaylistManager(self.path)
+        self.assertEqual(mgr2.get_credentials("X1"), ("http://x.com", "u", "new"))
+
+    def test_update_password_only_xtream(self) -> None:
+        self.mgr.add("M3U", "/tmp/x.m3u")
+        self.assertFalse(self.mgr.update_password("M3U", "x"))
+        self.assertFalse(self.mgr.update_password("NOEXISTE", "x"))
+        self.assertFalse(self.mgr.set_password("M3U", "x"))
+
+    def test_m3u_never_stores_password(self) -> None:
+        self.mgr.add("M3U", "/tmp/x.m3u")
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(len(raw), 1)
+        self.assertNotIn("password", raw[0])
 
     def test_get_credentials_none_for_m3u(self) -> None:
         self.mgr.add("M3U", "/tmp/x.m3u")

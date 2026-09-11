@@ -36,6 +36,13 @@ PAIR_MODAL_BG = 20
 PAIR_MODAL_BORDER = 21
 PAIR_FOCUS = 22
 PAIR_SCROLLBAR = 23
+PAIR_SELECTED_M3U = 24  # amarillo para playlists M3U/html
+PAIR_SELECTED_XTREAM = 25  # púrpura para playlists Xtream
+
+
+def selection_pair_for_kind(kind: str | None) -> int:
+    """Par de selección según tipo de lista: xtream → púrpura, resto → amarillo."""
+    return PAIR_SELECTED_XTREAM if (kind or "m3u") == "xtream" else PAIR_SELECTED_M3U
 
 
 def pair(pair_id: int) -> int:
