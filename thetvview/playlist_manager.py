@@ -17,6 +17,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+# Prefijo de source que identifica una lista Xtream API.
+XTREAM_SOURCE_PREFIX = "xtream://"
+
+
 class PlaylistError(Exception):
     """Error amigable de gestión de playlists."""
 
@@ -42,13 +46,18 @@ class PlaylistEntry:
     def __post_init__(self) -> None:
         if not self.added:
             self.added = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        # Normalizar kind
-        if self.kind not in ("m3u", "xtream"):
+        # Normalizar kind: el prefijo xtream:// en source manda (es API Xtream).
+        if self.source.startswith(XTREAM_SOURCE_PREFIX):
+            self.kind = "xtream"
+            if not self.server_url:
+                self.server_url = self.source[len(XTREAM_SOURCE_PREFIX):]
+        elif self.kind not in ("m3u", "xtream"):
             self.kind = "m3u"
 
     @property
     def is_xtream(self) -> bool:
-        return self.kind == "xtream"
+        """True solo para listas Xtream API (kind="xtream", source xtream://…)."""
+        return self.kind == "xtream" or self.source.startswith(XTREAM_SOURCE_PREFIX)
 
     def to_dict(self) -> dict:
         """Serializa a dict para JSON.
@@ -118,13 +127,17 @@ class PlaylistManager:
         out: list[PlaylistEntry] = []
         for raw in self._read():
             try:
+                source = str(raw["source"])
                 kind = str(raw.get("kind", "m3u"))
+                # El prefijo xtream:// identifica la API Xtream (migración).
+                if source.startswith(XTREAM_SOURCE_PREFIX):
+                    kind = "xtream"
                 password = ""
                 if kind == "xtream":
                     password = str(raw.get("password", ""))
                 entry = PlaylistEntry(
                     name=str(raw["name"]),
-                    source=str(raw["source"]),
+                    source=source,
                     added=str(raw.get("added", "")),
                     kind=kind,
                     server_url=str(raw.get("server_url", "")),
@@ -169,7 +182,7 @@ class PlaylistManager:
         if any(e.name == name for e in entries):
             raise PlaylistError(f"Ya existe una playlist llamada '{name}'.")
         # Source sintético para backward compat
-        source = f"xtream://{server_url}"
+        source = f"{XTREAM_SOURCE_PREFIX}{server_url}"
         entry = PlaylistEntry(
             name=name,
             source=source,

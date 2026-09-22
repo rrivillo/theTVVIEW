@@ -249,6 +249,22 @@ _HELP_HERE: dict[str, list[tuple[str, str]]] = {
 }
 
 
+def _help_here_for(screen, cls_name: str) -> list[tuple[str, str]]:
+    """Teclas de la pantalla actual; oculta 'C' si no hay lista Xtream elegida."""
+    entries = list(_HELP_HERE.get(cls_name, [
+        ("body", "Usa las flechas y Enter; Esc para volver."),
+    ]))
+    checker = getattr(screen, "can_change_password", None)
+    if callable(checker):
+        try:
+            allowed = bool(checker())
+        except Exception:
+            allowed = True
+        if not allowed:
+            entries = [e for e in entries if not e[1].startswith("C  ")]
+    return entries
+
+
 def build_help_lines(screen) -> list[tuple[str, str]]:
     """Contenido de la ayuda como lista de (estilo, texto).
 
@@ -284,9 +300,7 @@ def build_help_lines(screen) -> list[tuple[str, str]]:
         ("blank", ""),
         ("section", f"En esta pantalla: {where}"),
     ]
-    lines.extend(_HELP_HERE.get(cls_name, [
-        ("body", "Usa las flechas y Enter; Esc para volver."),
-    ]))
+    lines.extend(_help_here_for(screen, cls_name))
     lines += [
         ("blank", ""),
         ("section", "Las demás pantallas (referencia rápida)"),
@@ -668,9 +682,9 @@ class App:
         if entry is None:
             self.status.show(f"'{name}' no existe.", error=True)
             return
-        if not entry.is_xtream:
+        if not entry.is_xtream or not entry.server_url or not entry.username:
             self.status.show(
-                "Solo las listas Xtream tienen contraseña.", error=True
+                "Solo las listas Xtream API tienen contraseña.", error=True
             )
             return
         data = self._prompt_form(

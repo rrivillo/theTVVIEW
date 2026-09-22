@@ -99,6 +99,11 @@ class PlaylistsScreen(Screen):
             return None
         return self.entries[self.selected]
 
+    def can_change_password(self) -> bool:
+        """Solo las listas Xtream API (source con prefijo 'xtream://')."""
+        entry = self.current_entry()
+        return entry is not None and entry.is_xtream
+
     def _cols(self, max_x: int) -> int:
         """Número de columnas de cards según ancho."""
         if max_x >= 150:
@@ -137,7 +142,10 @@ class PlaylistsScreen(Screen):
     def shortcuts(self) -> str:
         if not self.entries:
             return "a Añadir · r Recientes · t Tema · ? Ayuda · q Salir"
-        return "↑/↓/←/→ · Enter · a Añadir · d Borrar · C Contraseña Xtream · R Actualizar · r Recientes · f ★ · t Tema · ? Ayuda · q Salir"
+        base = "↑/↓/←/→ · Enter · a Añadir · d Borrar"
+        if self.can_change_password():
+            base += " · C Contraseña Xtream"
+        return base + " · R Actualizar · r Recientes · f ★ · t Tema · ? Ayuda · q Salir"
 
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
         if not self.entries:
@@ -207,7 +215,7 @@ class PlaylistsScreen(Screen):
             entry = self.current_entry()
             if entry is None:
                 return None
-            if entry.kind != "xtream":
+            if not self.can_change_password():
                 try:
                     self.app.footer.show("Solo las listas Xtream tienen contraseña.")
                 except Exception:
