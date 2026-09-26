@@ -34,6 +34,8 @@ ver y con qué reproductor.
 - Al menos un reproductor: `mpv`, `mplayer` o `vlc`.
 - Entorno virtual recomendado (el proyecto usa `.env/`).
 - Terminal con al menos **40 × 10** caracteres y, idealmente, 256 colores.
+- **Windows**: `pip install windows-curses` (único extra y solo ahí) porque el
+  Python oficial no incluye `curses`. Si falta, el programa lo avisa al arrancar.
 
 ## Advertencia
 
@@ -50,11 +52,18 @@ cd theTVVIEW
 
 # Crear entorno virtual (opcional pero recomendado)
 python -m venv .env
-source .env/bin/activate  # Linux/Mac
-# .env\Scripts\activate   # Windows (no he probado en esta plataforma. Usen bajo su propio riesgo).
+source .env/bin/activate   # Linux/Mac
+# .env\Scripts\activate    # Windows
 
-# No hay dependencias externas, solo stdlib
+# No hay dependencias externas en Linux/macOS, solo stdlib
+# Windows (una sola vez, con el venv activo):
+#   pip install windows-curses
 ```
+
+Al arrancar, `python -m thetvview` **detecta por su cuenta el sistema
+operativo** (Linux, Windows, macOS), deja la consola en UTF-8 según
+corresponda y comprueba que `curses` exista *antes* de cargar la interfaz:
+si falta algo muestra un aviso con la solución, nunca un traceback.
 
 ## Inicio rápido
 
@@ -232,7 +241,7 @@ Para empezar de cero, borra la carpeta `data/` (se recrea sola).
 ## Tests
 
 ```bash
-# Suite completa (490 tests, ~35 s)
+# Suite completa (512 tests, ~35 s)
 python -m unittest -v
 
 # Solo tests de una parte
@@ -245,7 +254,8 @@ python -m tests.ux_report --verbose  # con tracebacks
 ```
 
 Cobertura mínima exigida por el proyecto: parser M3U (archivo y URL),
-parser XMLTV (incluye `.gz`) y persistencia JSON de playlists. El resto
+parser XMLTV (incluye `.gz`), persistencia JSON de playlists y arranque
+multiplataforma (detección del SO + preflight de curses). El resto
 cubre UI, Listas Especiales X, reproductores, layout, tema y recorridos UX completos.
 
 ---
@@ -257,6 +267,7 @@ El código vive en el paquete `thetvview/`:
 ```
 thetvview/
 ├── __main__.py         # punto de entrada: python -m thetvview
+├── platform_check.py   # detecta el SO, UTF-8 de consola y curses (preflight)
 ├── models.py           # dataclasses: Channel, Playlist, Program
 ├── m3u_parser.py       # parser M3U/M3U8/TS (archivo y URL, cache TTL)
 ├── epg_parser.py       # parser XMLTV (.xml/.gz) con cache TTL
@@ -296,6 +307,8 @@ degradando en silencio.
 
 | Síntoma | Qué hacer |
 | --- | --- |
+| *Windows: `ModuleNotFoundError: No module named '_curses'`* | Con el venv activo: `pip install windows-curses` y relanza. El aviso del propio programa ya te lo recuerda antes de fallar. |
+| *Aviso: «necesita una terminal interactiva (TTY)»* | Ejecútalo desde una consola real (PowerShell, CMD, bash), no desde un IDE, un pipe ni una tarea programada. |
 | *No hay reproductor disponible* | Instala `mpv`, `vlc` o `mplayer`. La app busca también fuera del `PATH` (Program Files, Homebrew, snap/flatpak…). |
 | *Sin correspondencia EPG* | El `tvg-id` del canal no está en el XMLTV. Prueba otra fuente (`e` → `r`). |
 | *Lista vacía* | Revisa que el fichero tenga canales; los `.ts` también valen. |
