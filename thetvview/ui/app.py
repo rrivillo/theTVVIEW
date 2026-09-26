@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import curses
 import locale
+import threading
+import time
+from pathlib import Path
 
 from thetvview import config
 from thetvview import resolutions
@@ -34,6 +37,10 @@ from .screens import (
     open_playlist,
     play_channel,
 )
+
+# Segundos mínimos entre reintentos de una fuente del catálogo que falló al
+# cargarse en segundo plano (evita martillar servidores caídos en cada canal).
+WARM_RETRY_S = 300.0
 
 
 def load_epg_source(source: str, *, force_refresh: bool = False) -> Epg:
@@ -392,6 +399,19 @@ class App:
         self.epg_source: str | None = None
         self.theme_name: str = self.prefs.load().theme or config.load_theme()
         self.playlist_cache: dict[str, Playlist] = {}
+        # Vigencia de cada entrada de playlist_cache (mtime local / instante
+        # de descarga): ver cached_playlist()/remember_playlist().
+        self.playlist_cache_meta: dict[str, dict] = {}
+        # Índice de variantes por fuente: clave -> (playlist, canales, índice).
+        # Lo construye warm_catalog en segundo plano para que abrir un canal
+        # no tenga que recorrer decenas de miles de nombres con regex.
+        self._base_indexes: dict[str, tuple[Playlist, list, dict[str, list[Channel]]]] = {}
+        # Carga asíncrona del catálogo: ver warm_catalog()/_warm_worker().
+        self._warm_lock = threading.Lock()
+        self._warm_queue: list[str] = []
+        self._warm_queued: set[str] = set()
+        self._warm_failed: dict[str, float] = {}
+        self._warm_thread: threading.Thread | None = None
         self.stack: list[PlaylistsScreen] = []
         self._undo_stack: list[dict] = []
         self.stack.append(PlaylistsScreen(self))
@@ -426,30 +446,127 @@ class App:
         # una fila superior: el contenido usa siempre el alto completo.
         return main_rect(max_y, max_x).h
 
+    # --- Cache de sesión de listas ya parseadas ------------------------------
+
+    @staticmethod
+    def _is_remote(source: str) -> bool:
+        # 'xtream://' es la fuente sintética de las listas Xtream: también
+        # se refresca por TTL (no existe fichero local cuyo mtime mirar).
+        return source.startswith(("http://", "https://", "xtream://"))
+
+    def cached_playlist(self, source: str) -> Playlist | None:
+        """Playlist ya parseada en esta sesión si sigue vigente; si no, None.
+
+        Sin esto, cada Enter re-leía y re-parseaba la lista entera: con ~96k
+        canales son más de un segundo de bloqueo por apertura.
+        """
+        key = source.strip()
+        playlist = self.playlist_cache.get(key)
+        if playlist is None:
+            return None
+        if not self._session_cache_valid(key, self.playlist_cache_meta.get(key)):
+            self.playlist_cache.pop(key, None)
+            self.playlist_cache_meta.pop(key, None)
+            self._base_indexes.pop(key, None)
+            return None
+        return playlist
+
+    def _session_cache_valid(self, source: str, meta: dict | None) -> bool:
+        """Vigencia de la copia en memoria: mtime (fichero) o TTL (URL)."""
+        if not meta:
+            # Asignación directa sin meta (tests): se da por válida.
+            return True
+        if self._is_remote(source):
+            from thetvview.m3u_parser import DEFAULT_TTL_HOURS
+
+            return (time.monotonic() - float(meta.get("at", 0.0))) < DEFAULT_TTL_HOURS * 3600
+        try:
+            return Path(source).stat().st_mtime == meta.get("mtime")
+        except OSError:
+            # Fichero borrado/ilegible: hay que volver a intentarlo.
+            return False
+
+    def remember_playlist(self, source: str, playlist: Playlist) -> None:
+        """Guarda en la caché de sesión la playlist recién parseada."""
+        key = source.strip()
+        self.playlist_cache[key] = playlist
+        self._base_indexes.pop(key, None)  # la lista cambió: índice obsoleto
+        meta: dict = {"at": time.monotonic()}
+        if not self._is_remote(key):
+            try:
+                meta["mtime"] = Path(key).stat().st_mtime
+            except OSError:
+                meta["mtime"] = None
+        self.playlist_cache_meta[key] = meta
+
+    def forget_playlist(self, source: str) -> None:
+        """Descarta la copia en memoria de una lista (no toca disco)."""
+        key = source.strip()
+        self.playlist_cache.pop(key, None)
+        self.playlist_cache_meta.pop(key, None)
+        self._base_indexes.pop(key, None)
+
     # --- Resoluciones ---------------------------------------------------------
 
-    def variants_for(self, channel: Channel) -> list[Channel]:
+    def _base_index(self, key: str, playlist: Playlist) -> dict[str, list[Channel]]:
+        """Índice nombre-base -> canales de `playlist` (construido una vez).
+
+        Buscar variantes sin índice recorre cada canal aplicándole regex
+        (~0,2s por lista grande) en cada apertura; el índice lo paga solo
+        una vez y después la búsqueda es instantánea.
+        """
+        cached = self._base_indexes.get(key)
+        if (
+            cached is not None
+            and cached[0] is playlist
+            and cached[1] is playlist.channels
+        ):
+            return cached[2]
+        index: dict[str, list[Channel]] = {}
+        try:
+            for channel in playlist.channels:
+                index.setdefault(resolutions.base_name(channel), []).append(channel)
+        except Exception:
+            # Datos raros (nombre no str): índice vacío en vez de romper la
+            # UI o de dejar al hilo de catálogo girando sin salir.
+            index = {}
+        self._base_indexes[key] = (playlist, playlist.channels, index)
+        return index
+
+    def variants_for(self, channel: Channel, *, catalog: bool = True) -> list[Channel]:
         """Variantes de resolución del canal buscando en todas las playlists.
 
         Devuelve variantes swappable (el canal objetivo puede o no tener
         etiqueta de resolución; se buscan entradas con distinta resolución).
 
         Orden de búsqueda:
-        1. Playlists ya abiertas/cacheadas en esta sesión.
+        1. Playlists ya abiertas/cacheadas en esta sesión (vía índice: sin
+           recorrer canales).
         2. Resto de fuentes del catálogo (se parsean una vez y se cachean;
            las que fallen se saltan en silencio).
+
+        `catalog=False` es la ruta de la UI al abrir un canal: no descarga
+        nada en el hilo de la interfaz, usa solo lo ya parseado y deja las
+        fuentes pendientes cargando en segundo plano (warm_catalog). Así
+        elegir un canal responde al instante en lugar de esperar a todos
+        los servidores del catálogo (antes: hasta 30s por fuente caída).
         """
         base = resolutions.base_name(channel)
 
-        def search(pool_channels: list[Channel]) -> list[Channel]:
-            if any(resolutions.base_name(c) == base for c in pool_channels):
-                return resolutions.swappable_variants(pool_channels, channel)
-            return []
+        def search(key: str, playlist: Playlist) -> list[Channel]:
+            group = self._base_index(key, playlist).get(base)
+            if not group:
+                return []
+            return resolutions.swappable_variants(group, channel)
 
-        for playlist in self.playlist_cache.values():
-            found = search(playlist.channels)
+        for key, playlist in list(self.playlist_cache.items()):
+            found = search(key, playlist)
             if found:
                 return found
+
+        if not catalog:
+            self.warm_catalog()
+            return []
 
         for entry in self.playlists.load():
             source = entry.source.strip()
@@ -459,11 +576,96 @@ class App:
                 playlist = load_playlist_source(source)
             except (OSError, ValueError):
                 continue  # fuente caída/inaccesible: no bloquea la búsqueda
-            self.playlist_cache[source] = playlist
-            found = search(playlist.channels)
+            self.remember_playlist(source, playlist)
+            found = search(source, playlist)
             if found:
                 return found
         return []
+
+    # --- Catálogo en segundo plano --------------------------------------------
+
+    def pending_catalog_sources(self) -> list[str]:
+        """Fuentes del catálogo todavía no parseadas en esta sesión.
+
+        Las listas Xtream se omiten: necesitan credenciales y solo se
+        cargan cuando el usuario las abre.
+        """
+        pending: list[str] = []
+        for entry in self.playlists.load():
+            source = (entry.source or "").strip()
+            if not source or source in self.playlist_cache:
+                continue
+            if entry.kind == "xtream":
+                continue
+            if source not in pending:
+                pending.append(source)
+        return pending
+
+    def warm_catalog(self) -> None:
+        """Carga (o indexa) el catálogo en un hilo aparte, sin tocar la UI.
+
+        Llena la caché de sesión fuera del hilo de la interfaz para que
+        variants_for(catalog=False) encuentre variantes entre listas sin
+        bloquear la pantalla. Idempotente: lo ya cargado o en cola se salta.
+        """
+        pending = self.pending_catalog_sources()
+        if not pending and self._first_unindexed() is None:
+            return
+        now = time.monotonic()
+        with self._warm_lock:
+            fresh = [
+                source
+                for source in pending
+                if source not in self._warm_queued
+                and now - self._warm_failed.get(source, -1e9) >= WARM_RETRY_S
+            ]
+            self._warm_queue.extend(fresh)
+            self._warm_queued.update(fresh)
+            if self._warm_thread is None:
+                self._warm_thread = threading.Thread(
+                    target=self._warm_worker, name="catalog-warm", daemon=True
+                )
+                self._warm_thread.start()
+
+    def _first_unindexed(self) -> tuple[str, Playlist] | None:
+        """Primera playlist cacheada sin índice, para construirlo en caliente."""
+        for key, playlist in list(self.playlist_cache.items()):
+            if key not in self._base_indexes:
+                return key, playlist
+        return None
+
+    def _warm_worker(self) -> None:
+        """Hilo daemon: primero indexa lo ya parseado, luego descarga el resto."""
+        try:
+            while True:
+                unindexed = self._first_unindexed()
+                if unindexed is not None:
+                    self._base_index(*unindexed)
+                    continue
+                with self._warm_lock:
+                    if not self._warm_queue:
+                        # Sale con el candado puesto: warm_catalog no puede
+                        # quedar con cola sin hilo que la procese.
+                        self._warm_thread = None
+                        return
+                    source = self._warm_queue.pop(0)
+                try:
+                    playlist = load_playlist_source(source)
+                    if playlist is None:
+                        raise ValueError(f"fuente ilegible: {source}")
+                    self.remember_playlist(source, playlist)
+                    self._base_index(source, playlist)
+                except Exception:  # red caída/fuente inválida: se reintenta luego
+                    with self._warm_lock:
+                        self._warm_failed[source] = time.monotonic()
+                finally:
+                    with self._warm_lock:
+                        self._warm_queued.discard(source)
+        finally:
+            # Red de seguridad: si el hilo muere por algo imprevisto, la
+            # próxima llamada a warm_catalog() pueda relanzarlo.
+            with self._warm_lock:
+                self._warm_thread = None
 
     def toggle_theme(self) -> None:
         self.theme_name = "light" if self.theme_name == "dark" else "dark"
@@ -720,6 +922,10 @@ class App:
         if not self.playlists.update_password(name, new_password):
             self.status.show(f"'{name}' no existe.", error=True)
             return
+        # Las URLs de stream llevan la contraseña incrustada: hay que
+        # olvidar la copia en memoria para que la próxima apertura use las
+        # credenciales nuevas (y re-autentique contra el servidor).
+        self.forget_playlist(entry.source)
         try:
             self.screen.reload()
         except Exception:
@@ -744,9 +950,9 @@ class App:
             creds = self.playlists.get_credentials(entry.name)
             saved["password"] = creds[2] if creds else entry.password
         self._undo_stack.append({"action": "restore_playlist", "entry": saved})
-        self._confirm_remove_playlist(name)
+        self._confirm_remove_playlist(name, source=entry.source)
 
-    def _confirm_remove_playlist(self, name: str) -> None:
+    def _confirm_remove_playlist(self, name: str, source: str | None = None) -> None:
         from .widgets import Modal
 
         modal = Modal("Confirmar", f"¿Eliminar playlist '{name}'?", ["Cancelar", "Eliminar"])
@@ -789,6 +995,8 @@ class App:
         except PlaylistError as exc:
             self.status.show(str(exc), error=True)
             return
+        if source:
+            self.forget_playlist(source)
         self.screen.reload()
         if removed:
             self.status.show(f"Playlist '{name}' eliminada.")
@@ -964,7 +1172,7 @@ class App:
             fresh.kind = getattr(playlist, "kind", "m3u") or "m3u"
         except Exception:
             pass
-        self.playlist_cache[source] = fresh
+        self.remember_playlist(source, fresh)
         for s in self.stack:
             pl = getattr(s, "playlist", None)
             if pl is None:
@@ -1021,6 +1229,10 @@ class App:
                 self.change_xtream_password(action["name"])
             case "open_playlist":
                 open_playlist(self, action["entry"])
+                if isinstance(self.screen, ChannelsScreen):
+                    # Precarga el resto del catálogo en segundo plano: así,
+                    # al elegir un canal, las variantes ya están en memoria.
+                    self.warm_catalog()
             case "show_favorites":
                 self.push(FavoritesScreen(self))
             case "show_recents":
@@ -1043,7 +1255,9 @@ class App:
                 self.push(ResolutionScreen(self, action["channel"], action["variants"]))
             case "open_channel":
                 channel = action["channel"]
-                variants = self.variants_for(channel)
+                # catalog=False: la UI nunca espera a descargar otras listas
+                # (antiguamente hasta 30s por servidor caído antes de pintar).
+                variants = self.variants_for(channel, catalog=False)
                 if variants:
                     self.push(ResolutionScreen(self, channel, variants))
                     return

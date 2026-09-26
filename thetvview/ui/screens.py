@@ -369,6 +369,15 @@ class ChannelsScreen(Screen):
         # por canal ni por frame con listas grandes.
         self._fav_urls: set[str] = set()
         self._has_fav: bool = False
+        # Cachés en memoria de las etiquetas y de los textos de búsqueda,
+        # válidas mientras `self.channels` no cambie (y las favoritas, en el
+        # caso de las etiquetas). Evita reformatear 90k+ cadenas en cada
+        # tecla al filtrar.
+        self._labels: list[str] | None = None
+        self._labels_src: list[Channel] | None = None
+        self._labels_favs: set[str] = set()
+        self._search_texts: list[str] | None = None
+        self._search_src: list[Channel] | None = None
         self._apply_filter()
 
     # --- Filtrado -------------------------------------------------------------
@@ -402,42 +411,80 @@ class ChannelsScreen(Screen):
         ch = self.channels[idx]
         return format_channel_name(ch, favorite=ch.url in self._fav_urls)
 
+    def _labels_for(self, channels: list[Channel], fav_urls: set[str]) -> list[str]:
+        """Etiquetas de todas las filas, cacheadas por (canales, favoritas).
+
+        Reformatear 90k+ canales costaba ~100 ms por tecla al buscar; con la
+        caché solo se hace el primer filtro (y al cambiar las favoritas).
+        """
+        if (
+            self._labels is not None
+            and self._labels_src is channels
+            and self._labels_favs == fav_urls
+        ):
+            return self._labels
+        labels: list[str] = []
+        append = labels.append
+        has_fav = False
+        for ch in channels:
+            fav = ch.url in fav_urls
+            if fav:
+                has_fav = True
+            append(format_channel_name(ch, favorite=fav))
+        self._labels = labels
+        self._labels_src = channels
+        self._labels_favs = set(fav_urls)
+        self._has_fav = has_fav
+        return labels
+
+    def _search_texts_for(self, channels: list[Channel]) -> list[str]:
+        """Texto en minúsculas (nombre + grupo) cacheado para filtrar.
+
+        Un `q in texto` por canal es una búsqueda C; hacer `.casefold()`
+        por canal en cada tecla era el cuello de botella al escribir.
+        """
+        if self._search_texts is not None and self._search_src is channels:
+            return self._search_texts
+        texts = [
+            (ch.name + "\n" + (ch.group or "")).casefold() for ch in channels
+        ]
+        self._search_texts = texts
+        self._search_src = channels
+        return texts
+
     def _apply_filter(self, keep_selection: bool = False) -> None:
-        prev = self.current_channel() if keep_selection else None
+        prev_pos = self.list.selected if keep_selection else -1
+        prev_idx = (
+            self.visible_idx[prev_pos]
+            if 0 <= prev_pos < len(self.visible_idx)
+            else None
+        )
         channels = self.channels
         fav_urls = self._refresh_fav_snapshot(channels)
+        all_labels = self._labels_for(channels, fav_urls)
         q = self.query.casefold()
         if not q:
             self.visible_idx = list(range(len(channels)))
-            labels = [
-                format_channel_name(ch, favorite=ch.url in fav_urls)
-                for ch in channels
-            ]
+            # Copia defensiva: set_items no debe compartir la lista con la caché.
+            shown = list(all_labels)
         else:
+            texts = self._search_texts_for(channels)
             visible: list[int] = []
-            labels: list[str] = []
+            shown = []
             append_v = visible.append
-            append_l = labels.append
-            for i, ch in enumerate(channels):
-                name_cf = ch.name.casefold()
-                grp = ch.group
-                if q in name_cf or (grp and q in grp.casefold()):
+            append_l = shown.append
+            for i, text in enumerate(texts):
+                if q in text:
                     append_v(i)
-                    append_l(format_channel_name(ch, favorite=ch.url in fav_urls))
+                    append_l(all_labels[i])
             self.visible_idx = visible
-        has_fav = False
-        if fav_urls:
-            for ch in channels:
-                if ch.url in fav_urls:
-                    has_fav = True
-                    break
-        self._has_fav = has_fav
-        self.list.set_items(labels, keep_selection=True)
-        if prev is not None:
-            for pos, i in enumerate(self.visible_idx):
-                if self.channels[i] is prev:
-                    self.list.selected = pos
-                    break
+        self.list.set_items(shown, keep_selection=True)
+        if prev_idx is not None:
+            try:
+                # index() es C-level y evita el bucle Python por tecla.
+                self.list.selected = self.visible_idx.index(prev_idx)
+            except ValueError:
+                pass  # el canal anterior quedó fuera del filtro
         self.list.clamp()
 
     def current_channel(self) -> Channel | None:
@@ -1909,6 +1956,11 @@ def open_playlist(app, entry: PlaylistEntry) -> None:
 
     Para fuentes Xtream: pide password si no está en memoria, autentica,
     descarga canales y los normaliza a Channel.
+
+    Rendimiento: si la misma fuente ya se abrió en esta sesión (y sigue
+    vigente: mtime local / TTL de URL) se reutiliza la caché de sesión y
+    la apertura es instantánea; solo la primera vez se parsea, y mientras
+    tanto se pinta la pantalla de "Cargando…" para que no parezca colgada.
     """
     if entry.kind == "xtream":
         _open_xtream_playlist(app, entry)
@@ -1917,13 +1969,27 @@ def open_playlist(app, entry: PlaylistEntry) -> None:
     from .app import load_playlist_source
 
     source = entry.source.strip()
-    try:
-        playlist = load_playlist_source(source)
-    except (OSError, ValueError) as exc:
-        app.status.show(str(exc), error=True)
-        return
+    get_cached = getattr(app, "cached_playlist", None)
+    playlist = get_cached(source) if callable(get_cached) else None
+    if playlist is None:
+        try:
+            app.show_loading(f"Abriendo '{entry.name}'…", sub=source)
+        except Exception:
+            pass  # sin curses (tests) o terminal rota: sigue sin cargar
+        try:
+            playlist = load_playlist_source(source)
+        except (OSError, ValueError) as exc:
+            app.status.show(str(exc), error=True)
+            return
+        remember = getattr(app, "remember_playlist", None)
+        if callable(remember):
+            remember(source, playlist)
+        else:  # app de tests sin caché de sesión
+            try:
+                app.playlist_cache[source] = playlist
+            except Exception:
+                pass
     playlist.kind = entry.kind
-    app.playlist_cache[source] = playlist
     if not playlist.channels:
         app.status.show(f"'{entry.name}' no contiene canales.", error=True)
         return
@@ -1936,7 +2002,18 @@ def _open_xtream_playlist(app, entry: PlaylistEntry) -> None:
     La contraseña está guardada en disco (solo Xtream); solo se pide
     si falta (listas viejas sin password). Si falla el auth, usa 'C'
     en el catálogo para cambiarla.
+
+    Si la lista ya se abrió en esta sesión (y la caché sigue vigente) se
+    reutiliza: sin llamadas a red ni re-normalización de decenas de miles
+    de canales.
     """
+    get_cached = getattr(app, "cached_playlist", None)
+    cached = get_cached(entry.source) if callable(get_cached) else None
+    if cached is not None and cached.channels:
+        cached.kind = "xtream"
+        app.push(ChannelsScreen(app, cached))
+        return
+
     # Obtener credenciales (password guardado en disco, solo Xtream)
     creds = app.playlists.get_credentials(entry.name)
     if creds is None:
@@ -2012,7 +2089,11 @@ def _open_xtream_playlist(app, entry: PlaylistEntry) -> None:
         kind="xtream",
     )
     source_key = entry.source.strip()
-    app.playlist_cache[source_key] = playlist
+    remember = getattr(app, "remember_playlist", None)
+    if callable(remember):
+        remember(source_key, playlist)
+    else:
+        app.playlist_cache[source_key] = playlist
     app.push(ChannelsScreen(app, playlist))
 
 

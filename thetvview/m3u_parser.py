@@ -89,12 +89,19 @@ def _split_extinf(rest: str) -> tuple[dict[str, str], str]:
         # Sin nombre tras la coma: attrs vacíos, nombre vacío.
         return {}, ""
     attr_part, name = rest[:comma_idx].strip(), rest[comma_idx + 1 :].strip()
+    if '"' not in attr_part:
+        # Sin comillas no puede haber pares clave="valor": evita el regex.
+        return {}, name
     # Fix bug real: tvg-logo="tvg-logo="https://..." (comillas anidadas)
     # Aparece en IPTVSV.m3u para un canal de Paraguay.
     if 'tvg-logo="tvg-logo="' in attr_part:
         attr_part = attr_part.replace('tvg-logo="tvg-logo="', 'tvg-logo="')
-    # Variante con espacios o mayúsculas raras: regex fallback
-    attr_part = re.sub(r'tvg-logo="\s*tvg-logo="', 'tvg-logo="', attr_part, flags=re.IGNORECASE)
+    # Variante con espacios o mayúsculas raras: regex fallback.
+    # Solo se ejecuta si quedan DOS 'tvg-logo="' (necesario para que la
+    # regex pueda coincidir): en listas grandes el re.sub por línea costaba
+    # ~0,2 s sobre 96k canales y casi nunca encontraba nada.
+    if attr_part.lower().count('tvg-logo="') > 1:
+        attr_part = re.sub(r'tvg-logo="\s*tvg-logo="', 'tvg-logo="', attr_part, flags=re.IGNORECASE)
     attrs = {k.lower().replace("-", "_"): v for k, v in _ATTR_RE.findall(attr_part)}
     return attrs, name
 
@@ -106,32 +113,18 @@ def parse_text(text: str, source: str | None = None, name: str | None = None) ->
     # hasta que aparezca su URL.
     current_extinf: tuple[str, dict[str, str]] | None = None  # (nombre, attrs)
     current_options: list[tuple[str, str]] = []
+    channels = playlist.channels
+    # Prefijos cacheados: se comprueba el '#' antes de subir a mayúsculas
+    # (una copia entera de la línea) porque las URLs son mitad de un M3U.
+    extm3u, extinf = "#EXTM3U", "#EXTINF:"
+    vlc_opt, kodi_opt = _OPTION_TAGS
 
     for raw_line in text.splitlines():  # normaliza \r\n, \r y \n
         line = raw_line.strip()
         if not line:
             continue
 
-        upper = line.upper()
-        if upper.startswith("#EXTM3U"):
-            # Cabecera: puede traer x-tvg-url (EPG asociado a la lista).
-            for key, value in _ATTR_RE.findall(line[len("#EXTM3U") :]):
-                if key.lower() == "x-tvg-url" and value.strip():
-                    playlist.epg_url = value.strip()
-        elif upper.startswith("#EXTINF:"):
-            # Nueva entrada: descarta cualquier EXTINF pendiente sin URL.
-            attrs, ch_name = _split_extinf(line[len("#EXTINF:") :])
-            current_extinf = (ch_name, attrs)
-            current_options = []
-        elif any(upper.startswith(tag) for tag in _OPTION_TAGS):
-            tag = next(t for t in _OPTION_TAGS if upper.startswith(t))
-            if current_extinf is not None:
-                current_options.append((tag.rstrip(":").lstrip("#"), line[len(tag) :]))
-            # Huérfano (sin EXTINF previo): ignorado silenciosamente.
-        elif line.startswith("#"):
-            # Otros tags (#EXTM3U, #EXTGRP, #PLAYLIST, comentarios): TODO(#EXTGRP).
-            continue
-        else:
+        if line[0] != "#":
             # Línea no-comentario => URL que cierra la entrada actual.
             if current_extinf is not None:
                 ch_name, attrs = current_extinf
@@ -140,15 +133,19 @@ def parse_text(text: str, source: str | None = None, name: str | None = None) ->
                 for key, value in attrs.items():
                     field_name = _KNOWN_ATTRS.get(key)
                     if field_name:
+                        # Se strippea una sola vez (antes se llamaba hasta 4
+                        # veces por atributo: era de lo más caro del parseo).
+                        stripped = value.strip()
                         # Valores vacíos (tvg-logo="" ) -> None, no cadena vacía.
-                        if not value.strip():
+                        if not stripped:
                             continue
                         # Sanitiza tvg-logo que arranca con 'tvg-logo=' residual
-                        if field_name == "tvg_logo" and value.strip().startswith("tvg-logo="):
-                            cleaned = value.strip()[len("tvg-logo="):].strip().lstrip('"').strip()
+                        if field_name == "tvg_logo" and stripped.startswith("tvg-logo="):
+                            cleaned = stripped[len("tvg-logo="):].strip().lstrip('"').strip()
                             if not cleaned:
                                 continue
-                            value = cleaned
+                            known[field_name] = cleaned
+                            continue
                         known[field_name] = value
                     else:
                         extra[key] = value
@@ -162,7 +159,7 @@ def parse_text(text: str, source: str | None = None, name: str | None = None) ->
                 tvg_name_val = known.get("tvg_name")
                 if tvg_name_val is not None and not tvg_name_val.strip():
                     tvg_name_val = None
-                playlist.channels.append(
+                channels.append(
                     Channel(
                         name=ch_name or line,
                         url=line,
@@ -178,6 +175,25 @@ def parse_text(text: str, source: str | None = None, name: str | None = None) ->
                 )
             current_extinf = None
             current_options = []
+            continue
+
+        upper = line.upper()
+        if upper.startswith(extm3u):
+            # Cabecera: puede traer x-tvg-url (EPG asociado a la lista).
+            for key, value in _ATTR_RE.findall(line[len(extm3u) :]):
+                if key.lower() == "x-tvg-url" and value.strip():
+                    playlist.epg_url = value.strip()
+        elif upper.startswith(extinf):
+            # Nueva entrada: descarta cualquier EXTINF pendiente sin URL.
+            attrs, ch_name = _split_extinf(line[len(extinf) :])
+            current_extinf = (ch_name, attrs)
+            current_options = []
+        elif upper.startswith(vlc_opt) or upper.startswith(kodi_opt):
+            tag = vlc_opt if upper.startswith(vlc_opt) else kodi_opt
+            if current_extinf is not None:
+                current_options.append((tag.rstrip(":").lstrip("#"), line[len(tag) :]))
+            # Huérfano (sin EXTINF previo): ignorado silenciosamente.
+        # Resto de comentarios (#EXTGRP, #PLAYLIST, ...): ignorados.
 
     # EXTINF final sin URL: descartado por contrato.
     if not playlist.channels and _is_ts_source(source):
