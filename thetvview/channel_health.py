@@ -25,10 +25,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Deque
 
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 from thetvview.models import Channel
+from thetvview.security.safe_http import SafeHttpClient
+from thetvview.security.url_policy import PURPOSE_STREAM
 
 # Reuso de aliases de player para headers (evitar duplicar lógica)
 # Definidos aquí para no crear dependencia circular con player.
@@ -132,28 +133,50 @@ def _build_headers(channel: Channel) -> dict[str, str]:
 
 
 def _friendly_error(exc: Exception) -> str:
-    msg = str(exc).lower()
+    """Traduce una excepción a un mensaje corto para la barra de estado.
+
+    Los errores de `safe_http` ya vienen en español y redactados, así que
+    aquí solo se abrevian; se conservan las reglas clásicas por si llega
+    algo de otra capa.
+    """
     if isinstance(exc, HTTPError):
         return f"HTTP {exc.code}"
+    msg = str(exc).lower()
+    for needle, short in _FRIENDLY_RULES:
+        if needle in msg:
+            return short
     s = str(exc)
-    if "timed out" in msg or "timeout" in msg:
-        return "Tiempo agotado"
-    if "name or service not known" in msg or "nodename nor servname" in msg:
-        return "DNS no resuelve"
-    if "connection refused" in msg:
-        return "Conexión rechazada"
-    if "no route to host" in msg:
-        return "Sin ruta al servidor"
-    if "network is unreachable" in msg:
-        return "Red no disponible"
-    if "certificate" in msg or "ssl" in msg:
-        return "Error TLS/certificado"
     # truncar mensaje crudo a algo legible
     if len(s) > 60:
         s = s[:57] + "..."
     # limpiar prefijo feo de URLError
     s = s.replace("<urlopen error ", "").strip(" []")
     return s or "Error de red"
+
+
+#: (fragmento en minúsculas, etiqueta corta) para la sonda.
+_FRIENDLY_RULES: tuple[tuple[str, str], ...] = (
+    ("tiempo de espera agotado", "Tiempo agotado"),
+    ("timed out", "Tiempo agotado"),
+    ("timeout", "Tiempo agotado"),
+    ("no resuelve en dns", "DNS no resuelve"),
+    ("name or service not known", "DNS no resuelve"),
+    ("nodename nor servname", "DNS no resuelve"),
+    ("rechazó la conexión", "Conexión rechazada"),
+    ("connection refused", "Conexión rechazada"),
+    ("no hay ruta", "Sin ruta al servidor"),
+    ("no route to host", "Sin ruta al servidor"),
+    ("red no disponible", "Red no disponible"),
+    ("network is unreachable", "Red no disponible"),
+    ("destino bloqueado", "URL bloqueada"),
+    ("demasiadas solicitudes", "Límite de peticiones"),
+    ("demasiadas peticiones", "Límite de peticiones"),
+    ("supera el límite", "Respuesta muy grande"),
+    ("no es segura", "Error TLS/certificado"),
+    ("certificado", "Error TLS/certificado"),
+    ("tls", "Error TLS/certificado"),
+    ("ssl", "Error TLS/certificado"),
+)
 
 
 def _is_http_url(url: str) -> bool:
@@ -167,14 +190,29 @@ def _strip_ffmpeg_prefix(url: str) -> str:
     return url
 
 
-def probe_channel_url(channel: Channel, timeout: float = 3.0) -> HealthSnapshot:
+#: Tope de cuerpo para la sonda. Con `read_body=False` no se lee nada,
+#: pero si algún día se lee, es el máximo que se materializa.
+_PROBE_BODY_BYTES: int = 64
+
+
+def probe_channel_url(
+    channel: Channel,
+    timeout: float = 3.0,
+    *,
+    allow_private: bool = False,
+) -> HealthSnapshot:
     """Hace una sonda HTTP al URL del canal y mide latencia.
 
     - Soporta http/https únicamente; otros esquemas (rtmp, udp, rtsp) devuelven
       success=None (no medible) sin hacer red.
-    - Intenta HEAD; si el servidor responde 405/501/403, reintenta GET con
-      Range bytes=0-1 (más compatible con HLS).
-    - Timeout corto (default 3s) para no congelar el hilo.
+    - Intenta HEAD; si el servidor responde 405/501/403/400, reintenta GET con
+      Range bytes=0-1 (más compatible con HLS) **sin leer el cuerpo**: en un
+      directo el servidor nunca terminaría de enviarlo.
+    - Timeout corto (default 3s) y sin reintentos, para no congelar el hilo
+      ni martillar al servidor.
+    - La URL pasa por `safe_http` (B3): política de URL, anti-SSRF,
+      redirects revalidados y TLS estricto. ``allow_private=True`` solo si
+      la fuente lo declaró (SDD §11).
     """
     now = datetime.now(timezone.utc).astimezone()
     raw_url = _strip_ffmpeg_prefix(channel.url.strip())
@@ -185,77 +223,47 @@ def probe_channel_url(channel: Channel, timeout: float = 3.0) -> HealthSnapshot:
         return HealthSnapshot(now, None, None, None, "Protocolo no HTTP", raw_url[:60])
 
     headers = _build_headers(channel)
+    client = SafeHttpClient(
+        allow_private=allow_private,
+        purpose=PURPOSE_STREAM,
+        max_bytes=_PROBE_BODY_BYTES,
+        retries=0,
+        accept_gzip=False,
+    )
     start = time.monotonic()
 
-    def _do_request(req: Request) -> tuple[bool, float, int | None, str | None]:
-        try:
-            with urlopen(req, timeout=timeout) as resp:  # noqa: S310 - url validada, timeout
-                code = getattr(resp, "status", None)
-                if code is None:
-                    try:
-                        code = resp.getcode()  # type: ignore[attr-defined]
-                    except Exception:
-                        code = 200
-                latency = (time.monotonic() - start) * 1000.0
-                # 2xx y 3xx se consideran éxito (redirecciones HLS válidas)
-                success = 200 <= int(code) < 400
-                err = None if success else f"HTTP {code}"
-                return success, latency, int(code), err
-        except HTTPError as e:
-            latency = (time.monotonic() - start) * 1000.0
-            # HTTPError ya trae código; pero puede ser reintentable
-            raise e
-        except URLError as e:
-            latency = (time.monotonic() - start) * 1000.0
-            raise e
-        except Exception as e:  # noqa: BLE001
-            raise URLError(str(e))
+    def _latency() -> float:
+        return (time.monotonic() - start) * 1000.0
 
-    # HEAD primero
-    req_head = Request(raw_url, headers=headers, method="HEAD")
+    def _network_fail(exc: Exception) -> HealthSnapshot:
+        # safe_http ya redacta URLs/credenciales en el mensaje.
+        return HealthSnapshot(
+            now, _latency(), False, None, _friendly_error(exc), str(exc)
+        )
+
     try:
-        success, latency, code, err = _do_request(req_head)
-        return HealthSnapshot(now, latency, success, code, err, None if success else err)
-    except HTTPError as e:
-        # Reintentar con GET si HEAD no soportado
-        if e.code in (405, 501, 403, 400):
-            try:
-                headers2 = dict(headers)
-                headers2["Range"] = "bytes=0-1"
-                req_get = Request(raw_url, headers=headers2, method="GET")
-                # reiniciar tiempo para GET? mantenemos mismo start para latencia total
-                with urlopen(req_get, timeout=timeout) as resp2:  # noqa: S310
-                    code2 = getattr(resp2, "status", None)
-                    if code2 is None:
-                        try:
-                            code2 = resp2.getcode()  # type: ignore[attr-defined]
-                        except Exception:
-                            code2 = 200
-                    latency2 = (time.monotonic() - start) * 1000.0
-                    success2 = 200 <= int(code2) < 400
-                    err2 = None if success2 else f"HTTP {code2}"
-                    return HealthSnapshot(now, latency2, success2, int(code2), err2, None if success2 else err2)
-            except HTTPError as e2:
-                latency = (time.monotonic() - start) * 1000.0
-                return HealthSnapshot(now, latency, False, int(e2.code), f"HTTP {e2.code}", str(e2))
-            except URLError as e2:
-                latency = (time.monotonic() - start) * 1000.0
-                friendly = _friendly_error(e2)
-                return HealthSnapshot(now, latency, False, None, friendly, str(e2))
-            except Exception as e2:  # noqa: BLE001
-                latency = (time.monotonic() - start) * 1000.0
-                friendly = _friendly_error(e2)  # type: ignore[arg-type]
-                return HealthSnapshot(now, latency, False, None, friendly, str(e2))
-        latency = (time.monotonic() - start) * 1000.0
-        return HealthSnapshot(now, latency, False, int(e.code), f"HTTP {e.code}", str(e))
-    except URLError as e:
-        latency = (time.monotonic() - start) * 1000.0
-        friendly = _friendly_error(e)
-        return HealthSnapshot(now, latency, False, None, friendly, str(e))
-    except Exception as e:  # noqa: BLE001
-        latency = (time.monotonic() - start) * 1000.0
-        friendly = _friendly_error(e)  # type: ignore[arg-type]
-        return HealthSnapshot(now, latency, False, None, friendly, str(e))
+        resp = client.head(raw_url, headers=headers, timeout=timeout)
+        code = int(resp.status)
+        if code in (405, 501, 403, 400):
+            # Reintentar con GET: muchos servidores HLS rechazan HEAD.
+            # `read_body=False`: sólo nos interesa el status.
+            get_headers = dict(headers)
+            get_headers["Range"] = "bytes=0-1"
+            resp = client.request(
+                raw_url,
+                method="GET",
+                headers=get_headers,
+                timeout=timeout,
+                read_body=False,
+            )
+            code = int(resp.status)
+    except Exception as exc:  # noqa: BLE001 - la sonda nunca debe romper el hilo
+        return _network_fail(exc)
+
+    # 2xx y 3xx se consideran éxito (redirecciones HLS válidas)
+    success = 200 <= code < 400
+    err = None if success else f"HTTP {code}"
+    return HealthSnapshot(now, _latency(), success, code, err, err)
 
 
 # ---------------------------------------------------------------------------
@@ -479,10 +487,14 @@ class ChannelHealthMonitor:
         history_size: int = 8,
         timeout: float = 3.0,
         auto_start: bool = True,
+        allow_private: bool = False,
     ) -> None:
         self.channel = channel
         self.interval = max(0.5, float(interval))
         self.timeout = max(0.5, float(timeout))
+        #: Excepción anti-SSRF de la fuente a la que pertenece el canal
+        #: (SDD §11). Por defecto la red privada está bloqueada.
+        self.allow_private = bool(allow_private)
         self.history: Deque[HealthSnapshot] = deque(maxlen=max(0, int(history_size)) or 8)
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -491,7 +503,9 @@ class ChannelHealthMonitor:
             self.start()
 
     def probe_once(self) -> HealthSnapshot:
-        snap = probe_channel_url(self.channel, timeout=self.timeout)
+        snap = probe_channel_url(
+            self.channel, timeout=self.timeout, allow_private=self.allow_private
+        )
         with self._lock:
             self.history.append(snap)
         return snap

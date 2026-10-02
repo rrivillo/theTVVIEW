@@ -1,32 +1,54 @@
-"""Jerarquía de errores para proveedores Xtream (solo stdlib).
+"""Errores Xtream: re-export de la taxonomía central + mensajes amigables.
 
-Cada subclase permite distinguir el tipo de fallo en la TUI y en tests
-sin depender de strings ni códigos HTTP crudos.
+El árbol de excepciones vive en :mod:`thetvview.security.errors` (SDD §27).
+Este módulo se queda como fachada para no romper los cientos de imports y
+tests existentes (`from thetvview.xtream_errors import ...`).
+
+`friendly_message()` es copia de la TUI (nunca muestra códigos HTTP ni
+rastros de secretos): traduce cualquier excepción a una frase que el
+usuario puede entender y en la que puede actuar.
 """
 
+from __future__ import annotations
 
-class ProviderError(Exception):
-    """Error base de cualquier operación con un proveedor IPTV."""
+import re
 
+from .security.errors import (
+    AccountDisabledError,
+    AccountExpiredError,
+    AuthenticationError,
+    ConnectionLimitError,
+    InvalidSourceError,
+    InvalidUrlError,
+    IPTVError,
+    NetworkError,
+    ParseError,
+    ProviderError,
+    RateLimitError,
+    ResponseTooLargeError,
+    SSRFBlockedError,
+    TLSValidationError,
+    UnsupportedProviderError,
+)
 
-class AuthenticationError(ProviderError):
-    """Credenciales inválidas o expiradas (401/403 del servidor)."""
-
-
-class InvalidSourceError(ProviderError):
-    """Fuente no válida: URL malformada, respuesta inesperada, etc."""
-
-
-class NetworkError(ProviderError):
-    """Fallo de conexión, timeout, DNS, etc."""
-
-
-class RateLimitError(ProviderError):
-    """El servidor pide esperar (429 Too Many Requests)."""
-
-
-class UnsupportedProviderError(ProviderError):
-    """El servidor no es un proveedor Xtream compatible."""
+__all__ = [
+    "IPTVError",
+    "ProviderError",
+    "AuthenticationError",
+    "AccountExpiredError",
+    "AccountDisabledError",
+    "InvalidSourceError",
+    "InvalidUrlError",
+    "NetworkError",
+    "TLSValidationError",
+    "SSRFBlockedError",
+    "ResponseTooLargeError",
+    "RateLimitError",
+    "ConnectionLimitError",
+    "ParseError",
+    "UnsupportedProviderError",
+    "friendly_message",
+]
 
 
 def friendly_message(exc: BaseException) -> str:
@@ -36,8 +58,32 @@ def friendly_message(exc: BaseException) -> str:
     Esos códigos se quedan en el log/traceback (`__cause__`), nunca en
     la barra de estado. Cada mensaje dice qué pasó y qué hacer.
     """
-    import re
-
+    # --- Bloqueos de seguridad (subclases de NetworkError: van primero) -----
+    if isinstance(exc, SSRFBlockedError):
+        return (
+            "Esa dirección apunta a una red interna o privada y la app la "
+            "bloquea por seguridad. Si es tu propio servidor, añade la fuente "
+            "aceptando el aviso de red privada."
+        )
+    if isinstance(exc, ResponseTooLargeError):
+        return (
+            "El servidor devolvió una respuesta demasiado grande y la app la "
+            "detuvo para no agotar la memoria. Prueba más tarde o revisa la fuente."
+        )
+    if isinstance(exc, TLSValidationError):
+        return (
+            "La conexión no es segura: el certificado del servidor no es válido. "
+            "No se envió ninguna credencial. Revisa la dirección o usa https."
+        )
+    if isinstance(exc, AccountDisabledError):
+        return (
+            "Tu cuenta está desactivada o bloqueada por el proveedor. "
+            "Contacta con tu proveedor para recuperar el acceso."
+        )
+    if isinstance(exc, AccountExpiredError):
+        return (
+            "Tu cuenta ha caducado. Contacta con tu proveedor para renovarla."
+        )
     if isinstance(exc, AuthenticationError):
         return (
             "Usuario o contraseña incorrectos: el servidor rechazó el acceso. "
@@ -48,10 +94,20 @@ def friendly_message(exc: BaseException) -> str:
             "Demasiados intentos seguidos: el servidor pide esperar un momento "
             "antes de reintentar."
         )
+    if isinstance(exc, ConnectionLimitError):
+        return (
+            "Hay demasiadas peticiones en marcha a la vez. "
+            "Espera unos segundos y vuelve a intentarlo."
+        )
     if isinstance(exc, UnsupportedProviderError):
         return (
             "Ese servidor no parece Xtream (no ofrece la API esperada). "
             "Prueba a añadirlo como lista M3U con su enlace get.php."
+        )
+    if isinstance(exc, ParseError):
+        return (
+            "El archivo no se puede leer: su contenido no es válido o está "
+            "dañado. Revisa la ruta o pide una copia nueva a tu proveedor."
         )
     if isinstance(exc, NetworkError):
         raw = str(exc)
@@ -74,6 +130,17 @@ def friendly_message(exc: BaseException) -> str:
         return (
             "Problema de conexión con el servidor. "
             "Revisa tu internet e inténtalo de nuevo."
+        )
+    if isinstance(exc, InvalidUrlError):
+        detail = str(exc).strip()
+        if detail:
+            msg = detail[0].upper() + detail[1:] if len(detail) > 1 else detail
+            if not msg.endswith("."):
+                msg += "."
+            return f"{msg} Corrige la dirección e inténtalo de nuevo."
+        return (
+            "La dirección no es válida. "
+            "Corrige la dirección e inténtalo de nuevo."
         )
     if isinstance(exc, InvalidSourceError):
         return (

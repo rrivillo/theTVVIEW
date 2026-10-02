@@ -142,7 +142,8 @@ class XtreamTestCase(unittest.TestCase):
         cls.server.shutdown()
 
     def _cfg(self, user: str = _FAKE_USER, pw: str = _FAKE_PASS) -> XtreamConfig:
-        return XtreamConfig(server_url=self.base_url, username=user, password=pw)
+        return XtreamConfig(server_url=self.base_url, username=user, password=pw,
+                               allow_private_network=True)
 
     def test_auth_ok(self) -> None:
         info = authenticate(self._cfg())

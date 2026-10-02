@@ -10,11 +10,13 @@ import curses
 import locale
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
+from thetvview import catchup
 from thetvview import config
 from thetvview import resolutions
-from thetvview.epg_parser import Epg, load_url, parse_file
+from thetvview.epg_parser import Epg, load_url, parse_file, resolve_source
 from thetvview.favorites import FavoritesError, FavoritesManager
 from thetvview.models import Channel, Playlist, Program
 from thetvview.playlist_manager import PlaylistError, PlaylistManager
@@ -42,15 +44,52 @@ from .screens import (
 # cargarse en segundo plano (evita martillar servidores caídos en cada canal).
 WARM_RETRY_S = 300.0
 
+# Espera máxima (s) a que termine la carga en segundo plano del EPG que trae
+# una playlist antes de caer en el prompt manual de "Cargar EPG".
+EPG_WAIT_S = 60.0
 
-def load_epg_source(source: str, *, force_refresh: bool = False) -> Epg:
-    """Carga un XMLTV desde path local o URL http(s) (cache TTL)."""
+# Reintento de una fuente EPG declarada en la lista que falló (misma idea
+# que WARM_RETRY_S, para no martillar un servidor caído en cada apertura).
+EPG_RETRY_S = 300.0
+
+
+def playlist_epg_sources(playlist: Playlist | None) -> list[str]:
+    """Fuentes EPG que declara la lista, resueltas y sin duplicados.
+
+    Lee `epg_urls` (o `epg_url` como fallback) y las normaliza contra el
+    origen de la lista: URLs http(s) tal cual, paths locales relativos
+    contra el directorio del fichero (o urljoin si la lista es remota).
+    """
+    if playlist is None:
+        return []
+    refs = list(getattr(playlist, "epg_urls", None) or [])
+    if not refs:
+        single = (getattr(playlist, "epg_url", None) or "").strip()
+        if single:
+            refs = [single]
+    base = (getattr(playlist, "source", None) or "").strip() or None
+    sources: list[str] = []
+    for ref in refs:
+        resolved = resolve_source(ref, base=base)
+        if resolved and resolved not in sources:
+            sources.append(resolved)
+    return sources
+
+
+def load_epg_source(source: str, *, force_refresh: bool = False,
+                    allow_private: bool = False) -> Epg:
+    """Carga un XMLTV desde path local o URL http(s) (cache TTL).
+
+    ``allow_private`` es la excepción anti-SSRF declarada para esa fuente
+    (SDD §11); por defecto la red privada está bloqueada.
+    """
     if source.lower().startswith(("http://", "https://")):
-        return load_url(source, force_refresh=force_refresh)
+        return load_url(source, force_refresh=force_refresh, allow_private=allow_private)
     return parse_file(source)
 
 
-def load_playlist_source(source: str, *, force_refresh: bool = False) -> Playlist:
+def load_playlist_source(source: str, *, force_refresh: bool = False,
+                         allow_private: bool = False) -> Playlist:
     """Parsea una fuente IPTV (path local o URL http(s)).
 
     Acepta .m3u/.m3u8 y también .ts como lista válida (un solo stream),
@@ -61,11 +100,16 @@ def load_playlist_source(source: str, *, force_refresh: bool = False) -> Playlis
     las siguientes abren instantáneo desde cache. Si el servidor falla
     pero hay cache previa, se devuelve la cache en vez de romper.
     Con `force_refresh=True` se re-descarga siempre (botón Recargar).
+
+    ``allow_private`` habilita red privada/loopback solo si la fuente lo
+    tiene declarado en el catálogo (SDD §11).
     """
     from thetvview import m3u_parser
 
     if source.lower().startswith(("http://", "https://")):
-        return m3u_parser.load_url(source, force_refresh=force_refresh)
+        return m3u_parser.load_url(
+            source, force_refresh=force_refresh, allow_private=allow_private
+        )
     return m3u_parser.parse_file(source)
 
 
@@ -237,9 +281,11 @@ _HELP_HERE: dict[str, list[tuple[str, str]]] = {
         ("key", "r  borrar todo el historial de recientes."),
     ],
     "EpgScreen": [
-        ("key", "Enter  ver el canal de esta guía."),
-        ("key", "r  volver a cargar la guía (por si está desactualizada)."),
-        ("tip", "● marca el programa que están emitiendo ahora."),
+        ("key", "Enter  ver el directo del canal."),
+        ("key", "Enter  sobre ▶ ver ese programa del archivo."),
+        ("key", "r  volver a cargar la guía."),
+        ("tip", "● se emite ahora · ▶ está en el archivo · ○ sólo info."),
+        ("tip", "El archivo existe sólo si el proveedor lo declara."),
     ],
     "ResolutionScreen": [
         ("key", "← / →  elegir calidad (p. ej. 1080p, 720p, Auto)."),
@@ -303,6 +349,7 @@ def build_help_lines(screen) -> list[tuple[str, str]]:
         ("key", "r  ver lo último reproducido (Recientes)."),
         ("key", "p  elegir reproductor para el canal actual."),
         ("key", "u  deshacer el último borrado de lista."),
+        ("key", "!  comprobar la seguridad (security-check) con modal."),
         ("key", "Ratón  clic para elegir, doble clic para abrir."),
         ("blank", ""),
         ("section", f"En esta pantalla: {where}"),
@@ -383,20 +430,56 @@ def interpret_quit_choice(res: str | None, key: int) -> bool | None:
     return None
 
 
+def _is_private_source(source: str) -> bool:
+    """True si `source` es una URL hacia red privada/loopback/metadata.
+
+    Sin DNS (`resolve=False`): sólo literales IP y nombres locales. Un
+    hostname que resuelva a un rango privado lo pilla el anti-SSRF al
+    descargar y se muestra en su propio modal.
+    """
+    text = (source or "").strip()
+    if not text.lower().startswith(("http://", "https://")):
+        return False  # ruta local: no hay destino de red
+    from thetvview.security.ssrf import SSRFBlockedError, check_url
+    from thetvview.security.url_policy import PURPOSE_METADATA, InvalidUrlError
+
+    try:
+        check_url(text, PURPOSE_METADATA, allow_private=False, resolve=False)
+    except SSRFBlockedError:
+        return True
+    except (InvalidUrlError, ValueError, OSError):
+        return False
+    return False
+
+
+def _is_plain_http(source: str) -> bool:
+    """True si `source` es remota y va sin TLS (B13)."""
+    return (source or "").strip().lower().startswith("http://")
+
+
 class App:
     """Estado global + stack de pantallas + bucle de eventos."""
-
     def __init__(self, stdscr: curses.window) -> None:
         self.stdscr = stdscr
         self.status = StatusBar()
         self.header = HeaderBar(app=self)
         self.footer = FooterBar()
+        # Guarda anti-recursión: un modal nunca abre otro modal.
+        self._in_modal = False
+        # Todo error mostrado con status.show(..., error=True) sube a modal.
+        self.status.on_error = self._show_notice
         self.playlists = PlaylistManager(config.PLAYLISTS_JSON)
         self.favorites = FavoritesManager(config.FAVORITES_JSON)
         self.prefs = PrefsManager()
         self.recents = RecentsManager()
         self.epg: Epg | None = None
         self.epg_source: str | None = None
+        # Fuente que cargó self.epg automáticamente desde una playlist
+        # (None si la cargó el usuario a mano: eso nunca se pisa solo).
+        self._epg_auto_source: str | None = None
+        # Carga en segundo plano del EPG que declara la playlist abierta.
+        self._epg_load_thread: threading.Thread | None = None
+        self._epg_failed: dict[str, float] = {}
         self.theme_name: str = self.prefs.load().theme or config.load_theme()
         self.playlist_cache: dict[str, Playlist] = {}
         # Vigencia de cada entrada de playlist_cache (mtime local / instante
@@ -573,7 +656,9 @@ class App:
             if source in self.playlist_cache:
                 continue
             try:
-                playlist = load_playlist_source(source)
+                playlist = load_playlist_source(
+                    source, allow_private=entry.allow_private_network
+                )
             except (OSError, ValueError):
                 continue  # fuente caída/inaccesible: no bloquea la búsqueda
             self.remember_playlist(source, playlist)
@@ -583,6 +668,18 @@ class App:
         return []
 
     # --- Catálogo en segundo plano --------------------------------------------
+
+    def _allow_private_for(self, source: str) -> bool:
+        """Excepción anti-SSRF que el catálogo declara para `source` (SDD §11).
+
+        Por defecto la red privada está bloqueada; sólo una fuente que el
+        usuario habilitó explícitamente puede salirse de esa regla. Nunca
+        lanza: si el catálogo no está disponible, se queda en False.
+        """
+        try:
+            return bool(self.playlists.allow_private_for(source))
+        except Exception:
+            return False
 
     def pending_catalog_sources(self) -> list[str]:
         """Fuentes del catálogo todavía no parseadas en esta sesión.
@@ -650,7 +747,9 @@ class App:
                         return
                     source = self._warm_queue.pop(0)
                 try:
-                    playlist = load_playlist_source(source)
+                    playlist = load_playlist_source(
+                        source, allow_private=self._allow_private_for(source)
+                    )
                     if playlist is None:
                         raise ValueError(f"fuente ilegible: {source}")
                     self.remember_playlist(source, playlist)
@@ -805,8 +904,12 @@ class App:
         if not data:
             return
         name, source = data["name"], data["source"]
+        if not self._guard_source_policy(source):
+            return
         try:
-            self.playlists.add(name, source)
+            self.playlists.add(
+                name, source, allow_private_network=_is_private_source(source)
+            )
         except PlaylistError as exc:
             self.status.show(str(exc), error=True)
             return
@@ -844,7 +947,16 @@ class App:
             self.status.show(f"URL inválida: {exc}", error=True)
             return
 
-        cfg = XtreamConfig(server_url=normalized, username=user, password=password)
+        if not self._guard_source_policy(normalized):
+            return
+        allow_private = _is_private_source(normalized)
+
+        cfg = XtreamConfig(
+            server_url=normalized,
+            username=user,
+            password=password,
+            allow_private_network=allow_private,
+        )
         self.show_loading("Probando conexión…", sub=normalized)
         try:
             info = authenticate(cfg, force_refresh=True)
@@ -866,7 +978,10 @@ class App:
         msg += "). Guardando…"
 
         try:
-            self.playlists.add_xtream(name, normalized, user, password)
+            self.playlists.add_xtream(
+                name, normalized, user, password,
+                allow_private_network=allow_private,
+            )
         except PlaylistError as exc:
             self.status.show(str(exc), error=True)
             return
@@ -907,6 +1022,7 @@ class App:
             server_url=entry.server_url,
             username=entry.username,
             password=new_password,
+            allow_private_network=entry.allow_private_network,
         )
         self.show_loading("Verificando contraseña…", sub=entry.server_url)
         try:
@@ -1063,6 +1179,93 @@ class App:
         else:
             self.status.show(f"'{channel.name}' no estaba en favoritos.", error=True)
 
+    def auto_load_playlist_epg(self, playlist: Playlist | None) -> bool:
+        """Carga en segundo plano el EPG que declare la playlist, si lo trae.
+
+        Muchas listas traen su XMLTV en la cabecera (#EXTM3U x-tvg-url /
+        url-tvg / tvg-url, con URL o path relativo). En ese caso no hace
+        falta pedirle nada al usuario: se descarga (o se lee) al abrir la
+        lista, sin bloquear la TUI, y los canales muestran su parrilla
+        en cuanto termina.
+
+        Devuelve True si se lanzó la carga. No relanza si:
+        - la fuente declarada ya está cargada,
+        - el EPG actual lo eligió el usuario a mano (no se pisa),
+        - hay una carga en curso,
+        - o la fuente falló hace poco (WARM de reintentos).
+        """
+        sources = playlist_epg_sources(playlist)
+        if not sources:
+            return False
+        if self.epg is not None:
+            if self.epg_source in sources:
+                return False  # ya está en uso esta fuente
+            if self.epg_source != self._epg_auto_source:
+                return False  # elección manual del usuario: se respeta
+        thread = self._epg_load_thread
+        if thread is not None and thread.is_alive():
+            return False
+        now = time.monotonic()
+        pending = [s for s in sources if now - self._epg_failed.get(s, -1e9) >= EPG_RETRY_S]
+        if not pending:
+            return False
+        name = (getattr(playlist, "name", None) or "lista").strip() or "lista"
+        # El EPG lo declara la propia lista: hereda su excepción anti-SSRF.
+        allow_private = self._allow_private_for(getattr(playlist, "source", "") or "")
+        self.status.show(f"Cargando el EPG de '{name}'…")
+        worker = threading.Thread(
+            target=self._epg_load_worker,
+            args=(pending, allow_private),
+            name="epg-load",
+            daemon=True,
+        )
+        self._epg_load_thread = worker
+        worker.start()
+        return True
+
+    def _epg_load_worker(self, sources: list[str], allow_private: bool = False) -> None:
+        """Hilo daemon: prueba las fuentes en orden y se queda con la primera.
+
+        `allow_private` es la excepción anti-SSRF de la lista que declaró
+        estas fuentes (SDD §11); viaja en el hilo para no leer el catálogo
+        desde otro thread.
+        """
+        last_error = ""
+        try:
+            for src in sources:
+                try:
+                    epg = load_epg_source(src, allow_private=allow_private)
+                except (OSError, ValueError) as exc:
+                    last_error = str(exc)
+                    self._epg_failed[src] = time.monotonic()
+                    continue
+                self.epg = epg
+                self.epg_source = src
+                self._epg_auto_source = src
+                self._epg_failed.pop(src, None)
+                self.status.show(f"EPG cargado de la lista ({len(epg.programs)} canales).")
+                return
+            self.status.show(
+                f"No se pudo cargar el EPG de la lista: {last_error or 'fuente ilegible'}",
+                error=True,
+            )
+        finally:
+            self._epg_load_thread = None
+
+    def wait_for_epg_load(self, timeout: float = EPG_WAIT_S) -> bool:
+        """Espera a lo sumo `timeout` s a que termine la carga en curso.
+
+        True si no queda ninguna carga en marcha (terminó bien, falló o no
+        la había); False si sigue cargando al agotarse el tiempo.
+        """
+        thread = self._epg_load_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
+            thread = self._epg_load_thread
+            if thread is not None and thread.is_alive():
+                return False
+        return True
+
     def ensure_epg(
         self,
         channel: Channel,
@@ -1074,8 +1277,16 @@ class App:
 
         El origen puede ser un path local (.xml/.gz) o una URL http(s)
         (descarga con cache TTL; 'r' en la pantalla EPG fuerza re-descarga).
+        Si la playlist trae su EPG declarado en la cabecera, ya se lanza
+        con `auto_load_playlist_epg` al abrirla: aquí solo se espera.
         `url_hint` sugiere el x-tvg-url de la playlist de origen.
         """
+        if self.epg is None and getattr(self, "_epg_load_thread", None) is not None:
+            # La playlist trae su EPG y se está cargando en segundo plano:
+            # se espera (acotado) en vez de interrumpir con el prompt.
+            if not self.wait_for_epg_load():
+                self.notify_warning("El EPG de la lista sigue cargando; vuelve a pulsar 'e'.")
+                return []
         if self.epg is None:
             default = self.epg_source or (url_hint or "").strip()
             data = self._prompt_form(
@@ -1087,15 +1298,22 @@ class App:
             if not path:
                 return []
             try:
-                self.epg = load_epg_source(path)
+                self.epg = load_epg_source(
+                    path, allow_private=self._allow_private_for(path)
+                )
             except (OSError, ValueError) as exc:
                 self.status.show(str(exc), error=True)
                 return []
             self.epg_source = path
+            self._epg_auto_source = None  # elección manual: no la pisa el auto-carga
             self.status.show(f"EPG cargado ({len(self.epg.programs)} canales).")
         elif force_refresh and self.epg_source:
             try:
-                self.epg = load_epg_source(self.epg_source, force_refresh=True)
+                self.epg = load_epg_source(
+                    self.epg_source,
+                    force_refresh=True,
+                    allow_private=self._allow_private_for(self.epg_source),
+                )
                 self.status.show(f"EPG recargado ({len(self.epg.programs)} canales).")
             except (OSError, ValueError) as exc:
                 self.status.show(str(exc), error=True)
@@ -1106,6 +1324,117 @@ class App:
             )
             return []
         return self.epg.programmes_for(cid)
+
+    # --- Avisos al usuario (modal) ------------------------------------------
+
+    def notify_error(self, message: str) -> None:
+        """Error bloqueante: barra de estado + modal de confirmación."""
+        self.notify(message, error=True)
+
+    def notify_warning(self, message: str) -> None:
+        """Aviso no bloqueante: barra de estado + modal de confirmación."""
+        self.notify(message, error=False)
+
+    def notify(self, message: str, *, error: bool = False, title: str | None = None) -> None:
+        """Muestra `message` en la barra de estado y en un modal (Fase 6).
+
+        No negociable #1: errores, advertencias e interacciones del usuario
+        se ven en un modal. Fuera de curses, desde un hilo o con otro modal
+        abierto, se degrada a la barra de estado para no colgar la TUI.
+        """
+        self.status.show(message, error=error)
+        if not error:
+            self._show_notice(title or "Aviso", message)
+
+    def _show_notice(self, title: str, message: str) -> None:
+        """Modal informativo de un solo botón. Nunca lanza (Fase 6)."""
+        from .widgets import Modal
+
+        self._run_modal(Modal(title, message, ["Aceptar"]))
+
+    def _confirm(self, title: str, message: str) -> bool:
+        """Modal de confirmación. False sin UI o si el usuario cancela."""
+        from .widgets import Modal
+
+        res = self._run_modal(Modal(title, message, ["Cancelar", "Aceptar"]))
+        return res == "aceptar"
+
+    def _run_modal(self, modal) -> str | None:  # noqa: ANN001
+        """Bucle de modal centrado; devuelve el botón o None si no hay UI.
+
+        Nunca lanza y nunca se anida: fuera de curses, en un hilo o con otro
+        modal abierto devuelve None y deja la decisión en la barra de estado.
+        """
+        if self._in_modal:
+            return None
+        if threading.current_thread() is not threading.main_thread():
+            return None
+        stdscr = getattr(self, "stdscr", None)
+        if not isinstance(stdscr, curses.window):
+            return None
+        self._in_modal = True
+        try:
+            while True:
+                try:
+                    stdscr.erase()
+                    try:
+                        self.header.render(
+                            stdscr, getattr(self.screen, "title", ""), len(self.stack)
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        self.screen.render(stdscr)
+                    except Exception:
+                        pass
+                    try:
+                        self._render_footer(stdscr)
+                    except Exception:
+                        pass
+                    modal.render(stdscr)
+                    stdscr.refresh()
+                except curses.error:
+                    pass
+                key = stdscr.getch()
+                if key == curses.KEY_RESIZE or key == -1:
+                    continue
+                res = modal.handle_key(key)
+                if res is not None:
+                    return res
+        except Exception:
+            # Cualquier sorpresa de curses: el mensaje ya está en la barra.
+            return None
+        finally:
+            self._in_modal = False
+
+    def _guard_source_policy(self, source: str) -> bool:
+        """Confirmación previa al guardado de una fuente (SDD §11, B13).
+
+        - Red privada/loopback/metadata → hay que confirmarlo a mano; sin
+          confirmación no se guarda (la excepción anti-SSRF es por fuente y
+          explícita, nunca global).
+        - ``http://`` sin TLS → aviso, no bloquea.
+
+        Devuelve False si hay que cancelar el guardado.
+        """
+        from thetvview.security.redaction import redact_text
+
+        if _is_private_source(source):
+            if not self._confirm(
+                "Acceso a red privada",
+                "Esta fuente apunta a una dirección local o privada:\n"
+                f"  {redact_text(source)}\n"
+                "El bloqueo anti-SSRF la impide por defecto.\n"
+                "¿Permitir el acceso sólo para esta lista?",
+            ):
+                self.notify_error("Cancelado: red privada no permitida.")
+                return False
+        if _is_plain_http(source):
+            self.notify_warning(
+                "Guardando una URL sin cifrar (http://):\n"
+                f"  {redact_text(source)}"
+            )
+        return True
 
     def show_loading(self, message: str = "Cargando…", sub: str = "") -> None:
         """Dibuja la pantalla de 'Cargando' y la muestra ya (refresh).
@@ -1118,6 +1447,8 @@ class App:
         from .widgets import LoadingOverlay
 
         stdscr = self.stdscr
+        if not isinstance(stdscr, curses.window):
+            return  # sin terminal (tests/headless): nada que dibujar
         try:
             stdscr.erase()
             try:
@@ -1162,7 +1493,11 @@ class App:
         name = getattr(playlist, "name", "lista") or "lista"
         self.show_loading(f"Actualizando '{name}'…", sub=source)
         try:
-            fresh = load_playlist_source(source, force_refresh=True)
+            fresh = load_playlist_source(
+                source,
+                force_refresh=True,
+                allow_private=self._allow_private_for(source),
+            )
         except (OSError, ValueError) as exc:
             self.status.show(str(exc), error=True)
             return
@@ -1173,6 +1508,10 @@ class App:
         except Exception:
             pass
         self.remember_playlist(source, fresh)
+        try:
+            self.auto_load_playlist_epg(fresh)
+        except Exception:
+            pass  # el EPG es opcional: no rompe la recarga de la lista
         for s in self.stack:
             pl = getattr(s, "playlist", None)
             if pl is None:
@@ -1197,6 +1536,52 @@ class App:
             self.footer.show(msg)
         except Exception:
             pass
+
+    def play_catchup(self, channel: Channel, program: Program) -> None:
+        """Pide al proveedor un programa ya emitido y lo reproduce (§8, §10).
+
+        El orden es el del SDD y es lo importante: **primero** se valida la
+        capacidad y la ventana; **después** se construye la referencia
+        opaca; **por último** se delega en `play_channel`, que es el mismo
+        camino que el directo. Si algo falla, el motivo sale en un modal y
+        no se lanza nada.
+
+        La pantalla no decide si el canal tiene archivo: eso lo dice
+        `catchup.capability_for`, que es la única fuente de la verdad.
+        """
+        cap = catchup.capability_for(channel)
+        now = datetime.now().astimezone()
+        estado = catchup.classify(channel, program, now)
+        if estado is not catchup.CatchupState.AVAILABLE:
+            # Ninguna petición histórica sale por aquí: sólo el porqué (§17).
+            self.notify_warning(catchup.describe_state(estado, cap))
+            return
+        inicio = program.start
+        fin = program.stop or program.start + timedelta(hours=1)
+        request = catchup.CatchupRequest(
+            channel_id=str((channel.attrs or {}).get("xtream_id") or channel.tvg_id or ""),
+            start=inicio,
+            end=fin,
+        )
+        try:
+            playback = catchup.build_playback_request(
+                channel, cap, request, now=now,
+            )
+        except catchup.CatchupError as exc:
+            # Plantilla que no reconocemos, mecanismo desconocido, esquema
+            # no permitido: se explica y no se intenta reproducir (§13).
+            self.notify_error(str(exc))
+            return
+        # Hecho: la referencia es opaca y sin credenciales. De aquí en
+        # adelante esto es una reproducción normal para el motor multimedia
+        # (SDD Catch-up §14): mismo reproductor, mismo argv, mismo argv `--`.
+        play_channel(
+            self,
+            catchup.playback_channel(playback),
+            player_name=self.prefs.last_player(),
+            catchup_playback=playback,
+            catchup_program=program,
+        )
 
     def handle_action(self, action: dict) -> None:
         match action.get("action"):
@@ -1284,6 +1669,8 @@ class App:
                 self.push(PlayerScreen(self, action["channel"]))
             case "play_with":
                 play_channel(self, action["channel"], player_name=action["player_name"])
+            case "play_catchup":
+                self.play_catchup(action["channel"], action["program"])
             case "stop_playback":
                 cur = self.screen
                 if isinstance(cur, NowPlayingScreen):
@@ -1319,7 +1706,10 @@ class App:
         except Exception:
             pass
         while True:
-            if isinstance(self.screen, NowPlayingScreen):
+            if isinstance(self.screen, NowPlayingScreen) or self._epg_load_thread is not None:
+                # Reproducción (vivo) o EPG de la playlist cargándose en
+                # segundo plano: refresco cada 500 ms para que los datos
+                # aparezcan en cuanto estén, sin esperar a una tecla.
                 stdscr.timeout(500)
             else:
                 stdscr.timeout(-1)
@@ -1350,6 +1740,10 @@ class App:
 
             key = stdscr.getch()
             if key == curses.KEY_RESIZE:
+                continue
+            if key == -1 and not isinstance(self.screen, NowPlayingScreen):
+                # Refresco periódico (EPG de la playlist cargándose en
+                # segundo plano): repinta sin consumirlo como pulsación.
                 continue
 
             if key == curses.KEY_MOUSE:
@@ -1438,6 +1832,9 @@ class App:
                     else:
                         self.footer.show("Nada que deshacer.")
                     continue
+                if key == ord("!"):
+                    self.run_security_check()
+                    continue
                 if key in (27, curses.KEY_BACKSPACE):
                     if isinstance(self.screen, NowPlayingScreen):
                         action = self.screen.handle_key(key)
@@ -1480,6 +1877,36 @@ class App:
         if msg:
             self.footer.show(msg, error=self.status.is_error)
         self.footer.render(stdscr)
+
+    def run_security_check(self) -> None:
+        """Tecla ``!``: ejecuta el security-check y abre el modal con el informe.
+
+        No negociable #1: el resultado —correcto o no— siempre termina en
+        un modal, nunca sólo en la barra de estado.
+        """
+        from ..security.check import FAILED_MARK, PASSED_MARK, run_checks
+
+        results = run_checks()
+        failed = [r for r in results if not r.ok]
+        total = len(results)
+        title = "Comprobación de seguridad"
+        if not failed:
+            msg = f"SECURITY CHECK PASSED ({total}/{total})"
+            msg += "\n\nTodos los controles del SDD §45 responden correcto."
+            msg += "\nDetalle: python -m thetvview.security.check"
+            self.status.show(f"Security check: {total}/{total} correcto.")
+        else:
+            head = f"SECURITY CHECK FAILED ({len(failed)}/{total})"
+            rows = [
+                f"{FAILED_MARK} {r.label}\n     {r.detail}" for r in failed
+            ]
+            msg = head + "\n\n" + "\n".join(rows)
+            msg += f"\n\nPulsa ! para repetir. ({PASSED_MARK} = correcto)"
+            self.status.show(
+                f"Security check: {len(failed)} comprobaciones fallan.",
+                error=True,
+            )
+        self._show_notice(title, msg)
 
     def _show_help(self) -> None:
         """Ayuda contextual con scroll: qué hacer aquí, paso a paso."""

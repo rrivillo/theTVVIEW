@@ -48,5 +48,8 @@ class Playlist:
     name: str
     channels: list[Channel] = field(default_factory=list)
     source: str | None = None  # path o URL de origen
-    epg_url: str | None = None  # x-tvg-url de la cabecera #EXTM3U
+    epg_url: str | None = None  # primera fuente EPG de la cabecera #EXTM3U
+    # Todas las fuentes EPG declaradas en la cabecera (x-tvg-url, url-tvg...),
+    # ya resueltas contra el origen de la lista y sin duplicados.
+    epg_urls: list[str] = field(default_factory=list)
     kind: str = "m3u"  # "m3u" | "xtream": color de selección (amarillo/púrpura)

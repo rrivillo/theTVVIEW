@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config
+from .security.local_files import chmod_private
 from .xtream_client import api_call
 from .xtream_config import XtreamConfig
 from .xtream_errors import AuthenticationError, InvalidSourceError, ProviderError
@@ -103,6 +104,7 @@ class XtreamSeriesInfo:
 def _cache_dir() -> Path:
     d = config.XTREAM_CACHE_DIR
     d.mkdir(parents=True, exist_ok=True)
+    chmod_private(d, directory=True)
     return d
 
 
@@ -138,6 +140,7 @@ def _write_cache(path: Path, data: dict | list) -> None:
     try:
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         tmp.replace(path)
+        chmod_private(path)
     except OSError:
         pass
 
@@ -166,11 +169,11 @@ def authenticate(cfg: XtreamConfig, *, force_refresh: bool = False) -> dict:
 
     if not force_refresh and _is_fresh(cp, CATEGORY_TTL):
         cached = _read_cache(cp)
-        if cached is not None:
+        if isinstance(cached, dict):
             return cached
 
     url = build_api_url(cfg.server_url, cfg.username, cfg.password, "auth")
-    data = api_call(url)
+    data = api_call(url, allow_private=cfg.allow_private_network)
 
     # Validar respuesta: Xtream devuelve {"user_info": {...}, "server_info": {...}}
     if not isinstance(data, dict):
@@ -215,7 +218,7 @@ def get_live_categories(cfg: XtreamConfig, *, force_refresh: bool = False) -> li
             return [_safe_dataclass_init(XtreamCategory, c) for c in cached]
 
     url = build_api_url(cfg.server_url, cfg.username, cfg.password, "get_live_categories")
-    data = api_call(url)
+    data = api_call(url, allow_private=cfg.allow_private_network)
     if not isinstance(data, list):
         return []
 
@@ -245,7 +248,7 @@ def get_live_streams(
 
     suffix = f"&category_id={category_id}" if category_id is not None else ""
     url = build_api_url(cfg.server_url, cfg.username, cfg.password, "get_live_streams") + suffix
-    data = api_call(url)
+    data = api_call(url, allow_private=cfg.allow_private_network)
     if not isinstance(data, list):
         return []
 
@@ -265,7 +268,7 @@ def get_vod_categories(cfg: XtreamConfig, *, force_refresh: bool = False) -> lis
             return [_safe_dataclass_init(XtreamCategory, c) for c in cached]
 
     url = build_api_url(cfg.server_url, cfg.username, cfg.password, "get_vod_categories")
-    data = api_call(url)
+    data = api_call(url, allow_private=cfg.allow_private_network)
     if not isinstance(data, list):
         return []
 
@@ -295,7 +298,7 @@ def get_vod_streams(
 
     suffix = f"&category_id={category_id}" if category_id is not None else ""
     url = build_api_url(cfg.server_url, cfg.username, cfg.password, "get_vod_streams") + suffix
-    data = api_call(url)
+    data = api_call(url, allow_private=cfg.allow_private_network)
     if not isinstance(data, list):
         return []
 
@@ -315,7 +318,7 @@ def get_series_categories(cfg: XtreamConfig, *, force_refresh: bool = False) -> 
             return [_safe_dataclass_init(XtreamCategory, c) for c in cached]
 
     url = build_api_url(cfg.server_url, cfg.username, cfg.password, "get_series_categories")
-    data = api_call(url)
+    data = api_call(url, allow_private=cfg.allow_private_network)
     if not isinstance(data, list):
         return []
 
@@ -345,7 +348,7 @@ def get_series(
 
     suffix = f"&category_id={category_id}" if category_id is not None else ""
     url = build_api_url(cfg.server_url, cfg.username, cfg.password, "get_series") + suffix
-    data = api_call(url)
+    data = api_call(url, allow_private=cfg.allow_private_network)
     if not isinstance(data, list):
         return []
 
@@ -358,7 +361,7 @@ def get_series_info(cfg: XtreamConfig, series_id: int | str) -> XtreamSeriesInfo
     """Obtiene info detallada de una serie (temporadas, episodios)."""
     url = build_api_url(cfg.server_url, cfg.username, cfg.password, "get_series_info")
     url += f"&series_id={series_id}"
-    data = api_call(url)
+    data = api_call(url, allow_private=cfg.allow_private_network)
     if not isinstance(data, dict):
         return XtreamSeriesInfo()
     return XtreamSeriesInfo(
@@ -372,7 +375,7 @@ def get_short_epg(cfg: XtreamConfig, channel_id: str, limit: int = 8) -> list[di
     """Obtiene EPG corto (short_epg) de un canal específico."""
     url = build_api_url(cfg.server_url, cfg.username, cfg.password, "get_short_epg")
     url += f"&stream_id={channel_id}&limit={limit}"
-    data = api_call(url)
+    data = api_call(url, allow_private=cfg.allow_private_network)
     if not isinstance(data, dict):
         return []
     epg_listings = data.get("epg_listings", [])

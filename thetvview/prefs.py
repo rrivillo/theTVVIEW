@@ -40,6 +40,14 @@ class PrefsManager:
         p.last_player = name
         self.save(p)
 
+    def last_player(self) -> str | None:
+        """Último reproductor elegido (o None si nunca se eligió uno).
+
+        Lo usa también la reproducción de archivo para no abrir un
+        reproductor distinto del que el usuario usa para el directo.
+        """
+        return self.load().last_player
+
     def set_last_group_sort(self, value: str) -> None:
         if value not in ("name", "count"):
             return

@@ -38,6 +38,7 @@ class TestCommandFor(unittest.TestCase):
                 "--gpu-api=opengl",
                 "--title=Test TV",
                 "--force-media-title=Test TV",
+                "--",
                 "http://stream.example.com/live",
             ],
         )
@@ -67,6 +68,7 @@ class TestCommandFor(unittest.TestCase):
                 "--user-agent=MiApp/1.0",
                 "--title=Test TV",
                 "--force-media-title=Test TV",
+                "--",
                 "http://stream.example.com/live",
             ],
         )
@@ -86,6 +88,7 @@ class TestCommandFor(unittest.TestCase):
                 "MiApp/1.0",
                 "-title",
                 "Test TV",
+                "--",
                 "http://stream.example.com/live",
             ],
         )
@@ -97,6 +100,7 @@ class TestCommandFor(unittest.TestCase):
                 "--avcodec-codec=h264",
                 "--http-user-agent=MiApp/1.0",
                 "--input-title-format=Test TV",
+                "--",
                 "http://stream.example.com/live",
             ],
         )
@@ -393,6 +397,52 @@ class TestExplainEarlyExit(unittest.TestCase):
         assert msg is not None
         self.assertIn("1", msg)
         self.assertIn("401", msg)
+
+
+class TestB1PoliticaDeEsquema(unittest.TestCase):
+    """Gap B1: ninguna línea de un M3U hostil llega al reproductor."""
+
+    def _reject(self, url: str) -> str:
+        with self.assertRaises(PlayerError) as ctx:
+            command_for(Channel(name="X", url=url), "mpv", player_path="/usr/bin/mpv")
+        return str(ctx.exception)
+
+    def test_esquema_file_rechazado(self) -> None:
+        msg = self._reject("file:///etc/passwd")
+        self.assertNotIn("/etc/passwd", msg)  # el mensaje nunca trae la URL
+
+    def test_javascript_rechazado(self) -> None:
+        self._reject("javascript:alert(1)")
+
+    def test_data_rechazado(self) -> None:
+        self._reject("data:text/html,<script>x</script>")
+
+    def test_linea_de_opcion_rechazada(self) -> None:
+        # Una línea no-# de un M3U que empieza por `-` (p. ej. --script=…)
+        msg = self._reject("--script=/tmp/evil.lua")
+        self.assertNotIn("/tmp/evil.lua", msg)
+
+    def test_rtsp_udp_rechazados_hoy(self) -> None:
+        # SDD §36: se evalúan antes de añadirlos; hoy no entran.
+        self._reject("rtsp://192.168.1.5/stream")
+        self._reject("udp://@239.0.0.1:1234")
+
+    def test_url_valida_lleva_separador_doble_guion(self) -> None:
+        cmd = command_for(_channel(), "mpv", player_path="/usr/bin/mpv")
+        self.assertEqual(cmd[-2], "--")
+        self.assertEqual(cmd[-1], "http://stream.example.com/live")
+
+    def test_el_doble_guion_va_antes_de_la_url_en_todos_los_players(self) -> None:
+        for name in ("mpv", "mplayer", "vlc"):
+            cmd = command_for(_channel(), name, player_path=f"/usr/bin/{name}")
+            self.assertEqual(cmd[-2], "--", name)
+            self.assertEqual(cmd[-1], "http://stream.example.com/live", name)
+
+    def test_ffmpeg_envuelta_siguesiendo_valida(self) -> None:
+        ch = Channel(name="HLS", url="ffmpeg://https://example.com/a.m3u8")
+        cmd = command_for(ch, "mplayer", player_path="/usr/bin/mplayer")
+        self.assertEqual(cmd[-2], "--")
+        self.assertEqual(cmd[-1], "ffmpeg://https://example.com/a.m3u8")
 
 
 if __name__ == "__main__":

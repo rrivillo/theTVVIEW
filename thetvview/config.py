@@ -168,12 +168,24 @@ def _candidate_paths(name: str) -> list[Path]:
 
 
 def ensure_dirs() -> None:
-    """Crea los directorios de datos si no existen (idempotente)."""
-    EPG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    PLAYLIST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    XTREAM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    PREFS_JSON.parent.mkdir(parents=True, exist_ok=True)
-    RECENTS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    """Crea los directorios de datos si no existen (idempotente).
+
+    Todos quedan con permisos privados (0700): guardan playlists, EPG y
+    cachés descargadas (SDD §21, B12). En Windows no hay permisos POSIX y
+    ``chmod_private`` lo salta sin más.
+    """
+    from .security.local_files import chmod_private
+
+    for directory in (
+        DATA_DIR,
+        EPG_CACHE_DIR,
+        PLAYLIST_CACHE_DIR,
+        XTREAM_CACHE_DIR,
+        PREFS_JSON.parent,
+        RECENTS_JSON.parent,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+        chmod_private(directory, directory=True)
 
 
 def load_theme() -> str:

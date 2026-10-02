@@ -65,55 +65,55 @@ class TestEpgUrl(unittest.TestCase):
         return f"{self.server.base_url}/epg.xml"
 
     def test_descarga_y_parsea(self) -> None:
-        epg = load_url(self.url(), cache_dir=self.cache_dir)
+        epg = load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.assertEqual(epg.channel_name("canal1.es"), "Canal Uno")
         cache_files = list(self.cache_dir.glob("epg_*.xml"))
         self.assertEqual(len(cache_files), 1)
 
     def test_ttl_valido_usa_cache_sin_red(self) -> None:
-        load_url(self.url(), cache_dir=self.cache_dir)
+        load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         # Se cambia el contenido servido; dentro del TTL no debe notarse.
         self.served.write_text(XML_B, encoding="utf-8")
-        epg = load_url(self.url(), cache_dir=self.cache_dir)
+        epg = load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         titles = [p.title for p in epg.programmes_for("canal1.es")]
         self.assertIn("Titulares", titles)
 
     def test_ttl_expirado_redescarga(self) -> None:
-        first = load_url(self.url(), cache_dir=self.cache_dir)
+        first = load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.assertIn("Titulares", [p.title for p in first.programmes_for("canal1.es")])
         # Expirar el cache manualmente y cambiar lo servido.
         for f in self.cache_dir.iterdir():
             os.utime(f, (time.time() - 13 * 3600, time.time() - 13 * 3600))
         self.served.write_text(XML_B, encoding="utf-8")
-        second = load_url(self.url(), cache_dir=self.cache_dir)
+        second = load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.assertEqual([p.title for p in second.programmes_for("canal1.es")], ["Tarde"])
 
     def test_force_refresh_ignora_cache(self) -> None:
-        load_url(self.url(), cache_dir=self.cache_dir)
+        load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.served.write_text(XML_B, encoding="utf-8")
-        epg = load_url(self.url(), force_refresh=True, cache_dir=self.cache_dir)
+        epg = load_url(self.url(), force_refresh=True, cache_dir=self.cache_dir, allow_private=True)
         self.assertEqual([p.title for p in epg.programmes_for("canal1.es")], ["Tarde"])
 
     def test_ttl_cero_siempre_redescarga(self) -> None:
-        load_url(self.url(), ttl_hours=0, cache_dir=self.cache_dir)
+        load_url(self.url(), ttl_hours=0, cache_dir=self.cache_dir, allow_private=True)
         self.served.write_text(XML_B, encoding="utf-8")
-        epg = load_url(self.url(), ttl_hours=0, cache_dir=self.cache_dir)
+        epg = load_url(self.url(), ttl_hours=0, cache_dir=self.cache_dir, allow_private=True)
         self.assertEqual([p.title for p in epg.programmes_for("canal1.es")], ["Tarde"])
 
     def test_servidor_caido_con_cache_fresca_funciona(self) -> None:
-        load_url(self.url(), cache_dir=self.cache_dir)
+        load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.server.stop()
-        epg = load_url(self.url(), cache_dir=self.cache_dir)
+        epg = load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.assertEqual(epg.channel_name("canal1.es"), "Canal Uno")
 
     def test_servidor_caido_sin_cache_lanza_oserror(self) -> None:
         self.server.stop()
         with self.assertRaises(OSError):
-            load_url(f"{self.server.base_url}/noexiste.xml", cache_dir=self.cache_dir)
+            load_url(f"{self.server.base_url}/noexiste.xml", cache_dir=self.cache_dir, allow_private=True)
 
     def test_url_invalida_value_error(self) -> None:
         with self.assertRaises(ValueError):
-            load_url("ftp://ejemplo.com/epg.xml", cache_dir=self.cache_dir)
+            load_url("ftp://ejemplo.com/epg.xml", cache_dir=self.cache_dir, allow_private=True)
 
 
 if __name__ == "__main__":

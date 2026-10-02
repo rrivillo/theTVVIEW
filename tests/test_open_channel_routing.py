@@ -2,9 +2,13 @@
 
 Cubre App.variants_for (cache de sesión + escaneo del catálogo) y el
 enrutado: con variantes -> ResolutionScreen; sin ellas -> PlayerScreen.
+También la no-bloqueo al abrir un canal: el catálogo pendiente se carga en
+segundo plano y la UI pinta la siguiente pantalla al instante.
 """
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -56,7 +60,9 @@ class TestVariantsFor(AppCase):
             "thetvview.ui.app.load_playlist_source", return_value=pl
         ) as loader:
             got = self.app.variants_for(ch("Dep FHD"))
-        loader.assert_called_once_with("/catalogo.m3u")
+        loader.assert_called_once_with(
+            "/catalogo.m3u", allow_private=entry.allow_private_network
+        )
         self.assertEqual([c.name for c in got], ["Dep SD", "Dep FHD"])
         # Y queda cacheado: segunda llamada no re-parsea.
         with mock.patch("thetvview.ui.app.load_playlist_source") as loader2:
@@ -131,6 +137,129 @@ class TestRoutingOpenChannel(AppCase):
         with mock.patch("thetvview.config.detect_players", return_value=installed):
             self.app.handle_action({"action": "select_player", "channel": canal})
         self.assertIsInstance(self.app.screen, PlayerScreen)
+
+
+class TestOpenChannelNoBloquea(AppCase):
+    """Regresión: elegir un canal no espera a descargar el catálogo.
+
+    Antes variants_for() cargaba todas las fuentes pendientes en el hilo de
+    la UI (30s de timeout por servidor caído => >10s de pantalla congelada).
+    """
+
+    INSTALLED = {"mpv": "/usr/bin/mpv", "mplayer": None, "vlc": None}
+
+    @staticmethod
+    def _entrada(source: str) -> mock.Mock:
+        entry = mock.Mock(source=source)
+        entry.kind = "m3u"
+        # Bool real: la excepción anti-SSRF se normaliza con bool() y un
+        # Mock pasaría a True sin querer.
+        entry.allow_private_network = False
+        return entry
+
+    def _join_warm(self, timeout: float = 10.0) -> None:
+        thread = self.app._warm_thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+            self.assertFalse(thread.is_alive(), "el hilo de catálogo no terminó")
+
+    def test_open_channel_pinta_sin_esperar_a_la_red(self) -> None:
+        entrada = self._entrada("http://lenta.example/lista.m3u")
+        self.app.playlists.load = mock.Mock(return_value=[entrada])
+        self.app.playlist_cache["/abierta.m3u"] = Playlist(
+            name="A", channels=[ch("Unica")]
+        )
+
+        def lenta(source: str, **_kw: object) -> Playlist:
+            time.sleep(1.0)
+            return Playlist(name="Otra", source=source, channels=[ch("Otra")])
+
+        with (
+            mock.patch("thetvview.ui.app.load_playlist_source", side_effect=lenta),
+            mock.patch("thetvview.config.detect_players", return_value=self.INSTALLED),
+        ):
+            t0 = time.perf_counter()
+            self.app.handle_action({"action": "open_channel", "channel": ch("Unica")})
+            elapsed = time.perf_counter() - t0
+            self.assertIsInstance(self.app.screen, PlayerScreen)
+            self.assertLess(elapsed, 0.5, f"la UI se bloqueó {elapsed:.2f}s")
+            # El trabajo no se descarta: sigue en segundo plano.
+            self._join_warm()
+
+        self.assertIn("http://lenta.example/lista.m3u", self.app.playlist_cache)
+
+    def test_variants_sin_catalogo_no_bloquea_y_aun_asi_carga(self) -> None:
+        entrada = self._entrada("http://otra.example/lista.m3u")
+        self.app.playlists.load = mock.Mock(return_value=[entrada])
+        self.app.playlist_cache["/a.m3u"] = Playlist(name="A", channels=[ch("Unica")])
+
+        def lenta(source: str, **_kw: object) -> Playlist:
+            time.sleep(1.0)
+            return Playlist(name="Otra", source=source, channels=[ch("Otra")])
+
+        with mock.patch(
+            "thetvview.ui.app.load_playlist_source", side_effect=lenta
+        ) as loader:
+            t0 = time.perf_counter()
+            got = self.app.variants_for(ch("Unica"), catalog=False)
+            elapsed = time.perf_counter() - t0
+            self.assertEqual(got, [])
+            self.assertLess(elapsed, 0.5, f"variants_for tardó {elapsed:.2f}s")
+            self._join_warm()
+            loader.assert_called_once_with(
+                "http://otra.example/lista.m3u",
+                allow_private=entrada.allow_private_network,
+            )
+
+    def test_con_el_catalogo_cargado_sí_ofrece_resoluciones(self) -> None:
+        entrada = self._entrada("http://otra.example/lista.m3u")
+        self.app.playlists.load = mock.Mock(return_value=[entrada])
+        self.app.playlist_cache["/abierta.m3u"] = Playlist(
+            name="A", channels=[ch("Canal")]
+        )
+        con_variantes = Playlist(
+            name="Otra", channels=[ch("Canal SD"), ch("Canal HD")]
+        )
+        with (
+            mock.patch(
+                "thetvview.ui.app.load_playlist_source", return_value=con_variantes
+            ),
+            mock.patch("thetvview.config.detect_players", return_value=self.INSTALLED),
+        ):
+            self.app.handle_action({"action": "open_channel", "channel": ch("Canal")})
+            self.assertIsInstance(self.app.screen, PlayerScreen)  # aún sin variantes
+            self._join_warm()
+
+        with mock.patch("thetvview.config.detect_players", return_value=self.INSTALLED):
+            self.app.handle_action({"action": "open_channel", "channel": ch("Canal")})
+        self.assertIsInstance(self.app.screen, ResolutionScreen)
+
+    def test_fuente_caída_no_se_martilla_en_cada_canal(self) -> None:
+        entrada = self._entrada("http://muerta.example/lista.m3u")
+        self.app.playlists.load = mock.Mock(return_value=[entrada])
+        with mock.patch(
+            "thetvview.ui.app.load_playlist_source", side_effect=OSError("red caída")
+        ) as loader:
+            self.app.warm_catalog()
+            self._join_warm()
+            self.app.warm_catalog()
+            self._join_warm()
+            self.assertEqual(loader.call_count, 1)
+
+    def test_indice_de_variantes_se_reutiliza_y_se_invalida(self) -> None:
+        pl = Playlist(name="P", channels=[ch("La 1 HD"), ch("La 1 SD")])
+        self.app.playlist_cache["/p.m3u"] = pl
+        self.app.variants_for(ch("La 1 HD"))
+        indice = self.app._base_indexes["/p.m3u"]
+        self.app.variants_for(ch("La 1 SD"))
+        self.assertIs(self.app._base_indexes["/p.m3u"], indice)
+
+        self.app.remember_playlist(
+            "/p.m3u", Playlist(name="P", channels=[ch("Otra HD"), ch("Otra SD")])
+        )
+        self.assertNotIn("/p.m3u", self.app._base_indexes)
+        got = self.app.variants_for(ch("Otra HD"))
+        self.assertEqual([c.name for c in got], ["Otra SD", "Otra HD"])
 
 
 if __name__ == "__main__":

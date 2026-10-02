@@ -5,8 +5,9 @@ Solo stdlib. El archivo es una lista de entradas:
       "kind": "m3u", "server_url": null, "username": null}, ...]
 
 Soporta playlists M3U (kind="m3u") y fuentes Xtream (kind="xtream").
-Para Xtream: server_url, username y password se persisten (solo Xtream).
-Para M3U: nunca se guarda password.
+Para Xtream: server_url y username se persisten; el password **nunca** se
+escribe en disco: vive en el SecretStore del SO (SDD §15, gap B7).
+Para M3U: nunca hay password.
 """
 
 from __future__ import annotations
@@ -15,6 +16,9 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .security.local_files import chmod_private
+from .security.secrets import get_store
 
 
 # Prefijo de source que identifica una lista Xtream API.
@@ -25,13 +29,25 @@ class PlaylistError(Exception):
     """Error amigable de gestión de playlists."""
 
 
+def _as_bool(value: object) -> bool:
+    """Interpreta el flag JSON `allow_private_network` tolerando basura."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on", "sí", "si")
+    return False
+
+
 @dataclass
 class PlaylistEntry:
     """Una playlist registrada en el catálogo.
 
     - kind: "m3u" (default) o "xtream"
-    - server_url, username, password: solo para kind="xtream", se persisten.
-      Para kind="m3u" nunca se guarda password.
+    - server_url, username: solo para kind="xtream", se persisten.
+    - password: solo para kind="xtream". Vive en el SecretStore del SO y en
+      la memoria de la sesión; jamás se serializa a JSON.
     """
 
     name: str
@@ -40,8 +56,10 @@ class PlaylistEntry:
     kind: str = "m3u"  # "m3u" | "xtream"
     server_url: str = ""  # solo para xtream
     username: str = ""  # solo para xtream
-    # password: solo se persiste para kind="xtream". En memoria para la sesión.
+    # password: solo para kind="xtream". En memoria para la sesión.
     password: str = field(default="", repr=False, compare=False)
+    # Excepción anti-SSRF de ESTA fuente (SDD §11). Nunca global ni silencioso.
+    allow_private_network: bool = False
 
     def __post_init__(self) -> None:
         if not self.added:
@@ -59,17 +77,30 @@ class PlaylistEntry:
         """True solo para listas Xtream API (kind="xtream", source xtream://…)."""
         return self.kind == "xtream" or self.source.startswith(XTREAM_SOURCE_PREFIX)
 
-    def to_dict(self) -> dict:
-        """Serializa a dict para JSON.
+    @property
+    def source_id(self) -> str:
+        """Identificador estable de la fuente (clave del SecretStore).
 
-        - kind="xtream": incluye server_url, username y password.
-        - kind="m3u": nunca incluye password (ni server_url/username).
+        Incluye el nombre porque es único dentro de un catálogo: dos fuentes
+        apuntando al mismo servidor/usuario son cuentas distintas.
+        """
+        if self.is_xtream:
+            return f"xtream|{self.name}|{self.server_url or self.source}|{self.username}"
+        return f"m3u|{self.name}|{self.source}"
+
+    def to_dict(self) -> dict:
+        """Serializa a dict para JSON. El password **nunca** se serializa.
+
+        - kind="xtream": incluye server_url y username.
+        - kind="m3u": ni server_url/username ni password.
+        - ``allow_private_network`` se conserva siempre: es la excepción
+          SSRF declarada para esa fuente concreta.
         """
         d = asdict(self)
+        d.pop("password", None)
         if self.kind == "m3u":
             d.pop("server_url", None)
             d.pop("username", None)
-            d.pop("password", None)
         return d
 
 
@@ -78,8 +109,8 @@ class PlaylistManager:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        # Passwords en memoria (cache de sesión). key=nombre.
-        # Se sincroniza con el password persistido en disco (solo Xtream).
+        # Passwords Xtream en memoria (cache de sesión).
+        # key = clave del SecretStore (catálogo + fuente); valor = password.
         self._passwords: dict[str, str] = {}
 
     # --- Persistencia -----------------------------------------------------
@@ -108,13 +139,22 @@ class PlaylistManager:
         )
         tmp.write_text(payload, encoding="utf-8")
         tmp.replace(self.path)  # atómico en POSIX
-        # playlists.json puede contener passwords Xtream: restringir a 0o600.
-        try:
-            import os
+        # Sin passwords dentro, pero igualmente restringimos a 0o600.
+        chmod_private(self.path)
 
-            os.chmod(self.path, 0o600)
-        except (OSError, AttributeError):
-            pass  # Windows o FS sin permisos: degrada sin romper
+    # --- SecretStore --------------------------------------------------------
+
+    def _store(self):  # type: ignore[no-untyped-def]
+        """Almacén de secretos del SO (o memoria en CI/tests)."""
+        return get_store()
+
+    def _secret_key(self, entry: PlaylistEntry) -> str:
+        """Clave del SecretStore: única por catálogo + fuente.
+
+        El catálogo entra en la clave para que dos `playlists.json` distintos
+        (tests, usuarios) no colisionen en el keyring compartido del SO.
+        """
+        return f"{self.path}::{entry.source_id}"
 
     # --- API pública --------------------------------------------------------
 
@@ -122,9 +162,12 @@ class PlaylistManager:
         """Carga todas las entradas; lista vacía si el archivo no existe.
 
         Entradas viejas sin 'kind' se cargan como kind="m3u" (migración invisible).
-        El password solo se restaura para kind="xtream"; en M3U se ignora.
+        El password Xtream se lee del SecretStore; un password en texto plano
+        heredado de una versión anterior se migra al store y se borra del disco.
         """
+        store = self._store()
         out: list[PlaylistEntry] = []
+        migrated = False
         for raw in self._read():
             try:
                 source = str(raw["source"])
@@ -132,9 +175,6 @@ class PlaylistManager:
                 # El prefijo xtream:// identifica la API Xtream (migración).
                 if source.startswith(XTREAM_SOURCE_PREFIX):
                     kind = "xtream"
-                password = ""
-                if kind == "xtream":
-                    password = str(raw.get("password", ""))
                 entry = PlaylistEntry(
                     name=str(raw["name"]),
                     source=source,
@@ -142,17 +182,40 @@ class PlaylistManager:
                     kind=kind,
                     server_url=str(raw.get("server_url", "")),
                     username=str(raw.get("username", "")),
-                    password=password,
+                    allow_private_network=_as_bool(raw.get("allow_private_network")),
                 )
-                out.append(entry)
-                # Sincronizar cache de sesión con lo persistido.
-                if entry.is_xtream and password:
-                    self._passwords[entry.name] = password
             except KeyError:
                 continue  # entrada malformada: se ignora sin romper la app
+            if entry.is_xtream:
+                key = self._secret_key(entry)
+                legacy = str(raw.get("password", ""))
+                stored = self._passwords.get(key) or store.get_password(key)
+                if legacy:
+                    if not stored:
+                        try:
+                            store.set_password(key, legacy)
+                        except Exception:
+                            pass  # sin keyring: no romper la carga
+                        stored = legacy
+                    migrated = True  # el texto plano ya no debe estar en disco
+                if stored:
+                    self._passwords[key] = stored
+                    entry.password = stored
+            out.append(entry)
+        if migrated:
+            try:
+                self._write(out)
+            except OSError:
+                pass
         return out
 
-    def add(self, name: str, source: str) -> PlaylistEntry:
+    def add(
+        self,
+        name: str,
+        source: str,
+        *,
+        allow_private_network: bool = False,
+    ) -> PlaylistEntry:
         """Añade una playlist IPTV (.m3u/.m3u8/.ts); falla amigablemente si el nombre ya existe."""
         name, source = name.strip(), source.strip()
         if not name or not source:
@@ -160,7 +223,12 @@ class PlaylistManager:
         entries = self.load()
         if any(e.name == name for e in entries):
             raise PlaylistError(f"Ya existe una playlist llamada '{name}'.")
-        entry = PlaylistEntry(name=name, source=source, kind="m3u")
+        entry = PlaylistEntry(
+            name=name,
+            source=source,
+            kind="m3u",
+            allow_private_network=bool(allow_private_network),
+        )
         entries.append(entry)
         self._write(entries)
         return entry
@@ -171,8 +239,10 @@ class PlaylistManager:
         server_url: str,
         username: str,
         password: str,
+        *,
+        allow_private_network: bool = False,
     ) -> PlaylistEntry:
-        """Añade una fuente Xtream. Password se persiste (solo Xtream)."""
+        """Añade una fuente Xtream. El password va al SecretStore, nunca a disco."""
         name = name.strip()
         server_url = server_url.strip()
         username = username.strip()
@@ -190,28 +260,77 @@ class PlaylistManager:
             server_url=server_url,
             username=username,
             password=password or "",
+            allow_private_network=bool(allow_private_network),
         )
         entries.append(entry)
         self._write(entries)
-        # Cache de sesión sincronizada con disco.
-        self._passwords[name] = password or ""
+        self._store_password(entry, password or "")
         return entry
+
+    def set_allow_private_network(self, name: str, enabled: bool) -> bool:
+        """Activa/desactiva la excepción SSRF de una fuente concreta.
+
+        Es la única forma de permitir un destino privado: por fuente y
+        explícita (SDD §11 «Excepción»). Devuelve False si la fuente no existe.
+        """
+        entries = self.load()
+        for entry in entries:
+            if entry.name == name:
+                entry.allow_private_network = bool(enabled)
+                self._write(entries)
+                return True
+        return False
+
+    def allows_private_network(self, name: str) -> bool:
+        """True si la fuente `name` acepta destinos privados/internos."""
+        entry = self.get(name)
+        return bool(entry is not None and entry.allow_private_network)
+
+    def allow_private_for(self, source: str) -> bool:
+        """Excepción anti-SSRF declarada para una fuente concreta (SDD §11).
+
+        Útil cuando sólo se tiene el `source` (URL o path), no el nombre:
+        es el caso de la carga de playlists y del EPG que declara la lista.
+        Devuelve False si la fuente no está en el catálogo: por defecto la
+        red privada está bloqueada.
+        """
+        want = (source or "").strip()
+        if not want:
+            return False
+        for entry in self.load():
+            if (entry.source or "").strip() == want:
+                return bool(entry.allow_private_network)
+        return False
+
+    def _store_password(self, entry: PlaylistEntry, password: str) -> None:
+        """Guarda (o borra) el password en el SecretStore y refresca la cache."""
+        key = self._secret_key(entry)
+        try:
+            store = self._store()
+            if password:
+                store.set_password(key, password)
+            else:
+                store.delete_password(key)
+        except Exception:
+            pass  # sin keyring disponible: no romper la operación
+        if password:
+            self._passwords[key] = password
+        else:
+            self._passwords.pop(key, None)
 
     def get_credentials(self, name: str) -> tuple[str, str, str] | None:
         """Devuelve (server_url, username, password) de una entrada Xtream.
 
-        Usa la cache de sesión y, si falta, el password persistido en disco.
+        El password se resuelve desde el SecretStore (cacheado en memoria).
         Solo Xtream: para M3U siempre devuelve None.
         Si no hay password configurado, devuelve None (hay que pedirlo).
         """
         entry = self.get(name)
         if entry is None or not entry.is_xtream:
             return None
-        password = self._passwords.get(name, "") or entry.password or ""
+        password = entry.password or ""
         if not password:
             return None
-        # Mantener cache sincronizada.
-        self._passwords[name] = password
         return entry.server_url, entry.username, password
 
     def set_password(self, name: str, password: str) -> bool:
@@ -223,7 +342,7 @@ class PlaylistManager:
         return self.update_password(name, password)
 
     def update_password(self, name: str, new_password: str) -> bool:
-        """Cambia la contraseña de una lista Xtream (persistida en disco).
+        """Cambia la contraseña de una lista Xtream (guardada en el SecretStore).
 
         Solo aplica a kind="xtream". Invalida la cache de auth del proveedor
         para que la próxima apertura re-autentique con la nueva contraseña.
@@ -238,12 +357,12 @@ class PlaylistManager:
                 found = True
                 target = e
                 break
-        if not found:
+        if not found or target is None:
             return False
         self._write(entries)
-        self._passwords[name] = new_password or ""
+        self._store_password(target, new_password or "")
         # Invalidar cache de auth: la password vieja ya no vale.
-        if target is not None and target.server_url and target.username:
+        if target.server_url and target.username:
             try:
                 from .xtream_provider import _clear_cache
 
@@ -253,7 +372,7 @@ class PlaylistManager:
         return True
 
     def remove(self, name: str) -> bool:
-        """Elimina por nombre. Limpia cache Xtream si aplica.
+        """Elimina por nombre. Limpia cache Xtream y el secreto si aplica.
 
         Devuelve True si se eliminó algo.
         """
@@ -263,6 +382,13 @@ class PlaylistManager:
         if len(kept) == len(entries):
             return False
         self._write(kept)
+        # El secreto ya no tiene dueño: borrarlo del almacén.
+        if entry is not None and entry.is_xtream:
+            try:
+                self._store().delete_password(self._secret_key(entry))
+            except Exception:
+                pass
+            self._passwords.pop(self._secret_key(entry), None)
         # Limpiar cache Xtream si la entrada era Xtream
         if entry is not None and entry.is_xtream and entry.server_url and entry.username:
             try:

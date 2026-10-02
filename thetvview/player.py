@@ -2,6 +2,11 @@
 
 Seguridad:
 - NUNCA shell=True: el comando siempre es una lista de argv.
+- Toda URL pasa por la política de esquema `purpose="stream"` (SDD §10)
+  ANTES de construir nada: un M3U hostil con `file://`, `javascript:` o
+  una línea que empieza por `-` no llega al reproductor (gap B1).
+- El separador `--` se antepone a la URL: aunque algo se colara, el
+  reproductor deja de interpretar la URL como opciones (B1, segunda capa).
 - El binario se resuelve con shutil.which (config.find_player).
 - Solo se traducen opciones EXTVLCOPT de una lista blanca; todo lo demás
   (incluidos los KODIPROP, específicos de Kodi) se ignora con aviso,
@@ -19,6 +24,8 @@ import subprocess
 
 from . import config
 from .models import Channel
+from .security.errors import InvalidUrlError
+from .security.url_policy import PURPOSE_STREAM, validate_url
 
 
 class PlayerError(Exception):
@@ -208,7 +215,12 @@ def command_for(
     """Construye la línea de comando (lista argv) para reproducir `channel`.
 
     Lanza PlayerError si el reproductor no está disponible o no está
-    soportado. Nunca incluye metadatos no validados sin lista blanca.
+    soportado, o si la URL no supera la política de esquema `stream`.
+    Nunca incluye metadatos no validados sin lista blanca.
+
+    El argv termina siempre en ``["--", url]``: el `--` impide que una
+    URL que empiece por `-` (o que el reproductor interprete como opción)
+    ejecute parámetros arbitrarios (gap B1).
 
     Args:
         channel: canal a reproducir.
@@ -217,6 +229,14 @@ def command_for(
         headless: si True, añade drivers nulos/dummy para tests o
             entornos sin display (no abre ventana ni requiere GUI).
     """
+    # B1: validación de esquema ANTES de tocar el sistema de ficheros ni
+    # construir un solo argv. file://, javascript:, data: o una línea que
+    # empiece por `-` salen de aquí con un mensaje apto para modal.
+    try:
+        validate_url(channel.url, PURPOSE_STREAM)
+    except InvalidUrlError as exc:
+        raise PlayerError(str(exc)) from exc
+
     path = player_path or config.find_player(player_name)
     if not path:
         raise PlayerError(
@@ -269,7 +289,10 @@ def command_for(
     # no necesita GPU y forzar opengl podría fallar sin display.
     gpu_args = ["--gpu-api=opengl"] if player_name == "mpv" and not headless else []
     headless_args = _headless_args(player_name) if headless else []
-    return [path, *headless_args, *codec_args, *gpu_args, *args, *title_args, url]
+    # `--` marca el fin de las opciones: a partir de aquí sólo va la URL.
+    return [
+        path, *headless_args, *codec_args, *gpu_args, *args, *title_args, "--", url
+    ]
 
 
 def launch(

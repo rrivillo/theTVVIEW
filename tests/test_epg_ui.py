@@ -28,7 +28,9 @@ class TestLoadEpgSource(unittest.TestCase):
         with mock.patch("thetvview.ui.app.load_url") as lu:
             ui_app.load_epg_source("https://epg.example.com/guias/guia.xml.gz")
         lu.assert_called_once_with(
-            "https://epg.example.com/guias/guia.xml.gz", force_refresh=False
+            "https://epg.example.com/guias/guia.xml.gz",
+            force_refresh=False,
+            allow_private=False,
         )
 
     def test_force_refresh_se_propaga(self):
@@ -100,7 +102,9 @@ class TestEnsureEpgRecycle(unittest.TestCase):
             "thetvview.ui.app.load_epg_source", return_value=recargado
         ) as loader:
             self.app.ensure_epg(ch(), force_refresh=True)
-        loader.assert_called_once_with("https://epg.example.com/guia.xml", force_refresh=True)
+        loader.assert_called_once_with(
+            "https://epg.example.com/guia.xml", force_refresh=True, allow_private=False
+        )
         self.assertIs(self.app.epg, recargado)
 
     def test_force_refresh_con_error_conserva_epg_anterior(self):

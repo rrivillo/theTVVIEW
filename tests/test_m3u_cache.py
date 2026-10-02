@@ -65,54 +65,54 @@ class TestM3uLoadUrl(unittest.TestCase):
         return f"{self.server.base_url}/lista.m3u"
 
     def test_descarga_y_cachea(self) -> None:
-        pl = load_url(self.url(), cache_dir=self.cache_dir)
+        pl = load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.assertEqual(len(pl.channels), 2)
         self.assertEqual(len(list(self.cache_dir.glob("playlist_*.m3u"))), 1)
 
     def test_ttl_valido_usa_cache_sin_red(self) -> None:
-        load_url(self.url(), cache_dir=self.cache_dir)
+        load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.served.write_text(OTHER, encoding="utf-8")
-        pl = load_url(self.url(), cache_dir=self.cache_dir)
+        pl = load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.assertEqual([c.name for c in pl.channels], ["Canal Uno", "Canal Dos"])
 
     def test_ttl_expirado_redescarga(self) -> None:
-        load_url(self.url(), cache_dir=self.cache_dir)
+        load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         for f in self.cache_dir.iterdir():
             old = time.time() - 7 * 3600
             os.utime(f, (old, old))
         self.served.write_text(OTHER, encoding="utf-8")
-        pl = load_url(self.url(), cache_dir=self.cache_dir)
+        pl = load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.assertEqual([c.name for c in pl.channels], ["Canal Nuevo"])
 
     def test_force_refresh_ignora_cache(self) -> None:
-        load_url(self.url(), cache_dir=self.cache_dir)
+        load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.served.write_text(OTHER, encoding="utf-8")
-        pl = load_url(self.url(), force_refresh=True, cache_dir=self.cache_dir)
+        pl = load_url(self.url(), force_refresh=True, cache_dir=self.cache_dir, allow_private=True)
         self.assertEqual([c.name for c in pl.channels], ["Canal Nuevo"])
 
     def test_servidor_caido_con_cache_expirada_devuelve_stale(self) -> None:
-        load_url(self.url(), cache_dir=self.cache_dir)
+        load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         for f in self.cache_dir.iterdir():
             old = time.time() - 7 * 3600
             os.utime(f, (old, old))
         self.server.stop()
-        pl = load_url(self.url(), cache_dir=self.cache_dir)
+        pl = load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.assertEqual(len(pl.channels), 2)
 
     def test_servidor_caido_sin_cache_lanza_oserror(self) -> None:
         self.server.stop()
         with self.assertRaises(OSError):
-            load_url(f"{self.server.base_url}/noexiste.m3u", cache_dir=self.cache_dir)
+            load_url(f"{self.server.base_url}/noexiste.m3u", cache_dir=self.cache_dir, allow_private=True)
 
     def test_gzip_por_sufijo(self) -> None:
         gz_path = self.root / "lista.m3u.gz"
         gz_path.write_bytes(gzip.compress(SAMPLE.encode("utf-8")))
-        pl = load_url(f"{self.server.base_url}/lista.m3u.gz", cache_dir=self.cache_dir)
+        pl = load_url(f"{self.server.base_url}/lista.m3u.gz", cache_dir=self.cache_dir, allow_private=True)
         self.assertEqual(len(pl.channels), 2)
 
     def test_url_invalida_value_error(self) -> None:
         with self.assertRaises(ValueError):
-            load_url("ftp://ejemplo.com/lista.m3u", cache_dir=self.cache_dir)
+            load_url("ftp://ejemplo.com/lista.m3u", cache_dir=self.cache_dir, allow_private=True)
 
 
 if __name__ == "__main__":

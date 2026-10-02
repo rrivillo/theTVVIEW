@@ -3,6 +3,7 @@
 import unittest
 
 from thetvview.models import Channel
+from thetvview.stream_ref import StreamRef
 from thetvview.xtream_models import (
     ContentType,
     Movie,
@@ -36,28 +37,43 @@ class TestNormalizeLiveStream(unittest.TestCase):
         )
 
     def test_returns_channel(self) -> None:
-        ch = normalize_live_stream(self.stream, "http://x.com", "u", "p")
+        ch = normalize_live_stream(self.stream, "http://x.com", "u", "p", source_name="Panel")
         self.assertIsInstance(ch, Channel)
         self.assertEqual(ch.name, "ESPN")
-        self.assertIn("/live/u/p/101.ts", ch.url)
+        self.assertEqual(ch.url, "xtream://Panel/live/101.ts")
+
+    def test_url_opaca_sin_credenciales(self) -> None:
+        ch = normalize_live_stream(
+            self.stream, "http://x.com", "usuario", "supersecreto",
+            source_name="Mi Panel",
+        )
+        self.assertNotIn("supersecreto", ch.url)
+        self.assertNotIn("usuario", ch.url)
+        self.assertNotIn("x.com", ch.url)
+        ref = StreamRef.parse(ch.url)
+        self.assertIsNotNone(ref)
+        assert ref is not None
+        self.assertEqual(ref.source_name, "Mi Panel")
+        self.assertEqual(ref.content_type, "live")
+        self.assertEqual(ref.stream_id, "101")
 
     def test_epg_channel_id_used_as_tvg_id(self) -> None:
-        ch = normalize_live_stream(self.stream, "http://x.com", "u", "p")
+        ch = normalize_live_stream(self.stream, "http://x.com", "u", "p", source_name="Panel")
         self.assertEqual(ch.tvg_id, "espn.us")
 
     def test_fallback_tvg_id_when_no_epg(self) -> None:
         self.stream.epg_channel_id = None
-        ch = normalize_live_stream(self.stream, "http://x.com", "u", "p")
+        ch = normalize_live_stream(self.stream, "http://x.com", "u", "p", source_name="Panel")
         self.assertEqual(ch.tvg_id, "xtream:101")
 
     def test_attrs_xtream_metadata(self) -> None:
-        ch = normalize_live_stream(self.stream, "http://x.com", "u", "p")
+        ch = normalize_live_stream(self.stream, "http://x.com", "u", "p", source_name="Panel")
         self.assertEqual(ch.attrs["xtream_id"], "101")
         self.assertEqual(ch.attrs["category_id"], "1")
         self.assertEqual(ch.attrs["content_type"], "live")
 
     def test_logo_assigned(self) -> None:
-        ch = normalize_live_stream(self.stream, "http://x.com", "u", "p")
+        ch = normalize_live_stream(self.stream, "http://x.com", "u", "p", source_name="Panel")
         self.assertEqual(ch.tvg_logo, "http://logo.png")
 
 

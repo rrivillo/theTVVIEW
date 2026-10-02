@@ -48,7 +48,9 @@ peticion.txt
 tests/fixtures/iptvsv_real.m3u
 AGENTS.md
 
-# SDD Xtream (documento local, no versionar)
+# SDD (documentos locales, no versionar)
 SDD — Soporte de fuentes Xtream para visor IPTV asistido por IA.md
+SDD_IPTV_Viewer_Seguro_Xtream_M3U.md
+SDD_IPTV_Catchup_Timeshift.md
 
 Captura de pantalla de 2026-09-11 15-43-17.png

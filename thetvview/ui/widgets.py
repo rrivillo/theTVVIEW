@@ -183,6 +183,9 @@ class StatusBar:
         self.message = ""
         self.is_error = False
         self._flash_until = 0.0
+        # Escalado de errores a modal (no negociable #1). Se inyecta desde
+        # App; None fuera de la TUI o en tests.
+        self.on_error: Any = None
 
     def set(self, shortcuts: str) -> None:
         self.shortcuts = shortcuts
@@ -190,9 +193,16 @@ class StatusBar:
     def show(self, message: str, error: bool = False) -> None:
         import time
 
+        from ..security.redaction import redact_text
+
+        # Frontera de la UI: aunque un mensaje traiga una URL con
+        # credenciales, aquí sale redactada (SDD §2.2, B10).
+        message = redact_text(message)
         self.message = message
         self.is_error = error
         self._flash_until = time.monotonic() + (4.0 if message else 0.0)
+        if error and message and self.on_error is not None:
+            self.on_error("Error", message)
 
     def _current_message(self) -> str:
         import time

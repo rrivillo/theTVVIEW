@@ -78,7 +78,8 @@ class TestAuthEdge(unittest.TestCase):
 
     def _cfg(self):
         return XtreamConfig(
-            server_url=f"http://127.0.0.1:{self.port}", username="u", password="p")
+            server_url=f"http://127.0.0.1:{self.port}", username="u", password="p",
+            allow_private_network=True)
 
     def test_404_player_api(self):
         EdgeHandler.mode = "404"

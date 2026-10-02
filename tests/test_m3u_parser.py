@@ -87,5 +87,61 @@ class TestParseText(unittest.TestCase):
         self.assertEqual(pl.channels[2].group, "Deportes")
 
 
+class TestParseTextTags(unittest.TestCase):
+    """Tags malformados/comentarios: el parseo optimizado no cambia de criterio."""
+
+    def test_logo_anidado_sin_espacio(self) -> None:
+        # Bug real de IPTVSV.m3u: tvg-logo="tvg-logo="https://...
+        pl = parse_text(
+            '#EXTM3U\n#EXTINF:-1 tvg-id="a" tvg-logo="tvg-logo="https://l.png",Canal\n'
+            "http://u\n"
+        )
+        self.assertEqual(pl.channels[0].tvg_logo, "https://l.png")
+
+    def test_logo_anidado_con_espacio(self) -> None:
+        # Variante con espacio: solo la puede arreglar el regex de respaldo.
+        pl = parse_text(
+            '#EXTM3U\n#EXTINF:-1 tvg-logo=" tvg-logo="https://l.png",Canal\n'
+            "http://u\n"
+        )
+        self.assertEqual(pl.channels[0].tvg_logo, "https://l.png")
+
+    def test_logo_normal_intacto(self) -> None:
+        pl = parse_text(
+            '#EXTM3U\n#EXTINF:-1 tvg-logo="https://l.png" tvg-id="a",Canal\n'
+            "http://u\n"
+        )
+        ch = pl.channels[0]
+        self.assertEqual(ch.tvg_logo, "https://l.png")
+        self.assertEqual(ch.tvg_id, "a")
+
+    def test_extinf_sin_comillas_no_da_atributos(self) -> None:
+        pl = parse_text("#EXTM3U\n#EXTINF:-1 tvg-id=a,Canal\nhttp://u\n")
+        ch = pl.channels[0]
+        self.assertEqual(ch.name, "Canal")
+        self.assertIsNone(ch.tvg_id)
+        self.assertEqual(ch.attrs, {})
+
+    def test_tags_en_minusculas_se_reconocen(self) -> None:
+        pl = parse_text(
+            "#EXTM3U\n"
+            "#extinf:-1 group-title=\"Deportes\",Canal\n"
+            "#extvlcopt: http-user-agent=UA\n"
+            "http://u\n"
+        )
+        ch = pl.channels[0]
+        self.assertEqual(ch.group, "Deportes")
+        self.assertEqual(ch.extra_options, [("EXTVLCOPT", " http-user-agent=UA")])
+
+    def test_comentario_desconocido_entre_extinf_y_url(self) -> None:
+        pl = parse_text(
+            "#EXTM3U\n#EXTINF:-1,Canal\n#EXTGRP:Ignorada\nhttp://u\n"
+        )
+        ch = pl.channels[0]
+        self.assertEqual(ch.name, "Canal")
+        self.assertEqual(ch.url, "http://u")
+        self.assertIsNone(ch.group)
+
+
 if __name__ == "__main__":
     unittest.main()

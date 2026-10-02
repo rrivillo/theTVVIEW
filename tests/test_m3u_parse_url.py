@@ -54,33 +54,33 @@ class TestParseUrl(unittest.TestCase):
         cls.server.server_close()
 
     def test_descarga_y_parsea(self) -> None:
-        pl = parse_url(f"{self.base}/lista.m3u")
+        pl = parse_url(f"{self.base}/lista.m3u", allow_private=True)
         self.assertEqual(len(pl.channels), 3)
         self.assertEqual(pl.source, f"{self.base}/lista.m3u")
         self.assertEqual(pl.name, "lista")
 
     def test_playlist_vacia_remota(self) -> None:
-        pl = parse_url(f"{self.base}/vacio.m3u")
+        pl = parse_url(f"{self.base}/vacio.m3u", allow_private=True)
         self.assertEqual(pl.channels, [])
 
     def test_404_error_amigable(self) -> None:
         with self.assertRaises(OSError) as ctx:
-            parse_url(f"{self.base}/no-existe.m3u")
+            parse_url(f"{self.base}/no-existe.m3u", allow_private=True)
         self.assertIn("404", str(ctx.exception))
 
     def test_conexion_rechazada_error_amigable(self) -> None:
         # Puerto cerrado: conexión rechazada inmediata.
         with self.assertRaises(OSError):
-            parse_url("http://127.0.0.1:1/x.m3u")
+            parse_url("http://127.0.0.1:1/x.m3u", allow_private=True)
 
     def test_timeout_no_cuelga(self) -> None:
         with self.assertRaises(OSError) as ctx:
-            parse_url(f"{self.base}/lento.m3u", timeout=0.2)
+            parse_url(f"{self.base}/lento.m3u", timeout=0.2, allow_private=True)
         self.assertIn("Tiempo de espera agotado", str(ctx.exception))
 
     def test_esquema_invalido(self) -> None:
         with self.assertRaises(ValueError):
-            parse_url("ftp://example.com/lista.m3u")
+            parse_url("ftp://example.com/lista.m3u", allow_private=True)
 
 
 if __name__ == "__main__":

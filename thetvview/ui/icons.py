@@ -25,6 +25,9 @@ ICON_GROUP = "▣"
 # --- EPG / timeline --------------------------------------------------------
 ICON_EPG = "◈"
 ICON_TIME = "◷"
+#: Archivo / catch-up (SDD Catch-up §11): sólo aparece si el proveedor lo
+#: declaró. Reutiliza el glifo del reloj porque es "tiempo que ya pasó".
+ICON_ARCHIVE = "◷"
 
 # --- UI / navegación -------------------------------------------------------
 ICON_ARROW_UP = "▲"

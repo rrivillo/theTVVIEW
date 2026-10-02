@@ -9,10 +9,13 @@ La identidad de un favorito es su `url`: toggle añade/quita por url.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from .models import Channel
+from .security.local_files import chmod_private
+from .security.redaction import needs_redaction_for_storage, redact_text
+from .stream_ref import is_opaque_ref
 
 
 class FavoritesError(Exception):
@@ -56,6 +59,7 @@ class FavoritesManager:
         payload = json.dumps([asdict(c) for c in channels], ensure_ascii=False, indent=2)
         tmp.write_text(payload, encoding="utf-8")
         tmp.replace(self.path)  # atómico en POSIX
+        chmod_private(self.path)  # 0600: puede traer URLs con login heredadas
         self._cache = list(channels)
         try:
             self._cache_mtime = self.path.stat().st_mtime
@@ -88,9 +92,16 @@ class FavoritesManager:
         if self._cache_valid():
             return list(self._cache or [])
         out: list[Channel] = []
+        migrated = False
         for raw in self._read():
             try:
                 raw["extra_options"] = [tuple(p) for p in raw.get("extra_options", [])]
+                # Entradas antiguas con credenciales embebidas se limpian
+                # al leer y se reescriben en disco (SDD §37).
+                u = str(raw.get("url") or "")
+                if u and not is_opaque_ref(u) and needs_redaction_for_storage(u):
+                    raw["url"] = redact_text(u)
+                    migrated = True
                 out.append(Channel(**raw))
             except (KeyError, TypeError):
                 continue  # entrada malformada: se ignora sin romper la app
@@ -99,6 +110,11 @@ class FavoritesManager:
             self._cache_mtime = self.path.stat().st_mtime if self.path.exists() else None
         except OSError:
             self._cache_mtime = None
+        if migrated:
+            try:
+                self._write(out)
+            except OSError:
+                pass
         return list(out)
 
     def favorite_urls(self) -> set[str]:
@@ -112,6 +128,7 @@ class FavoritesManager:
 
     def toggle(self, channel: Channel) -> bool:
         """Añade o quita el canal. True si quedó como favorito."""
+        channel = self._clean(channel)
         entries = self.load()
         kept = [c for c in entries if c.url != channel.url]
         if len(kept) != len(entries):
@@ -123,9 +140,25 @@ class FavoritesManager:
 
     def remove(self, channel: Channel) -> bool:
         """Quita por url. Devuelve True si se eliminó algo."""
+        channel = self._clean(channel)
         entries = self.load()
         kept = [c for c in entries if c.url != channel.url]
         if len(kept) == len(entries):
             return False
         self._write(kept)
         return True
+
+    @staticmethod
+    def _clean(channel: Channel) -> Channel:
+        """Copia sin credenciales embebidas en `url` (SDD §37).
+
+        Las referencias opacas (`xtream://` y `xtream-ts://`, directo y
+        archivo) ya van sin credenciales: se dejan intactas. Una URL de
+        catch-up renderizada desde una plantilla `catchup-source` que las
+        traiga sí se redacta, y por tanto deja de ser reproducible al
+        releerla — que es justo lo que se prefiere a filtrar la contraseña
+        a disco.
+        """
+        if is_opaque_ref(channel.url) or not needs_redaction_for_storage(channel.url):
+            return channel
+        return replace(channel, url=redact_text(channel.url))

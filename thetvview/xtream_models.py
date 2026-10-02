@@ -85,6 +85,8 @@ def normalize_live_stream(
     server_url: str,
     username: str,
     password: str,
+    *,
+    source_name: str,
 ) -> Channel:
     """Convierte un XtreamStream de tipo live a Channel del dominio.
 
@@ -92,13 +94,35 @@ def normalize_live_stream(
     - stream_icon → tvg_logo
     - "xtream:<id>" → tvg_id (para matching EPG)
     - attrs guarda metadata Xtream para uso futuro
-    """
-    from .xtream_security import build_stream_url
 
-    url = build_stream_url(
-        server_url, username, password,
-        stream.stream_id, "live", "ts",
-    )
+    `source_name` es el nombre de la fuente en el catálogo: es la clave
+    con la que después se recuperan las credenciales. **Nunca** se
+    embeben usuario ni contraseña en `url` (SDD §37, gap B8); el que
+    necesite la URL real la resuelve con `stream_ref` en el momento de
+    lanzar el reproductor.
+
+    `attrs` incluye también `source_name`, `tv_archive` y
+    `tv_archive_duration`: son la **entrada** de la capacidad catch-up, que
+    `thetvview.catchup` traduce al modelo interno (SDD Catch-up §4). La UI
+    no lee esas claves: siempre pasa por `catchup.capability_for`.
+
+    Args:
+        server_url: validado, pero hoy no se usa para construir `url`.
+        username: validado, hoy no se usa para construir `url`.
+        password: **no** viaja al dominio ni a disco.
+    """
+    from .stream_ref import StreamRef
+
+    # Se reciben para no romper la firma histórica; la URL opaca no
+    # necesita ninguno de los tres.
+    _ = (server_url, username, password)
+
+    url = StreamRef(
+        source_name=source_name,
+        content_type="live",
+        stream_id=str(stream.stream_id),
+        extension="ts",
+    ).to_opaque()
 
     return Channel(
         name=stream.name or f"Channel {stream.num}",
@@ -110,8 +134,14 @@ def normalize_live_stream(
         radio=False,
         attrs={
             "xtream_id": str(stream.stream_id),
+            "source_name": source_name,
             "category_id": str(stream.category_id),
             "content_type": "live",
+            # Declaración del proveedor sobre el archivo de este canal.
+            # Sin ventana declarada (tv_archive_duration=0) no hay
+            # catch-up: lo decide catchup.capability_for, fail-closed.
+            "tv_archive": str(stream.tv_archive),
+            "tv_archive_duration": str(stream.tv_archive_duration),
         },
         extra_options=[],
     )

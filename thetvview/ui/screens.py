@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import curses
 import time
+from dataclasses import replace
 from datetime import datetime
 
 from thetvview import player, resolutions
+from thetvview import catchup
 from thetvview import config
 from thetvview.channel_health import ChannelHealthMonitor
 from thetvview.epg_parser import Epg, parse_file
@@ -22,6 +24,7 @@ from thetvview.groups import groups_of
 from thetvview.models import Channel, Playlist
 from thetvview.playlist_manager import PlaylistEntry, PlaylistError, PlaylistManager
 from thetvview.recents import RecentsManager
+from thetvview.stream_ref import MissingCredentialsError, resolve_channel_url
 
 from . import colors
 from . import icons
@@ -66,6 +69,24 @@ def _epg_channel_id(epg: Epg, channel: Channel) -> str | None:
         if cid in epg.programs and name.casefold() == want:
             return cid
     return None
+
+
+def _warn(app, message: str) -> None:  # noqa: ANN001
+    """Aviso en barra de estado + modal (no negociable #1). Degrada en tests."""
+    fn = getattr(app, "notify_warning", None)
+    if callable(fn):
+        fn(message)
+    else:
+        app.status.show(message)
+
+
+def _error(app, message: str) -> None:  # noqa: ANN001
+    """Error en barra de estado + modal (no negociable #1). Degrada en tests."""
+    fn = getattr(app, "notify_error", None)
+    if callable(fn):
+        fn(message)
+    else:
+        app.status.show(message, error=True)
 
 
 def format_channel_name(ch: Channel, *, favorite: bool = False) -> str:
@@ -625,13 +646,13 @@ class ChannelsScreen(Screen):
         if key == ord("f"):
             channel = self.current_channel()
             if channel is None:
-                self.app.status.show("No hay canales que marcar.")
+                _warn(self.app, "No hay canales que marcar.")
                 return None
             return {"action": "toggle_favorite", "channel": channel}
         if key == ord("e"):
             channel = self.current_channel()
             if channel is None:
-                self.app.status.show("Selecciona un canal para ver su EPG.")
+                _warn(self.app, "Selecciona un canal para ver su EPG.")
                 return None
             return {
                 "action": "show_epg",
@@ -641,7 +662,7 @@ class ChannelsScreen(Screen):
         if key in (curses.KEY_ENTER, 10, 13):
             channel = self.current_channel()
             if channel is None:
-                self.app.status.show("La playlist no tiene canales (o el filtro no coincide).")
+                _warn(self.app, "La playlist no tiene canales (o el filtro no coincide).")
                 return None
             return {"action": "open_channel", "channel": channel}
         return None
@@ -714,6 +735,23 @@ class ChannelsScreen(Screen):
         except curses.error:
             pass
         row += 1
+
+        # Archivo (catch-up): sólo si el proveedor lo declaró (FR-002). Un
+        # canal sin declaración no muestra ninguna pista de que exista la
+        # función: eso es justo lo que pide el SDD §20.1.
+        if row < max_y - 1:
+            cap = catchup.capability_for(ch)
+            if catchup.can_use_catchup(cap):
+                dias = cap.archive_duration_days
+                plural = "día" if dias == 1 else "días"
+                try:
+                    stdscr.addstr(
+                        row, x, f" {icons.ICON_ARCHIVE} Archivo: {dias} {plural}",
+                        colors.pair(colors.PAIR_PRIMARY),
+                    )
+                except curses.error:
+                    pass
+                row += 1
 
         # EPG: programa actual si hay datos cargados
         epg = getattr(self.app, "epg", None)
@@ -1004,13 +1042,13 @@ class RecentsScreen(Screen):
         if key == ord("f"):
             ch = self.current_channel()
             if ch is None:
-                self.app.status.show("No hay reciente para marcar.")
+                _warn(self.app, "No hay reciente para marcar.")
                 return None
             return {"action": "toggle_favorite", "channel": ch}
         if key in (curses.KEY_ENTER, 10, 13):
             ch = self.current_channel()
             if ch is None:
-                self.app.status.show("No hay reciente para abrir.")
+                _warn(self.app, "No hay reciente para abrir.")
                 return None
             return {"action": "open_channel", "channel": ch}
         return None
@@ -1512,6 +1550,11 @@ class NowPlayingScreen(Screen):
     Se hace push al iniciar la reproducción y pop automático cuando el
     proceso termina (polling desde App.run). 'q' mata el reproductor.
     Muestra info del canal y, si hay EPG ya cargado, el programa actual.
+
+    Con catch-up (SDD Catch-up §11) la tarjeta cambia de "En vivo" a
+    "Archivo" y muestra **el programa y la hora que el usuario eligió**, no
+    el que se esté emitiendo. El medidor y la salud del canal quedan
+    intactos: el motor multimedia es el mismo (§14).
     """
 
     def __init__(  # noqa: ANN001
@@ -1521,13 +1564,23 @@ class NowPlayingScreen(Screen):
         player_name: str,
         proc,  # noqa: ANN001 - Popen sin tipar para evitar import circular
         health_monitor: ChannelHealthMonitor | None = None,
+        catchup_playback=None,  # noqa: ANN001 - PlaybackRequest | None
+        catchup_program=None,  # noqa: ANN001 - Program | None
     ) -> None:
         super().__init__(app)
         self.channel = channel
         self.player_name = player_name
         self.proc = proc
         self.player_path: str = config.find_player(player_name) or "?"
-        self.title = f"\u25b6 {channel.name}"
+        # Marca de catch-up. Si llega la petición, la reproducción es de
+        # archivo aunque el `channel` traiga la referencia live.
+        self.catchup_playback = catchup_playback
+        self.catchup_program = catchup_program
+        self.is_archive = catchup_playback is not None
+        if self.is_archive:
+            self.title = f"\u25b6 {channel.name} · Archivo"
+        else:
+            self.title = f"\u25b6 {channel.name}"
         self._spin_chars = ["|", "/", "-", "\\"]
         self._spin_idx = 0
         # Medidor de tiempo real: inicio de esta reproducción.
@@ -1596,6 +1649,14 @@ class NowPlayingScreen(Screen):
         return None
 
     def _current_program(self):  # type: ignore[no-untyped-def]
+        """Programa que se está viendo.
+
+        Con catch-up es **el que eligió el usuario** (el pedido), no el que
+        se esté emitiendo ahora: mezclar los dos haría creer que se ve la
+        directo mientras se ve el archivo.
+        """
+        if self.catchup_program is not None:
+            return self.catchup_program
         if not self._programs:
             return None
         now = datetime.now().astimezone()
@@ -1699,6 +1760,9 @@ class NowPlayingScreen(Screen):
         lines.append((f" Canal:      {self.channel.name}", colors.pair(colors.PAIR_NORMAL) | curses.A_BOLD))
         lines.append((f" Grupo:      {grp}", colors.pair(colors.PAIR_DIM)))
         lines.append((f" Reproductor: {player_label}", colors.pair(colors.PAIR_NORMAL)))
+        if self.is_archive:
+            lines.append((f" Fuente:     {icons.ICON_ARCHIVE} Archivo (catch-up)",
+                          colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD))
         lines.append(("", colors.pair(colors.PAIR_NORMAL)))
 
         # ── MEDIDOR SIMPLE basado en reproductor (fácil de entender) ──
@@ -1712,7 +1776,10 @@ class NowPlayingScreen(Screen):
         if max_x < 50:
             bar_w = max(8, max_x - 20)
         bar_str = self._meter_bar(alive, bar_w)
-        bar_label = "En vivo" if alive else "Parado"
+        # Con catch-up la etiqueta es "Archivo", no "En vivo": el SDD §11
+        # exige que la UI distinga el modo de reproducción, y el mismo motor
+        # multimedia sirve para los dos (§14).
+        bar_label = ("Archivo" if self.is_archive else "En vivo") if alive else "Parado"
         bar_icon = icons.ICON_LIVE if alive else icons.ICON_LIVE_OFF
         # Color de barra: verde si vivo, tenue si parado
         bar_attr = colors.pair(colors.PAIR_SUCCESS) if alive else colors.pair(colors.PAIR_DIM)
@@ -1724,21 +1791,27 @@ class NowPlayingScreen(Screen):
         started_str = self._start_wall.strftime("%H:%M")
         # Texto humano: "⏱ 02:15 viendo · desde 14:32"
         time_line = f" ⏱ {elapsed_str} viendo · desde {started_str}"
-        # Si hay programa EPG en curso, añadir % del programa y minutos restantes en misma línea si cabe
+        # El progreso del programa se mide contra el pedido de catch-up si
+        # lo hay (el reloj no sirve: lo que corre es el archivo, no la
+        # emission actual). Con directo, contra el programa en emisión.
         prog = self._current_program()
         extra_prog = ""
-        if prog is not None and prog.stop is not None:
+        if prog is not None:
             try:
-                now2 = datetime.now().astimezone()
-                total2 = (prog.stop - prog.start).total_seconds()
+                if self.is_archive and self.catchup_playback is not None:
+                    ref = self.catchup_playback.start
+                    total2 = float(max(1, int(self.catchup_playback.duration)))
+                    etiqueta = "del archivo"
+                else:
+                    ref = datetime.now().astimezone()
+                    total2 = (prog.stop - prog.start).total_seconds() if prog.stop else 0
+                    etiqueta = "del programa"
                 if total2 > 0:
-                    frac2 = max(0.0, min(1.0, (now2 - prog.start).total_seconds() / total2))
-                    rem2 = int(total2 - (now2 - prog.start).total_seconds())
-                    if rem2 < 0:
-                        rem2 = 0
+                    frac2 = max(0.0, min(1.0, (ref - prog.start).total_seconds() / total2))
+                    rem2 = max(0, int(total2 - (ref - prog.start).total_seconds()))
                     pct2 = int(frac2 * 100)
-                    rem_human = self._fmt_human(rem2)
-                    extra_prog = f" · {pct2}% del programa, quedan {rem_human}"
+                    extra_prog = (f" · {pct2}% {etiqueta}, quedan "
+                                  f"{self._fmt_human(rem2)}")
             except Exception:
                 pass
         # Solo añadir extra_prog si no hace la línea demasiado larga (> max_x-4)
@@ -1777,7 +1850,20 @@ class NowPlayingScreen(Screen):
         if prog is not None:
             start = prog.start.astimezone().strftime("%H:%M")
             stop = prog.stop.astimezone().strftime("%H:%M") if prog.stop else "--:--"
-            lines.append((f" ● Ahora: {start}-{stop}  {prog.title}", colors.pair(colors.PAIR_CURRENT) | curses.A_BOLD))
+            if self.is_archive:
+                # Con catch-up el programa elegido ya no está "en emisión":
+                # se anuncia como archivo, con la hora por la que se entra.
+                entra = self.catchup_playback.start.astimezone().strftime("%H:%M")
+                lines.append((
+                    f" {icons.ICON_ARCHIVE} Archivo: {start}-{stop}  {prog.title}",
+                    colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD,
+                ))
+                lines.append((
+                    f"    entras en {entra} · {self._fmt_human(int(self.catchup_playback.duration))}",
+                    colors.pair(colors.PAIR_DIM),
+                ))
+            else:
+                lines.append((f" ● Ahora: {start}-{stop}  {prog.title}", colors.pair(colors.PAIR_CURRENT) | curses.A_BOLD))
             if prog.sub_title:
                 lines.append((f"    {prog.sub_title}", colors.pair(colors.PAIR_NORMAL)))
             if prog.desc:
@@ -1794,17 +1880,21 @@ class NowPlayingScreen(Screen):
                     cats = cats[: max_cats - 3] + "..."
                 lines.append((f"    ({cats})", colors.pair(colors.PAIR_DIM)))
             # Barra de progreso EPG solo si no se mostró ya el % en el medidor (evitar duplicado)
-            # La mostramos siempre, es útil y familiar (es progreso del programa, no del medidor)
+            # La mostramos siempre, es útil y familiar. Con catch-up se mide
+            # contra el pedido, no contra la hora actual (el archivo ya pasó).
             if prog.stop:
                 try:
-                    now = datetime.now().astimezone()
+                    if self.is_archive and self.catchup_playback is not None:
+                        ref = self.catchup_playback.start
+                    else:
+                        ref = datetime.now().astimezone()
                     total = (prog.stop - prog.start).total_seconds()
                     if total > 0:
-                        frac = max(0.0, min(1.0, (now - prog.start).total_seconds() / total))
+                        frac = max(0.0, min(1.0, (ref - prog.start).total_seconds() / total))
                         bar_w2 = max(8, min(24, max_x - 14))
                         filled = int(bar_w2 * frac)
                         bar2 = "━" * filled + "●" + "─" * max(0, bar_w2 - filled - 1)
-                        lines.append((f"    {bar2} {int(frac*100)}%", colors.pair(colors.PAIR_CURRENT) | curses.A_DIM))
+                        lines.append((f"    {bar2} {int(frac*100)}%", colors.pair(colors.PAIR_PRIMARY) | curses.A_DIM))
                 except Exception:
                     pass
         elif self._programs:
@@ -1854,7 +1944,21 @@ class NowPlayingScreen(Screen):
 
 
 class EpgScreen(Screen):
-    """Parrilla de programas del canal seleccionado."""
+    """Parrilla de programas del canal seleccionado.
+
+    Distingue tres situaciones con el marcador de cada fila (SDD Catch-up
+    §11, que aquí no es cosmético: es la **información de si la acción
+    existe**):
+
+    - ``●`` en directo (el programa que se está emitiendo);
+    - ``▶`` programa pasado **con** catch-up declarado por el proveedor:
+      se puede pedir al archivo;
+    - ``○`` programa pasado **sin** catch-up: se ve, no se reproduce.
+
+    El marcador no lo decide la pantalla leyendo `tv_archive` ni
+    `catchup*`: pasa por `catchup.classify`, que es donde vive la única
+    invariante del dominio (§7/§21).
+    """
 
     def __init__(self, app, channel: Channel, epg_url: str | None = None) -> None:
         super().__init__(app)
@@ -1863,14 +1967,38 @@ class EpgScreen(Screen):
         self.title = f"EPG · {channel.name}"
         self._list = ScrollableList()
         self.programs: list = []
+        # Capacidad derivada una vez por carga, no por fila ni por tecla:
+        # es O(1) leer dos claves de `attrs`, pero 500 filas por frame ya
+        # es trabajo de más. Nunca se persiste.
+        try:
+            self.catchup = catchup.capability_for(channel)
+        except Exception:  # noqa: BLE001 - sin catch-up, directo intacto
+            self.catchup = catchup.DISABLED
         self.refresh_programs()
+
+    @property
+    def has_catchup(self) -> bool:
+        """True si el proveedor declaró archivo utilizable para este canal."""
+        return catchup.can_use_catchup(self.catchup)
 
     def refresh_programs(self) -> None:
         self.programs = self.app.ensure_epg(self.channel, url_hint=self.epg_url)
         self._list.set_items(self._rows())
 
     def shortcuts(self) -> str:
-        return "↑/↓ · Enter ▶ · r Recargar · ? Ayuda · t Tema · Esc ←"
+        if self.has_catchup:
+            return ("↑/↓ · Enter ▶ Archivo · Enter ● Directo · r Recargar · "
+                    "? Ayuda · t Tema · Esc ←")
+        return "↑/↓ · Enter ● Directo · r Recargar · ? Ayuda · t Tema · Esc ←"
+
+    def _state_of(self, prog, now: datetime) -> catchup.CatchupState:  # noqa: ANN001
+        """Estado catch-up de un programa (delegado al dominio, §7)."""
+        if not self.has_catchup:
+            return catchup.CatchupState.DISABLED_BY_PROVIDER
+        return catchup.classify(self.channel, prog, now)
+
+    def _is_current(self, prog, now: datetime) -> bool:  # noqa: ANN001
+        return prog.start <= now and (prog.stop is None or now < prog.stop)
 
     def _rows(self) -> list[str]:
         if not self.programs:
@@ -1880,13 +2008,24 @@ class EpgScreen(Screen):
         for prog in self.programs:
             start = prog.start.astimezone().strftime("%H:%M")
             stop = prog.stop.astimezone().strftime("%H:%M") if prog.stop else "--:--"
-            is_current = prog.start <= now and (prog.stop is None or now < prog.stop)
-            marker = "●" if is_current else "○"
+            if self._is_current(prog, now):
+                marker = icons.ICON_LIVE
+            elif self._state_of(prog, now) is catchup.CatchupState.AVAILABLE:
+                marker = icons.ICON_PLAY
+            else:
+                marker = icons.ICON_LIVE_OFF
             label = f"{prog.title}: {prog.sub_title}" if prog.sub_title else prog.title
             desc = f" — {prog.desc}" if prog.desc else ""
             cats = f" ({', '.join(prog.categories)})" if prog.categories else ""
             rows.append(f" {marker} {start}-{stop}  {label}{desc}{cats}")
         return rows
+
+    def _selected_program(self):  # type: ignore[no-untyped-def]
+        """Programa bajo el cursor, o None si la lista es el aviso de vacío."""
+        idx = self._list.selected
+        if 0 <= idx < len(self.programs):
+            return self.programs[idx]
+        return None
 
     def handle_key(self, key: int) -> dict | None:
         rows = self.app.body_height()
@@ -1898,7 +2037,28 @@ class EpgScreen(Screen):
             self.refresh_programs()
             return None
         if key in (curses.KEY_ENTER, 10, 13):
-            return {"action": "open_channel", "channel": self.channel}
+            prog = self._selected_program()
+            if prog is None:
+                # Sin parrilla: la acción disponible es el directo, intacto.
+                return {"action": "open_channel", "channel": self.channel}
+            now = datetime.now().astimezone()
+            if prog.start > now:
+                # Aún no se ha emitido: no es una situación de archivo. Se
+                # ofrece el directo, que es el camino por defecto (§20.10).
+                return {"action": "open_channel", "channel": self.channel}
+            if self._is_current(prog, now):
+                return {"action": "open_channel", "channel": self.channel}
+            state = self._state_of(prog, now)
+            if state is catchup.CatchupState.AVAILABLE:
+                return {
+                    "action": "play_catchup",
+                    "channel": self.channel,
+                    "program": prog,
+                }
+            # Sin catch-up declarado, o fuera de la ventana: se explica por
+            # qué en un modal, con el motivo exacto (§13). No se ofrece una
+            # acción que no existe.
+            _warn(self.app, catchup.describe_state(state, self.catchup))
         return None
 
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
@@ -1929,19 +2089,27 @@ class EpgScreen(Screen):
                     continue
                 text = self._list.items[idx][: max(0, max_x - 2)]
                 is_current = False
+                is_archive = False
                 if idx < len(self.programs):
                     prog = self.programs[idx]
-                    is_current = prog.start <= now and (prog.stop is None or now < prog.stop)
+                    is_current = self._is_current(prog, now)
+                    is_archive = (not is_current
+                                  and self._state_of(prog, now)
+                                  is catchup.CatchupState.AVAILABLE)
                 if idx == self._list.selected:
                     prefix = " ▸ "
                     if is_current:
                         attr = colors.pair(colors.PAIR_CURRENT) | curses.A_BOLD | curses.A_REVERSE
+                    elif is_archive:
+                        attr = colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD | curses.A_REVERSE
                     else:
                         attr = colors.pair(colors.PAIR_SELECTED) | curses.A_BOLD
                 else:
                     prefix = "   "
                     if is_current:
                         attr = colors.pair(colors.PAIR_CURRENT) | curses.A_BOLD
+                    elif is_archive:
+                        attr = colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD
                     else:
                         attr = colors.pair(colors.PAIR_NORMAL)
                 full_line = f"{prefix}{text}"
@@ -1977,7 +2145,9 @@ def open_playlist(app, entry: PlaylistEntry) -> None:
         except Exception:
             pass  # sin curses (tests) o terminal rota: sigue sin cargar
         try:
-            playlist = load_playlist_source(source)
+            playlist = load_playlist_source(
+                source, allow_private=entry.allow_private_network
+            )
         except (OSError, ValueError) as exc:
             app.status.show(str(exc), error=True)
             return
@@ -1993,6 +2163,15 @@ def open_playlist(app, entry: PlaylistEntry) -> None:
     if not playlist.channels:
         app.status.show(f"'{entry.name}' no contiene canales.", error=True)
         return
+    auto_epg = getattr(app, "auto_load_playlist_epg", None)
+    if callable(auto_epg):
+        # La lista puede traer su EPG en la cabecera: se carga en segundo
+        # plano (sin bloquear) y los canales muestran parrilla en cuanto
+        # termina. Si no trae EPG, no hace nada.
+        try:
+            auto_epg(playlist)
+        except Exception:
+            pass
     app.push(ChannelsScreen(app, playlist))
 
 
@@ -2043,7 +2222,12 @@ def _open_xtream_playlist(app, entry: PlaylistEntry) -> None:
     )
     from thetvview.xtream_models import normalize_live_stream, build_category_map
 
-    cfg = XtreamConfig(server_url=server_url, username=username, password=password)
+    cfg = XtreamConfig(
+        server_url=server_url,
+        username=username,
+        password=password,
+        allow_private_network=entry.allow_private_network,
+    )
     app.show_loading("Conectando…", sub=server_url)
     try:
         authenticate(cfg)
@@ -2072,7 +2256,9 @@ def _open_xtream_playlist(app, entry: PlaylistEntry) -> None:
     # Normalizar a Channel
     channels = []
     for s in streams:
-        ch = normalize_live_stream(s, server_url, username, password)
+        ch = normalize_live_stream(
+            s, server_url, username, password, source_name=entry.name,
+        )
         cat_name = cat_map.get(str(s.category_id))
         if cat_name:
             ch.group = cat_name
@@ -2097,11 +2283,32 @@ def _open_xtream_playlist(app, entry: PlaylistEntry) -> None:
     app.push(ChannelsScreen(app, playlist))
 
 
-def play_channel(app, channel, player_name: str | None = None) -> None:  # noqa: ANN001
+def play_channel(  # noqa: ANN001
+    app,
+    channel,
+    player_name: str | None = None,
+    *,
+    catchup_playback=None,
+    catchup_program=None,
+) -> None:
+    # Las URLs Xtream son opacas en el dominio: aquí (y sólo aquí) se
+    # recuperan las credenciales. El objeto original no se toca, para que
+    # la caché, favoritos y recientes sigan sin secretos (SDD §37).
+    #
+    # Con catch-up entra la referencia opaca `xtream-ts://…`, que se
+    # resuelve por el mismo camino: el reproductor no distingue los dos
+    # modos y el motor multimedia es el mismo (SDD Catch-up §14).
+    try:
+        resolved = resolve_channel_url(channel.url, getattr(app, "playlists", None))
+    except MissingCredentialsError as exc:
+        _error(app, str(exc))
+        return
+    if resolved != channel.url:
+        channel = replace(channel, url=resolved)
     try:
         proc = player.launch(channel, player_name=player_name)
     except player.PlayerError as exc:
-        app.status.show(str(exc), error=True)
+        _error(app, str(exc))
         return
     # Push de pantalla informativa; auto-pop cuando el proceso termina (ver App.run).
     # Si player_name venía None (no debería desde PlayerScreen), inferirlo del binario.
@@ -2115,6 +2322,18 @@ def play_channel(app, channel, player_name: str | None = None) -> None:  # noqa:
                     break
     except Exception:
         pass
-    app.push(NowPlayingScreen(app, channel, effective_name, proc))
+    app.push(NowPlayingScreen(
+        app, channel, effective_name, proc,
+        catchup_playback=catchup_playback,
+        catchup_program=catchup_program,
+    ))
     app.prefs.set_last_player(effective_name)
+    if catchup_playback is not None:
+        arch = (catchup_playback.start.astimezone().strftime("%H:%M")
+                if catchup_playback.start else "?")
+        app.status.show(
+            f"Archivo: '{channel.name}' desde las {arch} con "
+            f"{effective_name.upper()} (pid {proc.pid})."
+        )
+        return
     app.status.show(f"Reproduciendo '{channel.name}' con {effective_name.upper()} (pid {proc.pid}).")
