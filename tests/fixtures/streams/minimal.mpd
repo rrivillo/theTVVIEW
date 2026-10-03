@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT2H">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <Representation id="v720" codecs="avc1.4d401f" bandwidth="3800000" width="1280" height="720">
+        <BaseURL>https://h.test/dash/720.mp4</BaseURL>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>

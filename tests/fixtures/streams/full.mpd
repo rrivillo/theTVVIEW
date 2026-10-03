@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     profiles="urn:mpeg:dash:profile:isoff-live:2011"
+     type="dynamic"
+     availabilityStartTime="2026-10-02T00:00:00Z"
+     minUpdatePeriod="PT6S">
+  <Period id="0">
+    <AdaptationSet mimeType="video/mp4" contentType="video" segmentAlignment="true">
+      <ContentComponent contentType="video" id="1">
+        <ContentRole value="main"/>
+      </ContentComponent>
+      <Representation id="v360" codecs="avc1.4d401e" bandwidth="1280000" width="640" height="360" frameRate="25">
+        <BaseURL>video/360.mp4</BaseURL>
+      </Representation>
+      <Representation id="v720" codecs="avc1.4d401f" bandwidth="3800000" width="1280" height="720" frameRate="30000/1001">
+        <BaseURL>video/720.mp4</BaseURL>
+      </Representation>
+      <Representation id="v1080" codecs="avc1.640028" bandwidth="6800000" width="1920" height="1080" frameRate="50">
+        <BaseURL>video/1080.mp4</BaseURL>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio" lang="es">
+      <ContentComponent contentType="audio" id="2">
+        <ContentRole value="main"/>
+      </ContentComponent>
+      <Representation id="a-es" codecs="mp4a.40.2" bandwidth="128000" audioSamplingRate="48000">
+        <BaseURL>audio/es.m4a</BaseURL>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio" lang="en">
+      <ContentComponent contentType="audio" id="3">
+        <ContentRole value="dub"/>
+      </ContentComponent>
+      <Representation id="a-en" codecs="mp4a.40.2" bandwidth="128000" audioSamplingRate="48000">
+        <BaseURL>audio/en.m4a</BaseURL>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio" lang="en">
+      <ContentComponent contentType="audio" id="4">
+        <ContentRole value="commentary"/>
+      </ContentComponent>
+      <Representation id="a-en-commentary" codecs="mp4a.40.5" bandwidth="96000">
+        <BaseURL>audio/en-commentary.m4a</BaseURL>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="text/vtt" contentType="text" lang="es">
+      <ContentComponent contentType="text" id="5">
+        <ContentRole value="subtitle"/>
+      </ContentComponent>
+      <Representation id="s-es" codecs="wvtt" bandwidth="256">
+        <BaseURL>subs/es.vtt</BaseURL>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="application/ttml+xml" contentType="text" lang="es">
+      <ContentComponent contentType="text" id="6">
+        <ContentRole value="subtitle"/>
+      </ContentComponent>
+      <Representation id="s-es-ttml" codecs="stpp" bandwidth="512">
+        <BaseURL>subs/es.ttml</BaseURL>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>

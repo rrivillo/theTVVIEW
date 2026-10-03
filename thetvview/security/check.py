@@ -868,6 +868,176 @@ def check_catchup_capability_gate() -> str:
 
 
 # ---------------------------------------------------------------------------
+# 13. Descubrimiento de pistas: red vigilada, proxy vigilado, prefs vigiladas
+# ---------------------------------------------------------------------------
+
+
+def check_track_discovery_is_sandboxed() -> str:
+    """Selección de pistas: los tres invariantes del plan F7, verificados.
+
+    No son comentarios: se comprueban sobre el **código**, y si alguien los
+    relaja el check se pone rojo.
+
+    1. **Nada de red fuera de ``safe_http``.** Ningún módulo nuevo
+       (``streams``, ``tracks``, ``player``) llama a ``urllib.request``,
+       ``http.client``, ``socket.create_connection`` ni importa ``requests``:
+       todo lo que sale a la red pasa por el cliente único (H4).
+    2. **El proxy de fijado sólo escucha en loopback y exige token.** Se
+       comprueba sobre ``PinProxy.start`` (que rechaza cualquier host que no
+       sea 127.0.0.1) y sobre el servidor real: sin token la ruta responde
+       **404** y no se sirve ningún otro camino.
+    3. **``prefs.json`` de pistas nunca guarda la URL cruda.** Se comprueba
+       con una URL de Xtream real (usuario y contraseña en el *path*): ni el
+       fichero, ni las claves, ni los valores contienen nada de eso.
+    """
+    import tempfile
+
+    from thetvview.models import Channel
+    from thetvview.prefs import Prefs, PrefsManager
+    from thetvview.streams.pin_proxy import LOOPBACK, TOKEN_BYTES, PinProxy, PinProxyError
+    from thetvview.security.redaction import contains_embedded_login
+    from thetvview.tracks.models import VIDEO as VIDEO_TYPE
+    from thetvview.tracks.models import MediaTrack
+    from thetvview.tracks.prefs import (
+        TrackPreferences,
+        channel_key,
+        remember_for_channel,
+        resolve_preferences,
+    )
+
+    # --- (1) todo lo que sale a la red pasa por safe_http -----------------
+    nuevos = ("streams", "tracks", "player")
+    prohibido = {
+        "urlopen", "build_opener", "create_connection", "create_server",
+        "HTTPConnection", "HTTPSConnection", "requests", "httpx", "urllib3",
+    }
+    fugas: list[str] = []
+    for nombre in nuevos:
+        carpeta = PACKAGE_DIR / nombre
+        for ruta in _iter_python_files(carpeta):
+            arbol = _parse(ruta)
+            docs = _docstrings(arbol)
+            for nodo in ast.walk(arbol):
+                if isinstance(nodo, ast.Call):
+                    llamada = _call_name(nodo)
+                    if llamada.split(".")[-1] in prohibido and nodo.lineno not in docs:
+                        fugas.append(f"{ruta.name}:{nodo.lineno} {llamada}")
+                elif isinstance(nodo, (ast.Import, ast.ImportFrom)):
+                    modulos = (
+                        [a.name for a in nodo.names] if isinstance(nodo, ast.Import)
+                        else [nodo.module or ""]
+                    )
+                    for modulo in modulos:
+                        raiz = modulo.split(".")[0]
+                        # `socket` sí se usa, pero sólo para el IPC local de
+                        # mpv y para el proxy de loopback (comprobado abajo).
+                        if raiz in {"requests", "httpx", "aiohttp"}:
+                            fugas.append(f"{ruta.name}:{nodo.lineno} import {modulo}")
+    _require(not fugas, f"red fuera de safe_http: {fugas}")
+
+    # --- (2) el proxy sólo escucha en loopback y exige token --------------
+    _require(LOOPBACK == "127.0.0.1", f"el proxy escucha en {LOOPBACK}, no en loopback")
+    _require(TOKEN_BYTES >= 16, f"token de {TOKEN_BYTES * 8} bits: hacen falta 128")
+
+    with tempfile.TemporaryDirectory() as td:
+        ruta = Path(td) / "prefs.json"
+        # Se comprueba primero el rechazo de cualquier host que no sea loopback.
+        from thetvview.tracks.models import MediaCapabilities, PlaybackSelection
+
+        vacio = MediaCapabilities(
+            video_variants=[
+                MediaTrack(id="v720", type=VIDEO_TYPE, height=720,
+                           uri="http://h/v720.m3u8")
+            ],
+            protocol="hls",
+        )
+        sel = PlaybackSelection(video_track_id="v720", auto_quality=False)
+        try:
+            fugado = PinProxy.start(vacio, sel, host="0.0.0.0")
+        except PinProxyError:
+            pass
+        else:
+            fugado.stop()
+            raise CheckFailure("el proxy acepta escuchar fuera de loopback")
+
+        proxy = PinProxy.start(vacio, sel)
+        try:
+            import urllib.error
+            import urllib.request
+
+            with urllib.request.urlopen(proxy.url, timeout=5) as respuesta:  # noqa: S310
+                _require(respuesta.status == 200, "el proxy no sirve su manifest")
+                cuerpo = respuesta.read().decode()
+            _require("#EXTM3U" in cuerpo, "el proxy no sirve un manifest HLS")
+            rutas = {r for r in proxy.routes()}
+            _require(
+                all(r.startswith(f"/{proxy.token}/") for r in rutas),
+                f"rutas sin token: {rutas}",
+            )
+            # Sin token, y en cualquier otro camino: 404.
+            for url in (
+                f"http://{LOOPBACK}:{proxy.port}/{proxy.token}../master.m3u8",
+                f"http://{LOOPBACK}:{proxy.port}/master.m3u8",
+                f"http://{LOOPBACK}:{proxy.port}/",
+                f"http://{LOOPBACK}:{proxy.port}/{proxy.token}/seg0.ts",
+            ):
+                try:
+                    urllib.request.urlopen(url, timeout=5)  # noqa: S310
+                    raise CheckFailure(f"el proxy sirve una ruta no permitida: {url}")
+                except urllib.error.HTTPError as exc:
+                    _require(exc.code == 404, f"{url} devolvió {exc.code}, no 404")
+        finally:
+            proxy.stop()
+        _require(not proxy.is_running, "el proxy sigue vivo tras stop()")
+
+        # --- (3) prefs.json de pistas sin la URL cruda -------------------
+        url_secreta = "http://proveedor.test/live/alice/P4ssw0rd/1234.m3u8"
+        canal = Channel(name="Canal", url=url_secreta, tvg_id=None)
+        prefs = remember_for_channel(
+            PrefsManager(ruta), canal,
+            TrackPreferences(preferred_audio_language="ca", preferred_quality="720p"),
+        )
+        _require(prefs is not None, "no se pudo guardar la preferencia del canal")
+        texto = ruta.read_text(encoding="utf-8")
+        for secreto in ("alice", "P4ssw0rd", "proveedor.test/live"):
+            _require(secreto not in texto, f"prefs.json contiene {secreto!r}")
+        _require(not contains_embedded_login(texto), "prefs.json tiene login embebido")
+        clave = channel_key(canal)
+        _require(clave is not None, "el canal no tiene clave")
+        _require("alice" not in clave and "P4ssw0rd" not in clave,
+                 f"la clave de canal filtra credenciales: {clave}")
+
+        # Y el invariante de fondo: la clave se calcula sobre la URL
+        # **redactada**. Un hash de la URL cruja no metería nada legible en
+        # el fichero, pero sí dejaría algo atacable por diccionario, así que
+        # se comprueba la FUNCIÓN, no los datos (igual que el check 12).
+        arbol_prefs = _parse(PACKAGE_DIR / "tracks" / "prefs.py")
+        fn = next(
+            (n for n in ast.walk(arbol_prefs)
+             if isinstance(n, ast.FunctionDef) and n.name == "channel_key"),
+            None,
+        )
+        _require(fn is not None, "tracks/prefs.py ya no define channel_key")
+        llamada_redaccion = any(
+            (isinstance(n, ast.Name) and n.id.startswith("redact"))
+            or (isinstance(n, ast.Attribute) and n.attr.startswith("redact"))
+            for n in ast.walk(fn)
+        )
+        _require(
+            llamada_redaccion,
+            "channel_key no redacta la URL antes de hashearla: el hash "
+            "sería atacable por diccionario",
+        )
+        resuelta = resolve_preferences(canal, "https://proveedor.test/x",
+                                       prefs=Prefs(), scopes={prefs: {"preferred_audio_language": "ca"}})
+        _require(resuelta.preferred_audio_language == "ca",
+                 "la preferencia del canal no se resuelve")
+
+    return ("red sólo por safe_http, proxy en loopback con token de 128 bits "
+            "y 404 fuera de la allowlist, prefs.json sin la URL del canal")
+
+
+# ---------------------------------------------------------------------------
 # Registro
 # ---------------------------------------------------------------------------
 
@@ -886,6 +1056,8 @@ CHECKS: tuple[tuple[str, str, Callable[[], str]], ...] = (
     ("stdlib_dependencies", "Zero pip dependencies", check_stdlib_dependencies),
     ("catchup_capability_gate", "Catch-up capability gate",
      check_catchup_capability_gate),
+    ("track_discovery_sandbox", "Track discovery sandbox",
+     check_track_discovery_is_sandboxed),
 )
 
 

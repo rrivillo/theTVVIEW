@@ -21,6 +21,7 @@ ver y con qué reproductor.
 | **Fuentes** | M3U/M3U8/TS local o `http(s)`, y Listas Especiales X (auth con test de conexión). |
 | **Canales** | Lista con búsqueda incremental (`/`), favoritos (`f`), grupos (`g`), EPG (`e`). |
 | **Calidad** | Selector de resolución **solo** si el canal tiene variantes reales. |
+| **Pistas** | Audio, subtítulos y calidad del canal **solo si el proveedor los publica** (HLS master / DASH). En caliente con mpv. |
 | **Reproductor** | Elige mpv/mplayer/vlc (solo se ofrecen los instalados) y reproduce. |
 | **EPG** | XMLTV en ruta o URL, `.xml` o `.gz`, con cache y recarga (`r`); si la lista lo trae, se carga solo. |
 | **Archivo** | Catch-up solo si el proveedor lo declara (ver la sección dedicada). |
@@ -40,7 +41,9 @@ ver y con qué reproductor.
 
 ## Advertencia
 
-- Éste proyecto recibió asistencia de OpenCode, en su plan free. No lo hizo completo, pero sí ayudó.Sé que harías un mejor trabajo sin IA, así que, sé educado.
+- Éste proyecto recibió asistencia de OpenCode, en su plan free. No lo hizo
+  completo, pero sí ayudó. Sé que harías un mejor trabajo sin IA, así que,
+  sé educado.
 
 ---
 
@@ -72,12 +75,27 @@ si falta algo muestra un aviso con la solución, nunca un traceback.
 python -m thetvview
 ```
 
+Opciones de una sesión (sólo para este arranque, no se guardan en disco):
+
+```bash
+python -m thetvview --audio es --subtitles es   # español en ambos
+python -m thetvview --subtitles off             # sin subtítulos
+python -m thetvview --quality 720p              # fija la calidad
+python -m thetvview --quality auto              # vuelve a automática
+```
+
+Son un atajo para probar un canal sin tocar tu configuración: `--audio` y
+`--subtitles off` ganan a lo que haya en `prefs.json`, y al cerrar la sesión
+no queda nada guardado. Si escribes una opción mal, la app lo dice y sale con
+código 2, en vez de arrancarse como si la hubieras escrito bien.
+
 1. **Listas**: pulsa `a` y elige el tipo de fuente (`M3U / M3U8 / TS` o
    `Listas Especiales X`). Rellena el formulario y Enter.
 2. **Canales**: Enter sobre la lista para abrirla; navega con flechas
    (o `j`/`k`), busca con `/`, agrupa con `g`, marca favoritos con `f`.
-3. **Reproducir**: Enter sobre el canal → (si tiene variantes) eliges
-   calidad → eliges reproductor → se abre en otra ventana.
+3. **Reproducir**: Enter sobre el canal → (si tiene variantes en la lista)
+   eliges calidad → (si el proveedor publica varias pistas) eliges audio,
+   subtítulos y calidad → eliges reproductor → se abre en otra ventana.
 4. **Volver**: `Esc` retrocede; `q` sale de la app (con confirmación).
 
 La ayuda contextual (`?`) explica siempre dónde estás y qué puedes hacer
@@ -93,8 +111,12 @@ ahí mismo; es el mejor punto de partida si dudas.
   solución.
 - **La ayuda es contextual**: `?` describe la pantalla en la que estás, no un
   manual genérico.
-- La app nunca bloquea la interfaz: descargas, parseos grandes y sondas de red
-  van en hilos y la pantalla se repinta mientras tanto.
+- La app nunca bloquea la interfaz: descargas, parseos grandes, análisis de
+  manifiesto y sondas de red van en hilos y la pantalla se repinta mientras
+  tanto. La única espera síncrona es la acotada de 2,5 s al abrir un canal, y
+  hay pantalla que explica qué está pasando mientras ocurre.
+- Cuando un aviso viene de un hilo en segundo plano, se saca en el hilo de la
+  interfaz: un modal desde un hilo secundario no es seguro con `curses`.
 
 ---
 
@@ -103,17 +125,22 @@ ahí mismo; es el mejor punto de partida si dudas.
 ### Flujo general
 
 ```
-Listas ──Enter──▶ Canales ──Enter──▶ [Calidad] ──▶ Reproductor ──▶ Reproduciendo
-  │                  │                   │              │                │
-  │                  ├── /  buscar       │  (solo si     │  (solo los     │  q detiene
-  │                  ├── g  grupos       │   hay variantes) instalados)   │  y vuelve
-  │                  ├── f  favoritos    │                              │
-  │                  ├── e  guía EPG     │                              │
-  │                  └── p  reproductor  │                              │
-  │                                     │                              │
+Listas ──Enter──▶ Canales ──Enter──▶ [Pistas] ──▶ Reproductor ──▶ Reproduciendo
+  │                  │                  │              │               │
+  │                  ├── /  buscar      │ sólo si el    │ sólo los       │ q detiene
+  │                  ├── g  grupos      │ proveedor     │ instalados     │ y vuelve
+  │                  ├── f  favoritos   │ publica algo, │               │
+  │                  ├── e  guía EPG    │ y sólo tras   │               │
+  │                  └── p  reproductor │ ⏱ máx 2,5 s   │               │
+  │                                     │               │               │
   ├── a añadir · d borrar · u deshacer   └── Esc ← vuelve en cualquier punto
   └── f favoritos · C contraseña Listas Especiales X
 ```
+
+Lo de `[Pistas]` antes que `[Reproductor]` es deliberado: el reproductor no
+cambia qué pistas publica el canal, así que preguntarlo primero sería preguntar
+por algo que no depende de tu elección. Cuando el proveedor no publica
+alternativas, ese paso no aparece y se va directo al reproductor.
 
 ### Navegación (común a casi todas las pantallas)
 
@@ -146,7 +173,7 @@ Las Listas Especiales X se resaltan en púrpura; las M3U en amarillo.
 
 | Tecla | Acción |
 | --- | --- |
-| `Enter` | Ver el canal (→ selector de calidad si aplica). |
+| `Enter` | Ver el canal (→ pistas, si las publica → reproductor). |
 | `/` | Búsqueda incremental: la lista se filtra mientras escribes. |
 | `g` | Ver los grupos (categorías) de esta lista. |
 | `f` | Añadir/quitar el canal de favoritos (★). |
@@ -181,8 +208,188 @@ defecto, 2 a partir de 100 caracteres de ancho y 3 a partir de 150.
   corchetes ignorados al agrupar y sufijo de `tvg-id` estilo iptv-org
   (`id.es@HD`). Se reconocen `SD`, `HD`, `FHD`, `QHD`, `UHD`, `4K` y `8K`.
   Navega con `←`/`→` y confirma con `Enter`.
+  Este selector y el de pistas son cosas distintas: éste elige entre
+  **canales** de tu lista, el otro entre **variantes del manifiesto** del
+  canal que ya has elegido. Si la lista trae variantes, gana éste y el otro
+  se pregunta al abrir el canal ya concreto.
 - **Reproductor**: tarjetas con los reproductores instalados;
   `↑`/`↓` + `Enter`. Si no hay ninguno, la app te lo dice en vez de fallar.
+
+### Calidad, audio y subtítulos
+
+Cuando el proveedor **publica** varias pistas para el mismo canal (HLS master
+o DASH), la app te deja elegir. Si no publica ninguna, **no aparece ningún
+menú nuevo**: un `.ts` o un manifest de una sola pista se reproduce igual que
+siempre.
+
+- **El manifiesto es la fuente de verdad**, no la M3U. La app lo descarga en
+  segundo plano (6–8 s como máximo, en un hilo que nunca bloquea la
+  interfaz), detecta el protocolo por el **cuerpo** y no por la extensión, y
+  lee `EXT-X-MEDIA` / `EXT-X-STREAM-INF` (HLS) o `AdaptationSet` /
+  `Representation` (DASH).
+- **Sólo se ofrece lo que hay.** Con menos de dos opciones por tipo no hay
+  selector; un solo audio o una sola calidad se muestran como información.
+  Nunca se inventa una pista.
+- **Antes de elegir reproductor**, no después. Al abrir el canal, si el
+  proveedor publica alternativas, la pantalla `Audio y calidad` aparece con
+  tres secciones (Audio / Subtítulos / Calidad), sólo las que tengan
+  opciones de verdad. `↑`/`↓` elige, `←`/`→` salta de sección, `Espacio`
+  marca con `*` lo que has elegido tú, `0` vuelve a
+  `Automático`/`Desactivados`, `m` recuerda la elección para ese canal y
+  `Enter` **confirma y pasa al selector de reproductor**. Es el orden
+  natural: el reproductor no cambia qué pistas publica el canal, así que
+  preguntarlo primero sería preguntar por lo que no depende de la elección.
+  Si el canal no publica nada, la pantalla no aparece y se va directamente
+  al reproductor, como siempre.
+- **El cursor aplica, el asterisco distingue.** Moverse con `↑`/`↓` va
+  aplicando lo que pasa por debajo, así que sin nada más no habría forma
+  de separar *"esto ya venía así"* de *"esto lo he elegido yo"*. `Espacio`
+  marca la opción del cursor con un `*` y permite marcar **varias** cosas
+  (subtítulos *y* calidad) para revisarlas antes de `Enter`; `0` quita la
+  marca de la sección, porque volver a `Automático` no es elegir. El
+  asterisco vive en la pantalla, no en las preferencias: al salir se borra.
+- **La espera está acotada y se explica**: como el manifiesto se descarga en
+  segundo plano, al abrir el canal se espera **como máximo 2,5 s** —y sólo si
+  el canal puede tener manifiesto; un `.ts` no espera— con una pantalla de
+  "Analizando pistas del canal…". Si no llega a tiempo, se sigue el camino de
+  siempre y las opciones aparecen igualmente después, desde
+  `Reproduciendo` con las teclas `a`/`s`/`v`.
+- **La app se identifica ante el proveedor** con su propio `User-Agent`
+  (`theTVVIEW/1.0`), también cuando lanza el reproductor. No es un detalle:
+  hay CDNs que responden **403 a cualquier** User-Agent de reproductor (mpv,
+  ffmpeg e incluso el de Chrome) y sólo entregan los segmentos al de la app.
+  Sin esto el canal se quedaba reintentando segmentos para siempre, con el
+  mismo síntoma que una línea caída pero sin serlo. Si el canal declara su
+  propio `#EXTVLCOPT:http-user-agent=…`, **gana el del proveedor**.
+- **Los subtítulos dependen del reproductor, y la app lo avisa.** Medido:
+  `mpv` y `mplayer` usan el demuxer HLS de ffmpeg, que **no expone** las
+  pistas de subtítulo declaradas como rendition (`EXT-X-MEDIA` con
+  `TYPE=SUBTITLES`); lo dice explícitamente: `hls: Can't support the
+  subtitle(...)`. `vlc` sí las ve (trae su propio demuxer adaptativo), así que
+  **con VLC la elección se aplica**. Con subtítulos *incrustados* en los
+  segmentos (no en un rendition aparte) funciona en todos. Cuando eliges
+  subtítulos que el reproductor elegido no va a poder ver, aparece un **modal
+  informativo** —no una pregunta— que dice qué va a pasar y que con VLC sí
+  funciona. Se muestra **una sola vez por canal y reproductor**: no es algo que
+  haya que confirmar cada vez que reabres el canal con `s`.
+- **La preferencia manda al entrar**: idioma exacto → idioma base → etiqueta →
+  `DEFAULT` del stream → primera disponible. Se puede guardar por canal, por
+  lista o global, con esa misma precedencia. En `prefs.json` no se guarda
+  nunca la URL del canal: la clave es el `tvg-id` o el hash de la URL **ya
+  redactada**.
+- **Cambiar en caliente**: con `mpv` el cambio se aplica al instante por su
+  canal de control (IPC local); con `vlc` y `mplayer` no es posible y la app
+  lo dice en un modal. Desde `Reproduciendo`, las teclas `a` (audio), `s`
+  (subtítulos), `v` (calidad) e `i` (volver a analizar el manifiesto) hacen lo
+  mismo sin salir del canal.
+- **Cómo comprobar si una lista sirve de algo para esto**: la app trae una
+  encuesta que usa **el mismo camino real** (no una simulación) y dice, canal
+  a canal, qué se encontró:
+
+  ```bash
+  python -m thetvview.tracks.survey mi-lista.m3u -n 60
+  python -m thetvview.tracks.survey https://…/get.php -n 60 --private
+  python -m thetvview.tracks.survey mi-lista.m3u --solo-menu   # sólo los que sí ofrecen
+  python -m thetvview.tracks.survey mi-lista.m3u --conseguir 8  # para en cuanto haya 8
+  ```
+
+  Distingue las razones por las que no aparece el menú —"una sola pista",
+  MPEG-TS, no-HTTP, 403, 404, timeout, cuerpo no reconocido— porque **no
+  ofrecer opciones es lo correcto** cuando el proveedor no las publica.
+
+  - **`--conseguir N` para en cuanto encuentre N canales con menú**, que es
+    lo que hace falta para no demorarse en una lista larga. En una de **1810
+    canales** encontró los 8 buscados en **96 sondeos y 53 s**, sin recorrer
+    la lista entera. El informe avisa de que paró, para que su porcentaje no
+    se lea como una medición completa.
+  - **Diversifica por host** y **prioriza** las formas de URL que en listas
+    reales han dado resultado (`master` en la ruta, `playlist.m3u8`,
+    `index.m3u8`). Sin esto, preguntar los primeros N de una lista es
+    preguntarle a un solo proveedor: en esa lista hay 59 canales de un mismo
+    host, y los 96 primeros sondeos visitaron 96 hosts distintos. Se puede
+    apagar con `--sin-diversificar` y `--sin-priorizar`.
+  - El resto del mando: `-j/--jobs` sondeos simultáneos (4 por defecto),
+    `--timeout` segundos por canal (8), `-n 0` para recorrerla entera,
+    `--muestreo inicio|aleatorio|fin`, `--ejemplos N` ejemplos por veredicto
+    y `--solo-menu` para ver sólo los que sí tendrían menú.
+  - Medido sobre listas reales: 1755 canales → 60 sondeos, 5 (8 %) ofrecen
+    pistas. 387 canales (todas `.m3u8`) → 53 de 387 (13,7 %), de ellos **51
+    sólo calidad**, 1 sólo audio y 1 sólo subtítulos, ninguno las tres a la
+    vez. 1810 canales → 22 de 96 (22,9 %). 11152 canales → 11 de 112 (9,8 %),
+  y con más canales muertos (39 timeouts). El resto son manifiestos de una
+    sola pista (muchos proveedores sirven un `index.m3u8` por canal, que es
+    un media playlist, no un master), enlaces muertos o bloqueos.
+    No escribe nada en disco y redacta las URLs.
+- **Si el master en vivo cambia**, la app reconcilia: si la pista elegida
+  sigue existiendo la conserva, y si ha desaparecido elige una alternativa
+  válida y lo explica en un modal.
+- **Sólo se ofrece calidad cuando se puede fijar.** La calidad se aplica
+  reescribiendo el master HLS (el proxy), así que **en DASH no hay menú de
+  calidad**: un MPD no tiene master que reescribir y sus representations no
+  tienen URI de playlist, de modo que un master sintético saldría con la URI
+  vacía y el canal no reproduciría nada. Antes se ofrecía igual y el
+  reproductor arrancaba con un manifiesto roto; ahora el menú no aparece y,
+  si alguien fuerza la selección por API, sale un aviso explicando que se
+  reproducirá con calidad automática.
+- **Avisos sólo cuando algo no va a funcionar.** Elegir calidad en HLS
+  funciona y no se avisa de nada: un aviso que explica el mecanismo ("se
+  sirve un master fijado por un proxy local") suena a avería y llega por
+  modal para informarte de que tu elección se aplicó. Y cuando el canal no
+  ofrece nada que elegir (una sola pista, un directo), el motivo va a la
+  barra de estado en lugar de interrumpir con un modal **antes incluso de
+  elegir reproductor**: el canal se reproduce bien, así que no hay nada que
+  interrumpir. El modal se reserva para lo que de verdad falló (403, 404,
+  timeout, o un 200 que no es un manifiesto).
+- **Un manifiesto puede mentir**. Medido en la lista de iptv-org: hay canales
+  cuyo master se lee perfectamente, declara 2 variantes de calidad… y **las dos
+  dan 404**. Ahí el menú aparece porque el manifiesto dice que hay alternativas,
+  y cualquier elección falla. No es un fallo del parser (las URIs relativas se
+  resuelven bien contra la URL final) sino del proveedor. La encuesta lo
+  distingue del resto de 404 porque el master **sí** se pudo leer.
+- **Errores del proveedor no rompen nada**: un 403 (suele faltar el
+  `Referer` del `#EXTVLCOPT`), un 404, un timeout o una página de error en
+  lugar del manifiesto se traducen a un mensaje que explica qué ha pasado, y
+  el canal se reproduce igualmente.
+
+#### Qué sabe hacer cada reproductor
+
+Verificado ejecutando los binarios, no de documentation:
+
+| | audio | subtítulos | calidad fija | cambiar en caliente |
+|---|---|---|---|---|
+| **mpv** 0.40 | `--aid` | `--sid` | ✗ | ✓ (IPC) |
+| **VLC** 3.0 | `--audio-language` / `--audio-track-id` | `--sub-language` / `--sub-track-id` | ✗ | ✗ |
+| **mplayer** 1.5 | `-alang` / `-aid` | `-slang` / `-sid` | ✗ | ✗ |
+
+**Ningún reproductor sabe fijar una variante concreta de un master HLS.** Los
+tres `✗` de la última columna no son una limitación nuestra: se comprobó
+ejecutando los binarios contra un master de prueba. En mpv 0.40,
+`--video-bitrate` **no existe como opción** (`option not found`); la propiedad
+del mismo nombre existe, pero es de estadísticas, va en bits/s y es de sólo
+lectura. En VLC, `--program` es el selector de **programa de TV digital**
+(DVB), no de variante HLS: usarlo aquí no fijaría calidad y además rompería
+la reproducción. mplayer no tiene ninguna opción de bitrate por pista. Por eso
+la calidad manual se resuelve por el otro camino, y el que funciona igual en
+los tres:
+
+- La app reescribe el manifiesto con **una sola** `EXT-X-STREAM-INF` (la
+  elegida) y conserva el grupo de pistas de audio y subtítulos **entero**,
+  marcando la elegida como `DEFAULT=YES`. Si se quitaran esas entradas, el
+  master dejaría de ser válido y el reproductor se quedaría **sin audio**.
+- Se sirve en `127.0.0.1` con **token de 128 bits** en la ruta y **puerto
+  efímero**, y sólo acepta esa ruta: cualquier otra —segmentos incluidos—
+  responde `404`. Los segmentos no pasan por aquí: sus URI apuntan al
+  proveedor, así que el reproductor sigue hablando directamente con él y con
+  sus cabeceras, y el pin funciona aunque el proveedor exija `Referer`.
+- Con el proxy levantado no se pasan índices de pista (`--aid` y compañía),
+  porque el manifiesto servido se ha renumerado y esos índices ya no
+  coinciden.
+- Si eliges **Automático** con el proxy levantado, se reescriben **todas** las
+  variantes, cada grupo de audio una sola vez. Un master al que se le quitan
+  los `EXT-X-MEDIA` deja al reproductor sin audio, y duplicarlos produce
+  pistas repetidas: el proxy nunca degrada la calidad automática.
+- En DASH la calidad manual **no se ofrece**: no hay mecanismo fiable de
+  fijar una `Representation`.
 
 ### Cómo se lanza la reproducción
 
@@ -196,9 +403,15 @@ defecto, 2 a partir de 100 caracteres de ancho y 3 a partir de 150.
   `-vc ffh264,ffmpeg2,…` en mplayer, `--avcodec-codec=h264` en vlc.
 - El nombre del canal se pasa como título de la ventana del reproductor
   (saneado: sin saltos, sin no imprimibles, máx. 120 caracteres).
+- El reproductor se identifica ante el proveedor con el mismo `User-Agent`
+  que usa la app (`theTVVIEW/1.0`), y **sólo si el canal no declara el suyo**
+  en un `#EXTVLCOPT:http-user-agent=…`: en ese caso gana el del proveedor y no
+  se añade nada.
 - De los `#EXTVLCOPT` / `#KODIPROP` de la lista sólo se traducen
   `http-user-agent` y `http-referrer` (con sus alias). El resto se ignora con
-  un aviso: nunca se pasa texto arbitrario al reproductor.
+  un aviso: nunca se pasa texto arbitrario al reproductor. Lo mismo con las
+  opciones de pistas: salen de una **lista blanca** por reproductor
+  (`player/track_args.py`), no del texto que traiga el manifiesto.
 - Si el reproductor muere en menos de 4 s, se explica que el stream no llegó
   a abrir (lo habitual es una línea caducada o bloqueada en el proveedor), no
   un error local.
@@ -216,6 +429,9 @@ está en otra ventana) con:
   `Excelente` según latencia media, jitter y porcentaje de éxito. Si el canal
   no es `http(s)` (rtmp, udp…) se indica que no es medible.
 - `q` detiene la reproducción y vuelve a la pantalla anterior.
+- Al salir se apagan todo lo que esa pantalla había abierto: el sondeo en
+  segundo plano, el proxy de calidad y el socket de control de mpv. Dejarlo
+  puesto acumularía procesos y basura en `data/ipc/`.
 
 ### Guía EPG
 
@@ -288,6 +504,32 @@ Funcionan en cualquier pantalla salvo mientras escribes en una búsqueda.
 | `!` | Comprobar la seguridad (`security-check`); el resultado sale en un modal. |
 | Ratón | Clic para seleccionar, doble clic para abrir. |
 
+En la pantalla `Reproduciendo` hay cuatro teclas más, sólo si el canal
+publica alternativas:
+
+| Tecla | Acción |
+| --- | --- |
+| `a` | Cambiar el idioma del audio. |
+| `s` | Cambiar o apagar los subtítulos. |
+| `v` | Cambiar la calidad. |
+| `i` | Volver a analizar el manifiesto (pistas nuevas o que desaparecieron). |
+
+En la pantalla `Audio y calidad` (la que sale antes del reproductor):
+
+| Tecla | Acción |
+| --- | --- |
+| `↑` / `↓` | Moverse por las opciones de la sección (el cursor **es** la selección). |
+| `←` / `→` / `Tab` | Saltar de sección (audio, subtítulos, calidad). |
+| `Espacio` | Marcar con `*` la opción del cursor. Se pueden marcar varias. |
+| `0` | Volver a `Automático` / `Desactivados` y quitar la marca de la sección. |
+| `Enter` | Confirmar y pasar a elegir reproductor. |
+| `m` | Recordar esta elección para este canal. |
+
+Junto a la lista de subtítulos aparece, cuando aplica, una nota que dice
+que **VLC** los aplica y que con MPV o MPLAYER sólo funcionan si van dentro
+del vídeo. Se dice aquí, antes de elegir, y no en un modal después: cambiar
+de reproductor sólo tiene sentido si aún no se ha lanzado nada.
+
 ---
 
 ## Fuentes de canales
@@ -336,6 +578,7 @@ del catálogo en un hilo aparte (`warm_catalog`) que no bloquea la UI.
 | EPG XMLTV por URL | `data/epg_cache/` | TTL 12 h | 15 s |
 | Listas Especiales X: categorías | `data/xtream_cache/` | TTL 24 h | 10 s |
 | Listas Especiales X: canales | `data/xtream_cache/` | TTL 6 h | 10 s |
+| Manifiesto de pistas (HLS/MPD) | `data/track_cache/` | 60 s en memoria · 15 min en disco | 6–8 s |
 | Playlist ya parseada | Memoria (sesión) | hasta 6 h / cambio de `mtime` | — |
 
 - Si una URL remota falla pero hay caché previa, se usa la caché en vez
@@ -343,6 +586,11 @@ del catálogo en un hilo aparte (`warm_catalog`) que no bloquea la UI.
 - `R` / `F5` fuerza la re-descarga (`force_refresh`).
 - Una fuente del catálogo o un EPG declarado que falló se reintenta como muy
   pronto a los 5 minutos, para no martillar servidores caídos.
+- La caché de pistas tiene los dos TTL cortos **a propósito**: un master en
+  vivo cambia, y guardar 15 minutos una lista de variantes ya retiradas
+  daría al usuario una calidad que el proveedor ya no publica. La de disco
+  (con sal por instalación) sólo se consulta si la red falla, nunca para
+  ahorrar una petición.
 - Los topes de red y de tamaño son globales y ajustables
   (`security/limits.py`): por defecto 60 s de timeout total, 25 MB por
   respuesta, 64 MB para ficheros locales, 3 redirects, 200 000 entradas por
@@ -359,22 +607,29 @@ Todo lo persistido vive en `data/` (está en `.gitignore`):
 | `playlists.json` | Catálogo de listas: nombre, origen, tipo y (en Listas Especiales X) servidor y usuario. **Nunca** incluye contraseñas; permisos `0600`. |
 | `favorites.json` | Canales favoritos (identidad = `url`). |
 | `recents.json` | Últimos 20 elementos reproducidos (con la URL redactada si traía credenciales). |
-| `prefs.json` | Último reproductor usado, criterio de orden de grupos y tema. |
+| `prefs.json` | Último reproductor usado, criterio de orden de grupos, tema y preferencias de pistas (audio, subtítulos, calidad), con la misma precedencia canal → lista → global. |
 | `theme.json` | Tema claro/oscuro. |
 | `epg_cache/` | XMLTV descargados. |
 | `playlist_cache/` | Playlists M3U descargadas. |
 | `xtream_cache/` | Respuestas de la API de Listas Especiales X (categorías y canales). |
+| `track_cache/` | Manifiestos HLS/MPD ya analizados, con sal por instalación. |
+| `ipc/` | Sockets de control de mpv (uno por reproducción, se borra al salir). |
 | `ux_last.json` | Informe del runner de tests UX. |
 
 Las carpetas se crean con permisos `0700` y los ficheros con `0600`. Para
 empezar de cero, borra la carpeta `data/` (se recrea sola).
+
+`prefs.json` es también el único sitio donde viven las preferencias de
+pistas, y sus claves nunca son la URL del canal: son `tvg:…`, `channel:<hash
+de la URL redactada>` o `provider:<host>`. Es la misma regla que en el resto
+de la app: al disco sólo llegan datos sin credenciales.
 
 ---
 
 ## Tests
 
 ```bash
-# Suite completa (~1031 tests, ~55 s)
+# Suite completa (~1590 tests, ~2 min)
 python -m unittest -v
 
 # Solo tests de una parte
@@ -391,12 +646,17 @@ parser XMLTV (incluye `.gz`), persistencia JSON de playlists, arranque
 multiplataforma (detección del SO + preflight de curses) y dominio
 catch-up (los 8 tests obligatorios del §19, la invariante de capacidad y
 el test AST de "no sondear endpoints"). El resto cubre UI, Listas
-Especiales X, reproductores, layout, tema y recorridos UX completos.
+Especiales X, reproductores, layout, tema, recorridos UX completos y
+selección de pistas (modelo, parsers HLS/DASH, sondeo, política de
+selección, preferencias, argv, IPC y proxy de calidad).
 
 ```bash
 python -m unittest tests.test_catchup -v      # dominio catch-up
 python -m unittest tests.test_catchup_ui -v   # guía, marcadores y modales
-python -m thetvview.security.check            # 12 controles de seguridad
+python -m unittest tests.test_tracks_manager -v   # política de selección
+python -m unittest tests.test_streams_hls -v       # parser HLS
+python -m unittest tests.test_player_track_args -v # argv por reproductor
+python -m thetvview.security.check            # 13 controles de seguridad
 ```
 
 ---
@@ -419,7 +679,27 @@ thetvview/
 ├── resolutions.py      # detección/agrupación de variantes de calidad
 ├── groups.py           # agrupación por group-title
 ├── channel_health.py   # salud del stream en vivo (hilo no bloqueante)
-├── player.py           # lanzamiento de mpv/mplayer/vlc (sin shell)
+├── streams/            # descubrimiento del contenido de un canal
+│   ├── detector.py     # protocolo: cuerpo + Content-Type + extensión (§6)
+│   ├── hls.py          # master/media playlist → capacidades (lista blanca)
+│   ├── dash.py         # MPD → capacidades (xml_safe, sin DTD/entidades)
+│   ├── probe.py        # descarga del manifest por safe_http + caché TTL
+│   ├── headers.py      # cabeceras EXTVLCOPT (sonda de salud y de pistas)
+│   └── pin_proxy.py    # master HLS fijado en loopback con token
+├── tracks/             # representación de pistas (sin red, sin curses)
+│   ├── models.py       # MediaTrack, MediaCapabilities, PlaybackSelection
+│   ├── language.py     # es/es-ES/spa/Spanish/Español → es + etiqueta
+│   ├── labels.py       # etiquetas de audio, subtítulos y vídeo
+│   ├── manager.py      # qué se ofrece y por qué; reconciliación
+│   ├── prefs.py        # preferencias por canal / lista / global
+│   ├── cli.py          # --audio / --subtitles / --quality de una sesión
+│   └── survey.py       # python -m thetvview.tracks.survey (encuesta)
+├── player/             # backend: qué sabe hacer cada reproductor
+│   ├── __init__.py     # reexporta la API pública (from thetvview.player import launch)
+│   ├── core.py         # lanzamiento de mpv/mplayer/vlc (sin shell)
+│   ├── capabilities.py # tabla verificada de capacidades
+│   ├── track_args.py   # PlaybackSelection → argv (lista blanca)
+│   └── mpv_ipc.py      # cliente del IPC local de mpv (1,5 s por comando)
 ├── stream_ref.py       # referencias opacas xtream:// y xtream-ts://
 │                       #   (directo y archivo, sin credenciales)
 ├── catchup.py          # dominio catch-up: capacidad declarada, ventana,
@@ -442,6 +722,7 @@ thetvview/
 └── ui/
     ├── app.py          # bucle principal, stack de pantallas, ayuda
     ├── screens.py      # todas las pantallas
+    ├── tracks.py       # sesión de pistas del canal abierto (estado)
     ├── widgets.py      # listas, modales, formularios, toast, loading
     ├── layout.py       # rectángulos (header/main/footer)
     ├── theme.py        # paletas dual light/dark (256/8 colores, NO_COLOR)
@@ -481,6 +762,10 @@ degradando en silencio.
 | *Contraseña de Listas Especiales X cambiada en el servidor* | `C` en el catálogo para actualizarla. |
 | *La contraseña no se recuerda entre sesiones* | No hay keyring del sistema disponible; en ese caso la app sólo la guarda en memoria. |
 | *Colores raros* | Se usan 256 colores si existen y 8 si no; `NO_COLOR=1` los desactiva por completo. |
+| *No me aparece el menú de audio o calidad* | Lo más probable es que el proveedor no lo publique. La encuesta (`python -m thetvview.tracks.survey`) distingue por qué: una sola pista, MPEG-TS, 403, 404 o timeout. No ofrecer nada ahí es lo correcto. |
+| *El canal se ve pero no oigo* | Pasó al elegir calidad: revisa si el proxy quedó levantado con un master sin su grupo de audio. `i` desde `Reproduciendo` vuelve a analizar el manifiesto. |
+| *Los subtítulos no aparecen con MPV* | Es una limitación del demuxer HLS de ffmpeg, no de la app: los declarados como pista aparte (`EXT-X-MEDIA TYPE=SUBTITLES`) no los expone. Con VLC funcionan. |
+| *La app tarda un poco al abrir un canal* | Son los 2,5 s de espera acotada del sondeo de manifiesto, y sólo en canales que pueden tenerlo. Con `i` o con `--audio`/`--quality` de arranque se evita. |
 | *¿De dónde salen los datos?* | Borra `data/` para reiniciar de cero. |
 
 ---
@@ -491,15 +776,16 @@ Todo lo que llega de una lista (URL, XMLTV, nombres, `EXTVLCOPT`) se trata
 como **dato no confiable**. Compruébalo tú mismo:
 
 ```bash
-python -m thetvview.security.check        # 12 controles; exit != 0 si falla
+python -m thetvview.security.check        # 13 controles; exit != 0 si falla
 python -m thetvview.security.check -v     # detalle de cada control
 python -m thetvview.security.check --json # para CI
 ```
 
-Los 12 controles: redacción de secretos, verificación TLS, política SSRF,
+Los 13 controles: redacción de secretos, verificación TLS, política SSRF,
 redirects, límites de respuesta, XML seguro, saneado de secretos para IA,
 invocación sin shell, almacenamiento de credenciales, ausencia de contraseñas
-en logs, cero dependencias pip y puerta de capacidad catch-up.
+en logs, cero dependencias pip, puerta de capacidad catch-up y aislamiento
+del descubrimiento de pistas.
 
 Dentro de la app, la tecla **`!`** ejecuta lo mismo y el resultado sale
 **siempre en un modal** (lo mismo ocurre con todos los errores y avisos).
@@ -534,6 +820,20 @@ Dentro de la app, la tecla **`!`** ejecuta lo mismo y el resultado sale
   una lista blanca.
 - **Cero dependencias pip**: `requirements.txt` vacío y todos los `import`
   del paquete son del stdlib (también comprobado por `security-check`).
+- **Descubrimiento de pistas aislado** (control 13, verificado sobre el
+  código y comprobable rompiéndolo a propósito): la red de `streams/`,
+  `tracks/` y `player/` sale **sólo** por `safe_http`; el proxy que fija la
+  calidad escucha **sólo en `127.0.0.1`** en un puerto efímero y **exige un
+  token de 128 bits** (fuera de la ruta: `404`, y los segmentos nunca se
+  sirven); y `prefs.json` no guarda nunca la URL del canal con credenciales
+  dentro.
+- **El canal de control de mpv no tiene autenticación ni cifrado**: quien
+  pueda escribir en ese socket manda en el reproductor. Por eso vive en
+  `data/ipc/` con permisos `0700` y un nombre aleatorio de 128 bits
+  (`\\.\pipe\thetvview-<pid>-<rand>` en Windows, socket unix en POSIX), con
+  1,5 s de timeout por comando y un modal explícito si falla. El proxy de
+  calidad y el socket se apagan al cerrar el canal. Detalles y riesgos
+  residuales en [SECURITY.md](SECURITY.md).
 
 Riesgos residuales declarados (entre ellos: sin *IP pinning* contra DNS
 rebinding, y `<!DOCTYPE` dentro de un `CDATA` se rechaza por ser

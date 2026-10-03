@@ -33,6 +33,11 @@ Restricciones duras del repo (ver `AGENTS.md`):
 | Nombre de canal, grupo, título EPG | servidor remoto | redacción al pintar/mostrar |
 | Ficheros locales `data/` | usuario del SO | permisos `0600`/`0700` |
 | Argumentos al reproductor | todo lo anterior | validación de esquema + `--` |
+| Manifiesto HLS/MPD del canal | proveedor | `xml_safe` + límites + `safe_http` |
+| Sondeo de la encuesta (`-m thetvview.tracks.survey`) | proveedores terceros | `safe_http` (igual que la app), sin escribir en disco, URLs redactadas |
+| Pistas declaradas (idioma, calidad) | proveedor | se muestran **como datos**, nunca se ejecutan |
+| IPC local de mpv | otros procesos del usuario | socket en `data/ipc/` 0700 + nombre aleatorio |
+| Master fijado (proxy de calidad) | procesos del usuario | 127.0.0.1 + puerto efímero + token 128 bits |
 
 ## 2. Reglas
 
@@ -88,7 +93,7 @@ Restricciones duras del repo (ver `AGENTS.md`):
 
 ## 4. Comprobaciones (`SDD §45`)
 
-`security/check.py` ejecuta doce checks, cada uno de ellos **falla si no puede
+`security/check.py` ejecuta trece checks, cada uno de ellos **falla si no puede
 comprobar** la propiedad (un check verde significa "verificado", no "desconozco"):
 
 ```text
@@ -104,6 +109,7 @@ comprobar** la propiedad (un check verde significa "verificado", no "desconozco"
 [✓] No plaintext password logs
 [✓] Zero pip dependencies
 [✓] Catch-up capability gate
+[✓] Track discovery sandbox
 ```
 
 El undécimo sustituye al `pip-audit` del SDD §52: con `requirements.txt`
@@ -125,6 +131,24 @@ comprobar que lo detecta (`tests/test_security_check.py::TestCatchupGate`):
    resuelta, que se redacta).
 4. `catchup.py` no importa nada de red ni de procesos, y **ningún** módulo del
    paquete escribe rutas de sonda de endpoint.
+
+El decimotercero (`track_discovery_sandbox`, de la selección de pistas) se
+puede romper a propósito igual que el anterior
+(`tests/test_security_check.py::TestTrackDiscoverySandbox`):
+
+1. **Red sólo por `safe_http`.** Ningún módulo de `streams/`, `tracks/` o
+   `player/` llama a `urlopen`, `build_opener`, `create_connection`,
+   `HTTP(S)Connection` ni importa `requests`/`httpx`/`aiohttp`.
+2. **El proxy de calidad sólo escucha en loopback** (se comprueba sobre la
+   función `PinProxy.start`, que rechaza cualquier host distinto de
+   `127.0.0.1`) **y exige token**: sin él, o en cualquier otra ruta, la
+   respuesta es `404`, y no se sirve ningún segmento.
+3. **`prefs.json` de pistas nunca guarda la URL cruda**: ni el usuario, ni la
+   contraseña, ni el host de la ruta Xtream, ni en las claves ni en los
+   valores. Y la clave de preferencias por canal se calcula sobre la URL
+   **redactada** (se comprueba sobre la función `channel_key`, no sobre los
+   datos: hashear la URL cruda no escribiría nada legible, pero dejaría un
+   hash atacable por diccionario).
 
 ## 5. Riesgos residuales (declarados)
 
@@ -168,6 +192,55 @@ comprobar que lo detecta (`tests/test_security_check.py::TestCatchupGate`):
 10. **Panel que declara archivo sin ventana.** `tv_archive=1` sin
    `tv_archive_duration` deja el canal **sin** catch-up. Es *fail-closed* y es lo
    correcto, pero puede sorprender a quien use un panel mal declarado.
+
+## 5-bis. Canal de control de mpv (IPC local)
+
+mpv abre un canal de control con `--input-ipc-server=<ruta>` y acepta ahí
+**una línea JSON por comando** (`set_property aid|sid …`). Es el único modo
+de cambiar de pista sin reabrir el canal, y el único de los tres
+reproductores que lo tiene.
+
+**No tiene autenticación ni cifrado**: quien pueda escribir en ese socket
+manda en el reproductor. Lo que lo hace aceptable:
+
+| Medida | Detalle |
+|---|---|
+| Sólo local | Socket unix en POSIX, *named pipe* en Windows. Nunca red. |
+| Directorio `0700` | `data/ipc/`, creado con permisos privados. |
+| Nombre impredecible | `mpv-<pid>-<16 bytes aleatorios en hex>.sock`; 128 bits. |
+| Timeout corto | 1,5 s por comando: si mpv no contesta, la TUI no espera. |
+| Fallo explícito | Cualquier error sale como **modal** que dice que hay que reabrir el canal. |
+| Se borra al salir | `NowPlayingScreen.stop_tracks()` borra el socket. |
+
+Residual declarado: **otro proceso del mismo usuario** podría encontrar el
+socket recorriendo `data/ipc/` (tiene permiso para leerlo). Sin embargo,
+puede hacerlo quien ya puede leer los `data/` del usuario, que es el mismo
+nivel de confianza que ya asumimos para el resto de la caché. Un atacante de
+otro usuario del mismo equipo no puede.
+
+## 5-ter. Proxy local de calidad (pinning)
+
+Ninguno de los tres reproductores sabe elegir una variante concreta de un
+master HLS (comprobado ejecutándolos, ver `player/capabilities.py`). Para
+ofrecer calidad manual, la app reescribe el master con **una sola variante** y
+lo sirve ella misma:
+
+| Medida | Detalle |
+|---|---|
+| Sólo loopback | `127.0.0.1` en **puerto efímero** (puerto 0). `PinProxy.start` rechaza cualquier otro host. |
+| Token en la ruta | 128 bits aleatorios: `http://127.0.0.1:<puerto>/<token>/master.m3u8`. |
+| Allowlist de rutas | Sólo ese master (y su alias `index.m3u8`). Todo lo demás: `404`. |
+| **No** proxea segmentos | Las URI del master reescrito apuntan al proveedor: el reproductor sigue hablando con él y con sus cabeceras `EXTVLCOPT`. |
+| Sólo reescribe el master | El body se construye con los valores del manifiesto ya validados por el parser; nunca se interpola texto crudo del proveedor en una cabecera HTTP ni en una línea de respuesta. |
+| Sin logs | `log_message` silenciado (el stderr del proceso es la TUI). |
+| Se apaga siempre | `try/finally` + `stop()` idempotente + `atexit`. |
+
+Residual declarado: el proxy **sí** expone durante la reproducción qué canal
+se está viendo y con qué calidad, a cualquier proceso del mismo usuario que
+consiga el token. El token se genera al azar por reproducción y no se
+persiste, así que no se puede reutilizar para otro canal; y el riesgo real
+es bajo porque esa información ya está en la línea de órdenes del proceso
+del reproductor, que es legible por el mismo usuario.
 
 ## 6. Lo que **no** se afirma
 

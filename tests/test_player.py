@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from thetvview import config
 from thetvview.models import Channel
 from thetvview.player import (
     PlayerError,
@@ -27,6 +28,66 @@ def _channel(**opts) -> Channel:
     return Channel(name="Test TV", url="http://stream.example.com/live", **opts)
 
 
+class TestUserAgent(unittest.TestCase):
+    """El User-Agent del reproductor es el de la app, salvo que el canal
+    diga otro (medido: hay CDNs que sólo sirven los segmentos a esa
+    cabecera y responden 403 a mpv, ffmpeg y Chrome por igual)."""
+
+    def test_mpv_recibe_el_ua_de_la_app(self) -> None:
+        cmd = command_for(_channel(), "mpv", player_path="/usr/bin/mpv")
+        self.assertIn("--user-agent=theTVVIEW/1.0", cmd)
+
+    def test_mplayer_recibe_el_ua_en_dos_argumentos(self) -> None:
+        cmd = command_for(_channel(), "mplayer", player_path="/usr/bin/mplayer")
+        self.assertIn("-user-agent", cmd)
+        self.assertEqual(cmd[cmd.index("-user-agent") + 1], "theTVVIEW/1.0")
+
+    def test_vlc_recibe_su_propia_opcion(self) -> None:
+        cmd = command_for(_channel(), "vlc", player_path="/usr/bin/vlc")
+        self.assertIn("--http-user-agent=theTVVIEW/1.0", cmd)
+
+    def test_el_ua_del_canal_gana_y_no_se_duplica(self) -> None:
+        canal = _channel(
+            extra_options=[("EXTVLCOPT", "http-user-agent=Mozilla/5.0 Propio")]
+        )
+        for reproductor, path, opcion in (
+            ("mpv", "/usr/bin/mpv", "--user-agent="),
+            ("mplayer", "/usr/bin/mplayer", "-user-agent"),
+            ("vlc", "/usr/bin/vlc", "--http-user-agent="),
+        ):
+            with self.subTest(reproductor=reproductor):
+                cmd = command_for(canal, reproductor, player_path=path)
+                propio = f"{opcion}Mozilla/5.0 Propio"
+                esperados = [propio] if reproductor != "mplayer" else [opcion]
+                self.assertEqual([a for a in cmd if a in esperados], esperados)
+                self.assertNotIn("theTVVIEW/1.0", cmd)
+
+    def test_el_ua_no_mueve_el_separador(self) -> None:
+        for reproductor, path in (
+            ("mpv", "/usr/bin/mpv"),
+            ("mplayer", "/usr/bin/mplayer"),
+            ("vlc", "/usr/bin/vlc"),
+        ):
+            with self.subTest(reproductor=reproductor):
+                cmd = command_for(_channel(), reproductor, player_path=path)
+                self.assertEqual(cmd[-2], "--")
+
+    def test_headless_y_ua_conviven(self) -> None:
+        cmd = command_for(
+            _channel(), "mpv", player_path="/usr/bin/mpv", headless=True
+        )
+        self.assertIn("--vo=null", cmd)
+        self.assertIn("--ao=null", cmd)
+        self.assertIn("--user-agent=theTVVIEW/1.0", cmd)
+
+    def test_reproductor_desconocido_no_rompe(self) -> None:
+        canal = _channel()
+        path = "/usr/bin/otro"
+        with mock.patch.object(config, "find_player", return_value=path):
+            cmd = command_for(canal, "otro")
+        self.assertNotIn("--user-agent=theTVVIEW/1.0", cmd)
+
+
 class TestCommandFor(unittest.TestCase):
     def test_comando_basico_mpv(self) -> None:
         cmd = command_for(_channel(), "mpv", player_path="/usr/bin/mpv")
@@ -36,6 +97,7 @@ class TestCommandFor(unittest.TestCase):
                 "/usr/bin/mpv",
                 "--vd=ffh264",
                 "--gpu-api=opengl",
+                "--user-agent=theTVVIEW/1.0",
                 "--title=Test TV",
                 "--force-media-title=Test TV",
                 "--",

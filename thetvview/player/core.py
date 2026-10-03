@@ -1,5 +1,9 @@
 """Lanzamiento de reproductores externos (mpv/mplayer/vlc), solo stdlib.
 
+Es ``thetvview.player.core``; la API pública se reexporta en
+``thetvview/player/__init__.py`` para que ``from thetvview.player import
+launch`` siga siendo exactamente igual que antes.
+
 Seguridad:
 - NUNCA shell=True: el comando siempre es una lista de argv.
 - Toda URL pasa por la política de esquema `purpose="stream"` (SDD §10)
@@ -11,6 +15,9 @@ Seguridad:
 - Solo se traducen opciones EXTVLCOPT de una lista blanca; todo lo demás
   (incluidos los KODIPROP, específicos de Kodi) se ignora con aviso,
   nunca crashea ni pasa strings arbitrarios al reproductor.
+- El User-Agent que ve el proveedor es `DEFAULT_USER_AGENT`, el mismo que
+  usa la app, salvo que el canal declare el suyo: hay CDNs que sólo
+  sirven los segmentos a esa cabecera (ver `_default_user_agent_args`).
 
 TODO(player):
 - Soportar más claves EXTVLCOPT (p. ej. network-caching por reproductor).
@@ -21,11 +28,14 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from typing import Any
 
-from . import config
-from .models import Channel
-from .security.errors import InvalidUrlError
-from .security.url_policy import PURPOSE_STREAM, validate_url
+from .. import config
+from ..models import Channel
+from ..security.errors import InvalidUrlError
+from ..security.safe_http import DEFAULT_USER_AGENT
+from ..security.url_policy import PURPOSE_STREAM, validate_url
+from .track_args import track_args
 
 
 class PlayerError(Exception):
@@ -88,6 +98,40 @@ _KEY_ALIASES: dict[str, str] = {
 def _safe_value(value: str) -> bool:
     """True si el valor es razonable pasar como argumento único."""
     return bool(value) and value.isprintable() and not value.startswith("-")
+
+
+def _default_user_agent_args(
+    player_name: str, ya_emitidos: list[str]
+) -> list[str]:
+    """Identifica al reproductor como la app cuando el canal no fija UA.
+
+    Medido sobre listas reales: hay proveedores cuyo CDN responde **403 a
+    cualquier** User-Agent de reproductor (mpv, ffmpeg e incluso el de
+    Chrome) y sólo entrega los segmentos al que usa la propia app. Sin
+    esto, un canal que el sondeo lee perfectamente se queda reintentando
+    segmentos indefinidamente — el mismo síntoma que una línea caída, pero
+    no lo es, y sin este dato no hay forma de distinguirlo.
+
+    Se manda el mismo :data:`~thetvview.security.safe_http.DEFAULT_USER_AGENT`
+    que usa la app para sus peticiones: una sola identidad en todo el
+    código, y ninguna cabecera inventada.
+
+    Si el canal ya declara `#EXTVLCOPT:http-user-agent=…`, **gana el del
+    proveedor** y aquí no se añade nada.
+    """
+    mpv_flag, mplayer_flag, vlc_flag = _OPTION_FLAGS["http-user-agent"]
+    flag = {
+        "mpv": mpv_flag,
+        "mplayer": mplayer_flag.strip(),
+        "vlc": vlc_flag,
+    }.get(player_name)
+    if not flag or not _safe_value(DEFAULT_USER_AGENT):
+        return []
+    if any(arg.startswith(flag) or arg == flag for arg in ya_emitidos):
+        return []
+    if player_name == "mplayer":
+        return [flag, DEFAULT_USER_AGENT]
+    return [f"{flag}{DEFAULT_USER_AGENT}"]
 
 
 def _codec_h264_args(player_name: str) -> list[str]:
@@ -211,6 +255,11 @@ def command_for(
     player_name: str,
     player_path: str | None = None,
     headless: bool = False,
+    *,
+    selection: Any = None,
+    capabilities: Any = None,
+    proxy_url: str | None = None,
+    ipc_path: str | None = None,
 ) -> list[str]:
     """Construye la línea de comando (lista argv) para reproducir `channel`.
 
@@ -220,7 +269,8 @@ def command_for(
 
     El argv termina siempre en ``["--", url]``: el `--` impide que una
     URL que empiece por `-` (o que el reproductor interprete como opción)
-    ejecute parámetros arbitrarios (gap B1).
+    ejecute parámetros arbitrarios (gap B1). **Ningún argumento nuevo mueve
+    ese `--`**; todo lo de pistas va antes.
 
     Args:
         channel: canal a reproducir.
@@ -228,12 +278,35 @@ def command_for(
         player_path: ruta al binario (si None, se resuelve con find_player).
         headless: si True, añade drivers nulos/dummy para tests o
             entornos sin display (no abre ventana ni requiere GUI).
+        selection: :class:`~thetvview.tracks.models.PlaybackSelection` con lo
+            que el usuario eligió. ``None`` = comportamiento de siempre.
+        capabilities: :class:`~thetvview.tracks.models.MediaCapabilities` del
+            stream, para traducir ids de pista a índices.
+        proxy_url: master fijado servido por
+            :mod:`thetvview.streams.pin_proxy`. Cuando está, **es** la URL
+            que se reproduce y no se pasan índices de pista (el manifiesto ya
+            lleva la elección; ver :func:`track_args`).
+        ipc_path: socket de control de mpv. Sólo para mpv y sólo si se
+            quiere poder cambiar de pista en caliente.
+
+    Nota de seguridad: ``proxy_url`` **también** pasa por
+    ``validate_url(PURPOSE_STREAM)`` antes de construir nada. Es un host
+    loopback http, que la política admite, pero el filtro se aplica igual: si
+    alguien fabricase un ``proxy_url`` con esquema raro, sale con el mismo
+    mensaje que cualquier otra URL (H4, gap B1).
     """
     # B1: validación de esquema ANTES de tocar el sistema de ficheros ni
     # construir un solo argv. file://, javascript:, data: o una línea que
     # empiece por `-` salen de aquí con un mensaje apto para modal.
+    target_url = channel.url
+    if proxy_url:
+        try:
+            validate_url(proxy_url, PURPOSE_STREAM)
+        except InvalidUrlError as exc:
+            raise PlayerError(str(exc)) from exc
+        target_url = proxy_url
     try:
-        validate_url(channel.url, PURPOSE_STREAM)
+        validate_url(target_url, PURPOSE_STREAM)
     except InvalidUrlError as exc:
         raise PlayerError(str(exc)) from exc
 
@@ -244,7 +317,19 @@ def command_for(
             "Instálalo (p. ej. 'sudo apt install mpv') o elige otro."
         )
     args, _ = _option_args(channel, player_name)
-    url = channel.url
+    # Si el canal no fija User-Agent, el reproductor se identifica como la
+    # app: hay CDNs que sólo sirven los segmentos a esa cabecera.
+    args += _default_user_agent_args(player_name, args)
+    # Opciones de pistas (lista blanca de player/track_args.py). Con el proxy
+    # de fijado no se pasan: la elección ya está en el manifiesto servido.
+    track_opts = track_args(
+        player_name,
+        selection,
+        capabilities,
+        pinned_via_proxy=bool(proxy_url),
+    )
+    ipc_opts = _ipc_args(player_name, ipc_path)
+    url = target_url
     if player_name == "mplayer":
         # Fix lag/congelamiento en IPTV HLS:
         # - `-nocache` (sin cache) forzaba reproducción en tiempo real sin
@@ -290,19 +375,54 @@ def command_for(
     gpu_args = ["--gpu-api=opengl"] if player_name == "mpv" and not headless else []
     headless_args = _headless_args(player_name) if headless else []
     # `--` marca el fin de las opciones: a partir de aquí sólo va la URL.
+    # Ninguna opción de pista se cuela detrás: B1 es innegociable.
     return [
-        path, *headless_args, *codec_args, *gpu_args, *args, *title_args, "--", url
+        path,
+        *headless_args,
+        *codec_args,
+        *gpu_args,
+        *ipc_opts,
+        *args,
+        *track_opts,
+        *title_args,
+        "--",
+        url,
     ]
 
 
+def _ipc_args(player_name: str, ipc_path: str | None) -> list[str]:
+    """Argumentos para abrir el canal de control de mpv.
+
+    Sólo mpv; sólo si hay ruta. Con un reproductor distinto se ignora la
+    ruta en lugar de pasar una opción que ese binario no entiende (F5d).
+    """
+    if player_name != "mpv" or not ipc_path:
+        return []
+    valor = str(ipc_path).strip()
+    if not valor or not valor.isprintable() or valor.startswith("-"):
+        return []
+    return [f"--input-ipc-server={valor}"]
+
+
 def launch(
-    channel: Channel, player_name: str | None = None, headless: bool = False
+    channel: Channel,
+    player_name: str | None = None,
+    headless: bool = False,
+    *,
+    selection: Any = None,
+    capabilities: Any = None,
+    proxy_url: str | None = None,
+    ipc_path: str | None = None,
 ) -> subprocess.Popen[bytes]:
     """Lanza el reproductor para `channel` y devuelve el proceso.
 
     Si no se indica `player_name`, usa el primero detectado en orden de
     preferencia (config.SUPPORTED_PLAYERS). Bloquea solo lo que tarda el
     fork/exec; la TUI queda libre mientras el reproductor esté abierto.
+
+    Los argumentos ``selection``/``capabilities``/``proxy_url``/``ipc_path``
+    son opcionales y su valor por defecto es exactamente el comportamiento
+    anterior a la selección de pistas.
 
     Args:
         headless: si True, construye el comando con drivers nulos/dummy
@@ -315,7 +435,16 @@ def launch(
     for name in candidates:
         path = config.find_player(name)
         if path:
-            cmd = command_for(channel, name, player_path=path, headless=headless)
+            cmd = command_for(
+                channel,
+                name,
+                player_path=path,
+                headless=headless,
+                selection=selection,
+                capabilities=capabilities,
+                proxy_url=proxy_url,
+                ipc_path=ipc_path,
+            )
             return subprocess.Popen(  # noqa: S603 - argv sin shell
                 cmd,
                 stdin=subprocess.DEVNULL,

@@ -197,6 +197,22 @@ def prompt_password(stdscr: curses.window, status: StatusBar, label: str) -> str
         status.show("")
 
 
+# --- Espera del sondeo de pistas ---------------------------------------------
+#
+# Cuánto se espera, como mucho, a que vuelva el manifiesto **antes** de
+# ofrecer audio/subtítulos/calidad. Es lo que hace que el orden pedido
+# (pistas → reproductor) funcione de verdad: sin esta espera el usuario
+# llega al selector de reproductor antes de que el proveedor haya
+# contestado y las opciones nunca aparecen.
+#
+# Tres garantías para que esperar aquí no sea una espera mala:
+#   1. sólo se espera si el canal puede tener manifiesto (`.ts` no entra);
+#   2. hay pantalla de espera con lo que está haciendo, no un cuelgue mudo;
+#   3. al agotarse el tiempo se sigue el camino de siempre y el sondeo
+#      sigue en segundo plano, así que las opciones aparecen después desde
+#      "Reproduciendo" (teclas a/s/v).
+TRACK_WAIT_SECONDS: float = 2.5
+
 # --- Ayuda -------------------------------------------------------------------
 # Estilos de línea usados por build_help_lines(): "section" (encabezado),
 # "key" (formato "TECLA  explicación", la tecla se resalta en negrita),
@@ -239,6 +255,11 @@ _HELP_WHERE: dict[str, tuple[str, str]] = {
     "NowPlayingScreen": (
         "Reproduciendo",
         "El canal se está viendo en el reproductor externo.",
+    ),
+    "TrackOptionsScreen": (
+        "Audio, subtítulos y calidad",
+        "Aquí eliges el audio, los subtítulos y la calidad del canal, "
+        "después eliges con qué reproductor verlo.",
     ),
 }
 
@@ -297,7 +318,26 @@ _HELP_HERE: dict[str, list[tuple[str, str]]] = {
     ],
     "NowPlayingScreen": [
         ("key", "q  detener la reproducción y volver a la lista."),
+        ("key", "a  cambiar el idioma del audio."),
+        ("key", "s  cambiar o apagar los subtítulos."),
+        ("key", "v  cambiar la calidad."),
+        ("key", "i  volver a analizar las pistas del canal."),
         ("tip", "El vídeo se ve en otra ventana; aquí ves el estado."),
+        ("tip", "Con MPV el cambio se aplica al instante; con los otros,"),
+        ("body", "el cambio se aplica al reabrir el canal."),
+    ],
+    "TrackOptionsScreen": [
+        ("key", "↑ / ↓  moverte por las opciones."),
+        ("key", "← / →  saltar de sección (audio, subtítulos, calidad)."),
+        ("key", "Espacio  marcar con * la opción del cursor."),
+        ("key", "0  volver a Automático o a Desactivados."),
+        ("key", "Enter  confirmar y pasar a elegir reproductor."),
+        ("key", "m  recordar esta elección para este canal."),
+        ("tip", "Puedes marcar varias: por ejemplo subtítulos y una calidad, "
+                "y luego Enter."),
+        ("tip", "El asterisco marca lo que has elegido tú, para revisarlo "
+                "antes de confirmar."),
+        ("tip", "Sólo aparecen las secciones con más de una opción."),
     ],
 }
 
@@ -365,7 +405,8 @@ def build_help_lines(screen) -> list[tuple[str, str]]:
         ("body", "Recientes: r borrar historial · Enter volver a ver."),
         ("body", "Guía: r recargar · Enter ver el canal."),
         ("body", "Calidad / Reproductor: flechas y Enter para confirmar."),
-        ("body", "Reproduciendo: q detiene y vuelve a la lista."),
+        ("body", "Pistas: ↑↓ elige · 0 Automático · Enter ver · m recordar."),
+        ("body", "Reproduciendo: q detiene · a/s/v cambian pista · i info."),
         ("blank", ""),
         ("section", "Cómo buscar (Canales y Grupos)"),
         ("body", "1. Pulsa / y escribe en el modal: la lista se filtra sola."),
@@ -495,6 +536,11 @@ class App:
         self._warm_queued: set[str] = set()
         self._warm_failed: dict[str, float] = {}
         self._warm_thread: threading.Thread | None = None
+        # Sesión de pistas del canal abierto (audio/subtítulos/calidad).
+        # Vive aquí para que el sondeo sobreviva al cambio de pantalla y para
+        # que el flujo "reproductor -> opciones de pistas -> reproducir" tenga
+        # un único sitio donde mirar el estado. `None` = sin analysing.
+        self.track_session = None
         self.stack: list[PlaylistsScreen] = []
         self._undo_stack: list[dict] = []
         self.stack.append(PlaylistsScreen(self))
@@ -515,6 +561,7 @@ class App:
         try:
             if isinstance(top, NowPlayingScreen):
                 top.stop_health()
+                top.stop_tracks()
         except Exception:
             pass
         self.stack.pop()
@@ -787,6 +834,14 @@ class App:
         modal.selected_button = 0
         stdscr = self.stdscr
         while True:
+            # Avisos del sondeo de pistas: se sacan aquí, en el hilo de la
+            # interfaz, porque un modal desde un hilo secundario no es
+            # seguro con curses.
+            try:
+                self._drain_track_avisos()
+            except Exception:
+                pass
+
             stdscr.erase()
             self.header.render(stdscr, self.screen.title, len(self.stack))
             self.screen.render(stdscr)
@@ -1076,6 +1131,14 @@ class App:
         stdscr = self.stdscr
         # Render loop del modal
         while True:
+            # Avisos del sondeo de pistas: se sacan aquí, en el hilo de la
+            # interfaz, porque un modal desde un hilo secundario no es
+            # seguro con curses.
+            try:
+                self._drain_track_avisos()
+            except Exception:
+                pass
+
             stdscr.erase()
             self.header.render(stdscr, self.screen.title, len(self.stack))
             self.screen.render(stdscr)
@@ -1132,6 +1195,14 @@ class App:
         modal.selected_button = 1  # "No" por defecto
         stdscr = self.stdscr
         while True:
+            # Avisos del sondeo de pistas: se sacan aquí, en el hilo de la
+            # interfaz, porque un modal desde un hilo secundario no es
+            # seguro con curses.
+            try:
+                self._drain_track_avisos()
+            except Exception:
+                pass
+
             stdscr.erase()
             self.header.render(stdscr, self.screen.title, len(self.stack))
             self.screen.render(stdscr)
@@ -1446,7 +1517,7 @@ class App:
         """
         from .widgets import LoadingOverlay
 
-        stdscr = self.stdscr
+        stdscr = getattr(self, "stdscr", None)
         if not isinstance(stdscr, curses.window):
             return  # sin terminal (tests/headless): nada que dibujar
         try:
@@ -1536,6 +1607,289 @@ class App:
             self.footer.show(msg)
         except Exception:
             pass
+
+
+    # --- Pistas (audio / subtítulos / calidad) -------------------------------
+    #
+    # El sondeo arranca **al abrir el selector de reproductor**, en un hilo
+    # daemon: el usuario elige reproductor mientras tanto y, al pulsar Enter,
+    # normalmente ya hay resultado. Si no lo hay, se reproduce igual y la
+    # tarjeta muestra "Analizando pistas…" (plan F6).
+
+    def _track_source_for(self, channel: Channel) -> str | None:
+        """Fuente a la que pertenece el canal (para el ámbito de preferencias)."""
+        for screen in reversed(self.stack):
+            playlist = getattr(screen, "playlist", None)
+            if playlist is not None:
+                return playlist.source
+        return None
+
+    def start_track_probe(self, channel: Channel, *, wait: float = 0.0) -> None:
+        """Crea (o reutiliza) la sesión de pistas y arranca el sondeo.
+
+        Nunca lanza: si algo falla, el canal se reproduce exactamente igual
+        que antes de esta funcionalidad.
+
+        Args:
+            channel: canal a analizar.
+            wait: segundos como mucho que se espera a que el sondeo termine,
+                **sólo** si el canal puede tener manifiesto (`wait_settles`
+                de la sesión). Con 0 no se espera nada y el sondeo sigue
+                volando en segundo plano.
+        """
+        from .tracks import TrackSession
+
+        actual = self.track_session
+        if actual is not None and getattr(actual, "channel", None) == channel:
+            actual.start()
+            self._await_tracks(actual, wait)
+            return
+        if actual is not None:
+            try:
+                actual.stop()
+            except Exception:
+                pass
+        try:
+            session = TrackSession(self, channel, self._track_source_for(channel))
+        except Exception:
+            self.track_session = None
+            return
+        self.track_session = session
+        session.start()
+        self._await_tracks(session, wait)
+
+    def _await_tracks(self, session, wait: float) -> None:  # noqa: ANN001
+        """Espera **acotada** al sondeo, con un mensaje mientras tanto.
+
+        Sin esta espera el usuario llega al selector de reproductor antes de
+        que el manifiesto haya vuelto y las opciones de audio/calidad nunca
+        llegan a aparecer: el orden era el equivocado. El tope es corto y hay
+        una pantalla que lo explica, así que el coste nunca es un cuelgue
+        silencioso.
+        """
+        if not session.wait_settles or wait <= 0:
+            return
+        if not session.pending:
+            return  # ya estaba en caché: instantáneo
+        inicio = time.monotonic()
+        self.show_loading(
+            "Analizando pistas del canal…",
+            sub="Buscando audio, subtítulos y calidad que publica el proveedor",
+        )
+        while session.pending and (time.monotonic() - inicio) < wait:
+            time.sleep(0.05)
+        # Un último pintado para quitar la pantalla de espera.
+        try:
+            stdscr = getattr(self, "stdscr", None)
+            stdscr.erase()
+            stdscr.refresh()
+        except Exception:
+            pass
+
+    def track_capabilities(self):  # noqa: ANN201
+        session = self.track_session
+        return session.capabilities if session is not None else None
+
+    def track_selection(self):  # noqa: ANN201
+        """Selección activa, o None si el usuario no ha tocado nada."""
+        session = self.track_session
+        if session is None:
+            return None
+        selection = session.selection
+        return None if selection.is_default else selection
+
+    def push_player_screen(self, channel: Channel) -> bool:
+        """Empuja el selector de reproductor (o avisa si no hay ninguno).
+
+        Devuelve False si no hay ningún reproductor instalado: en ese caso
+        no se empuja nada, igual que antes de esta funcionalidad.
+        """
+        screen = PlayerScreen(self, channel)
+        if not screen.players:
+            self.status.show(
+                "No hay reproductor disponible. Instala uno de: "
+                + ", ".join(config.SUPPORTED_PLAYERS),
+                error=True,
+            )
+            return False
+        self.push(screen)
+        return True
+
+    def maybe_open_track_options(
+        self, channel: Channel, player_name: str | None = None
+    ) -> bool:
+        """Abre el selector de pistas si hay algo real que elegir.
+
+        Devuelve True si se abrió (y entonces no se sigue al reproductor
+        todavía). Con menos de dos opciones por tipo **no** se abre
+        (SDD §33/§34): ahí la reproducción sigue el camino de siempre.
+
+        ``player_name=None`` significa "todavía no se ha elegido
+        reproductor", que es el orden que se pidió: pistas primero,
+        reproductor después. En ese caso se ofrecen todas las secciones,
+        porque los tres reproductores soportan audio y subtítulos, y la
+        calidad se aplica por el proxy de pinning.
+        """
+        from .screens import TrackOptionsScreen
+
+        session = self.track_session
+        if session is None or getattr(session, "channel", None) != channel:
+            return False
+        if not session.has_menu(player_name):
+            self._explain_degraded(session)
+            return False
+        self.push(TrackOptionsScreen(self, channel, session, player_name))
+        return True
+
+    def _track_options_then_player(self, channel: Channel, *, wait: float) -> bool:
+        """Orden pedido: pistas primero, reproductor después.
+
+        Devuelve True si esta llamada ya ha resuelto la navegación (siempre,
+        para que la caller no tenga que decidir nada): o ha empujado el
+        selector de pistas, o el de reproductor, o ha avisado de que no hay
+        ninguno instalado.
+
+        Es el orden natural: el reproductor no cambia **qué** pistas publica
+        el canal, así que preguntárselo al usuario antes de elegir con qué
+        programa verlo es preguntar por lo que sí depende del canal.
+        """
+        # Primero lo barato y lo que más duele: si no hay reproductor
+        # instalado no tiene sentido enseñar opciones de pistas.
+        screen = PlayerScreen(self, channel)
+        if not screen.players:
+            self.status.show(
+                "No hay reproductor disponible. Instala uno de: "
+                + ", ".join(config.SUPPORTED_PLAYERS),
+                error=True,
+            )
+            return True
+        self.start_track_probe(channel, wait=wait)
+        if not self.maybe_open_track_options(channel, None):
+            self.push(screen)
+        return True
+
+    def open_track_options(self, channel: Channel, player_name: str | None, *, kind: str | None = None) -> None:
+        """Abre el selector para una sección concreta (teclas a/s/v)."""
+        from .screens import TrackOptionsScreen
+        from thetvview.tracks.manager import SelectTrackError
+
+        session = self.track_session
+        if session is None:
+            self.notify_warning(
+                "Este canal no tiene pistas analizadas, así que no hay nada "
+                "que cambiar aquí."
+            )
+            return
+        if kind not in session.kinds(player_name):
+            self.notify_warning(self._no_selection_reason(session, kind, player_name))
+            return
+        self.push(TrackOptionsScreen(self, channel, session, player_name, kind=kind))
+
+    def _no_selection_reason(self, session, kind: str | None, player_name: str | None) -> str:
+        """Por qué no hay menú para esa sección. Un texto, no un silencio."""
+        from thetvview.player.capabilities import hot_control
+        from thetvview.tracks.models import puede_fijar_calidad
+
+        if session.capabilities is None:
+            return (
+                "No se pudo averiguar qué pistas publica este canal, así que "
+                "no hay nada que cambiar. Se reproduce con normalidad."
+            )
+        if not hot_control(player_name) and session.capabilities.has_any_choice:
+            return (
+                f"{str(player_name).upper()} no puede cambiar de pista en "
+                "caliente. Elige la pista antes de abrir el reproductor."
+            )
+        if kind == "quality" and not puede_fijar_calidad(session.capabilities):
+            return (
+                "La calidad fija sólo es posible en streams HLS, y este canal "
+                "usa otro formato. Se reproduce con calidad automática."
+            )
+        if kind == "quality":
+            return (
+                "La calidad ya no se puede cambiar con el canal abierto: "
+                "reabre el canal y elige la calidad antes de ver."
+            )
+        return (
+            "Este canal publica una sola opción para eso, así que no hay nada "
+            "que elegir."
+        )
+
+    def _explain_degraded(self, session) -> None:
+        """Explica por qué no hay menú — pero sólo si hay algo que explicar.
+
+        Distingue dos cosas que antes salían igual y no deberían:
+
+        - **"No hay nada que elegir"** (una sola pista, un directo, el
+          proveedor no publica alternativas). Eso no es un fallo: el canal se
+          reproduce perfectamente. Interrumpir con un modal antes incluso de
+          elegir reproductor hace creer que algo va mal. Va a la barra de
+          estado, que es donde se lee sin interrumpir.
+        - **"No se pudo averiguar"** (403, 404, timeout). Eso sí es un fallo
+          del proveedor y sí merece un modal, aunque el canal suene igual:
+          sin él el usuario no sabe si el canal iba a venir con pistas.
+        """
+        if session.degraded_shown:
+            return
+        mensaje, fallo = session.degraded_outcome()
+        if not mensaje:
+            return
+        session.degraded_shown = True
+        if fallo:
+            self.notify_warning(mensaje)
+        else:
+            self.status.show(mensaje)
+
+    def remember_track_prefs(self, channel, session, *, for_provider: bool = False) -> None:  # noqa: ANN001
+        """'Recordar para este canal' con confirmación en modal (AGENTS)."""
+        if session is None:
+            self.notify_warning("No hay nada que recordar todavía.")
+            return
+        if not self._confirm(
+            "Recordar calidad e idioma",
+            "Se guardará esta elección de audio, subtítulos y calidad para:\n"
+            f"  {channel.name if channel is not None else '?'}\n"
+            + ("toda la fuente de esta lista.\n" if for_provider
+               else "sólo este canal.\n")
+            + "\nPuedes cambiarla luego desde las preferencias.",
+        ):
+            self.status.show("Cancelado: no se guardó ninguna preferencia.")
+            return
+        guardado = session.remember(for_provider=for_provider)
+        if guardado:
+            self.notify(
+                "Preferencia guardada"
+                + (" para toda la lista." if for_provider else " para este canal.")
+            )
+        else:
+            self.notify_warning(
+                "No se pudo guardar la preferencia: no hay donde escribirla."
+            )
+
+    def recheck_tracks(self, channel) -> None:  # noqa: ANN001
+        """Vuelve a analizar las pistas del canal abierto (tecla `i`).
+
+        El sondeo va en segundo plano: aquí sólo se avisa de que empieza. Los
+        avisos que traiga (pista desaparecida, §28) se enseñan cuando
+        lleguen, desde el hilo de la interfaz.
+        """
+        session = self.track_session
+        if session is None:
+            self.notify_warning(
+                "Este canal no tiene sesión de pistas abierta: abre el canal "
+                "de nuevo para analizarlas."
+            )
+            return
+        session.recheck()
+        self.status.show("Analizando las pistas del canal…")
+
+    def _drain_track_avisos(self) -> None:
+        """Enseña (en modal) los avisos que dejó el sondeo, si hay alguno."""
+        session = self.track_session
+        if session is None:
+            return
+        for aviso in session.take_avisos():
+            self.notify_warning(aviso)
 
     def play_catchup(self, channel: Channel, program: Program) -> None:
         """Pide al proveedor un programa ya emitido y lo reproduce (§8, §10).
@@ -1646,29 +2000,72 @@ class App:
                 if variants:
                     self.push(ResolutionScreen(self, channel, variants))
                     return
-                screen = PlayerScreen(self, channel)
-                if not screen.players:
-                    self.status.show(
-                        "No hay reproductor disponible. Instala uno de: "
-                        + ", ".join(config.SUPPORTED_PLAYERS),
-                        error=True,
-                    )
-                    return
-                self.push(screen)
+                self._track_options_then_player(channel, wait=TRACK_WAIT_SECONDS)
             case "select_player":
-                screen = PlayerScreen(self, action["channel"])
-                if not screen.players:
-                    self.status.show(
-                        "No hay reproductor disponible. Instala uno de: "
-                        + ", ".join(config.SUPPORTED_PLAYERS),
-                        error=True,
-                    )
-                    return
-                self.push(screen)
+                self._track_options_then_player(
+                    action["channel"], wait=TRACK_WAIT_SECONDS
+                )
             case "force_select_player":
-                self.push(PlayerScreen(self, action["channel"]))
+                # `p` desde cualquier pantalla: mismo orden, pero sin esperar
+                # (el usuario ya está eligiendo reproductor a propósito).
+                self._track_options_then_player(action["channel"], wait=0.0)
             case "play_with":
-                play_channel(self, action["channel"], player_name=action["player_name"])
+                channel = action["channel"]
+                player_name = action["player_name"]
+                session = self.track_session
+                ya_elegido = bool(
+                    session is not None
+                    and getattr(session, "channel", None) == channel
+                    and getattr(session, "chosen", False)
+                )
+                # Si el usuario ya pasó por el selector de pistas, se respeta
+                # su elección y se abre el canal. Si no pasó (p. ej. porque
+                # el sondeo terminó tarde y aquí es la primera oportunidad),
+                # se le ofrece ahora antes de lanzar: es el único sitio
+                # donde todos los reproductores hacen lo mismo.
+                if not ya_elegido and self.maybe_open_track_options(
+                    channel, player_name
+                ):
+                    return
+                play_channel(
+                    self,
+                    channel,
+                    player_name=player_name,
+                    selection=self.track_selection(),
+                    capabilities=self.track_capabilities(),
+                    track_session=self.track_session,
+                )
+            case "tracks_choose_player":
+                channel = action["channel"]
+                session = self.track_session
+                if session is not None and getattr(session, "channel", None) == channel:
+                    # Marca de que la elección ya está hecha: al elegir
+                    # reproductor no se vuelve a preguntar.
+                    session.chosen = True
+                self.push_player_screen(channel)
+            case "play_with_selection":
+                play_channel(
+                    self,
+                    action["channel"],
+                    player_name=action.get("player_name"),
+                    selection=action.get("selection"),
+                    capabilities=self.track_capabilities(),
+                    track_session=self.track_session,
+                )
+            case "open_track_kind":
+                self.open_track_options(
+                    action["channel"],
+                    action.get("player_name"),
+                    kind=action.get("kind"),
+                )
+            case "remember_track_prefs":
+                self.remember_track_prefs(
+                    action.get("channel"),
+                    action.get("session"),
+                    for_provider=bool(action.get("for_provider")),
+                )
+            case "recheck_tracks":
+                self.recheck_tracks(action.get("channel"))
             case "play_catchup":
                 self.play_catchup(action["channel"], action["program"])
             case "stop_playback":
@@ -1690,6 +2087,10 @@ class App:
                         cur.stop_health()
                     except Exception:
                         pass
+                    try:
+                        cur.stop_tracks()
+                    except Exception:
+                        pass
                     self.pop()
                     self.status.show(f"'{cur.channel.name}' detenido.")
                 else:
@@ -1706,7 +2107,12 @@ class App:
         except Exception:
             pass
         while True:
-            if isinstance(self.screen, NowPlayingScreen) or self._epg_load_thread is not None:
+            sesion = self.track_session
+            if (
+                isinstance(self.screen, NowPlayingScreen)
+                or self._epg_load_thread is not None
+                or (sesion is not None and sesion.pending)
+            ):
                 # Reproducción (vivo) o EPG de la playlist cargándose en
                 # segundo plano: refresco cada 500 ms para que los datos
                 # aparezcan en cuanto estén, sin esperar a una tecla.
@@ -1731,6 +2137,14 @@ class App:
                 stdscr.timeout(500)
                 stdscr.getch()
                 continue
+
+            # Avisos del sondeo de pistas: se sacan aquí, en el hilo de la
+            # interfaz, porque un modal desde un hilo secundario no es
+            # seguro con curses.
+            try:
+                self._drain_track_avisos()
+            except Exception:
+                pass
 
             stdscr.erase()
             self.header.render(stdscr, self.screen.title, len(self.stack))
@@ -1776,6 +2190,10 @@ class App:
                     if not self.screen.is_alive():
                         try:
                             self.screen.stop_health()
+                        except Exception:
+                            pass
+                        try:
+                            self.screen.stop_tracks()
                         except Exception:
                             pass
                         try:
@@ -1919,6 +2337,14 @@ class App:
         def render() -> tuple[int, int, int]:
             """Dibuja fondo + ventana de ayuda. Devuelve (visibles, total, alto)."""
             max_y, max_x = stdscr.getmaxyx()
+            # Avisos del sondeo de pistas: se sacan aquí, en el hilo de la
+            # interfaz, porque un modal desde un hilo secundario no es
+            # seguro con curses.
+            try:
+                self._drain_track_avisos()
+            except Exception:
+                pass
+
             stdscr.erase()
             self.header.render(stdscr, self.screen.title, len(self.stack))
             self.screen.render(stdscr)

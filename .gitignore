@@ -27,6 +27,8 @@ data/prefs.json
 data/recents.json
 data/ux_last.json
 data/xtream_cache/
+data/track_cache/
+data/ipc/
 docs/plan-xtream-tui.md
 
 # Archivos de sistema y editores
@@ -52,5 +54,6 @@ AGENTS.md
 SDD — Soporte de fuentes Xtream para visor IPTV asistido por IA.md
 SDD_IPTV_Viewer_Seguro_Xtream_M3U.md
 SDD_IPTV_Catchup_Timeshift.md
+IPTV_Track_Selection_SDD.md
 
 Captura de pantalla de 2026-09-11 15-43-17.png

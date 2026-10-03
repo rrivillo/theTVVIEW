@@ -30,18 +30,7 @@ from urllib.error import HTTPError
 from thetvview.models import Channel
 from thetvview.security.safe_http import SafeHttpClient
 from thetvview.security.url_policy import PURPOSE_STREAM
-
-# Reuso de aliases de player para headers (evitar duplicar lógica)
-# Definidos aquí para no crear dependencia circular con player.
-_KEY_ALIASES: dict[str, str] = {
-    "http-user-agent": "http-user-agent",
-    "user-agent": "http-user-agent",
-    "user_agent": "http-user-agent",
-    "http-referrer": "http-referrer",
-    "referrer": "http-referrer",
-    "referer": "http-referrer",
-    "http-referer": "http-referrer",
-}
+from thetvview.streams.headers import build_headers as _build_headers
 
 
 # ---------------------------------------------------------------------------
@@ -113,24 +102,6 @@ def health_label(level: int) -> str:
 # ---------------------------------------------------------------------------
 # Helpers: headers + probe
 # ---------------------------------------------------------------------------
-
-def _build_headers(channel: Channel) -> dict[str, str]:
-    headers: dict[str, str] = {"User-Agent": "theTVVIEW/1.0"}
-    for tag, raw in channel.extra_options:
-        if tag != "EXTVLCOPT":
-            continue
-        key, sep, value = raw.partition("=")
-        if not sep:
-            continue
-        k = key.strip().lower()
-        v = value.strip()
-        canon = _KEY_ALIASES.get(k)
-        if canon == "http-user-agent" and v:
-            headers["User-Agent"] = v
-        elif canon == "http-referrer" and v:
-            headers["Referer"] = v
-    return headers
-
 
 def _friendly_error(exc: Exception) -> str:
     """Traduce una excepción a un mensaje corto para la barra de estado.

@@ -25,6 +25,12 @@ from thetvview.models import Channel, Playlist
 from thetvview.playlist_manager import PlaylistEntry, PlaylistError, PlaylistManager
 from thetvview.recents import RecentsManager
 from thetvview.stream_ref import MissingCredentialsError, resolve_channel_url
+from thetvview.tracks.labels import audio_label, subtitle_label, video_label
+from thetvview.tracks.manager import QUICK_AUTO, SelectTrackError
+from thetvview.tracks.models import MediaCapabilities, PlaybackSelection
+from thetvview.player.capabilities import KIND_SUBTITLES
+
+from .tracks import SECTION_LABELS
 
 from . import colors
 from . import icons
@@ -33,6 +39,10 @@ from .widgets import ScrollableList, render_empty_message, render_separator
 
 # Centinela: ChannelsScreen sin filtro de grupo (vs. filtro "sin grupo").
 _UNSET: object = object()
+
+# Tab como código de carácter (el terminal lo entrega así, no como KEY_TAB,
+# que curses no define en todas las plataformas).
+_KEY_TAB: int = 9
 
 # F5 para "actualizar lista" ('R' es el atajo principal; 'r' queda para
 # Recientes). Fallback numérico por si curses no define KEY_F5.
@@ -1448,6 +1458,405 @@ class ResolutionScreen(Screen):
             pass
 
 
+class TrackOptionsScreen(Screen):
+    """Selector de audio / subtítulos / calidad de un mismo canal.
+
+    Con el estilo visual de ``PlayerScreen``/``ResolutionScreen``: secciones,
+    marca de lo seleccionado y atajos. Tres reglas la gobiernan y ninguna es
+    negociable (SDD §33/§34/§49, plan F6):
+
+    - **sólo se pintan las secciones con 2 o más opciones**: con una pista
+      única no hay nada que elegir, y ofrecer un menú de una opción sería
+      inventar una decisión que el usuario no tiene;
+    - **lo que va a aplicarse va marcado**: se entra viendo ya qué se va a
+      reproducir, porque las preferencias se resuelven antes de abrir;
+    - **``0`` devuelve a Automático/Desactivados** de la sección actual;
+      ``Enter`` confirma y devuelve el control al App, que a continuación
+      muestra el selector de reproductor (pistas primero, reproductor
+      después).
+    """
+
+    def __init__(  # noqa: ANN001
+        self,
+        app,
+        channel: Channel,
+        session,  # noqa: ANN001 - TrackSession
+        player_name: str | None = None,
+        kind: str | None = None,
+    ) -> None:
+        super().__init__(app)
+        self.channel = channel
+        self.session = session
+        self.player_name = player_name
+        self.title = f"Audio y calidad · {channel.name}"
+        self.options = session.options(player_name)
+        self.kinds: list[str] = options_kinds(self.options, kind)
+        # Índice global de la opción enfocada, sobre la lista aplanada.
+        self.selected: int = 0
+        #: Opciones que el usuario ha marcado con `Espacio`: (sección, id).
+        #: Es un ``set`` a propósito — elegir dos veces lo mismo no cuenta como
+        #: dos elecciones — y vive en la pantalla, no en la sesión: se borra al
+        #: salir y no se guarda como preferencia.
+        self.marcados: set[tuple[str, str]] = set()
+        self._focus()
+
+    # -- navegación ---------------------------------------------------------
+
+    def _rows(self) -> list[tuple[str | None, object]]:
+        """[(sección, opción)] aplanado, sólo con las secciones visibles."""
+        rows: list[tuple[str | None, object]] = []
+        for kind in self.kinds:
+            rows.append((SECTION_LABELS.get(kind, kind), None))
+            for choice in self.options.choices_for(kind):
+                rows.append((None, choice))
+        return rows
+
+    def _flatten(self) -> list[object]:
+        return [choice for _section, choice in self._rows() if choice is not None]
+
+    def _section_of(self, index: int) -> str | None:
+        opciones = self._flatten()
+        if not opciones or index < 0 or index >= len(opciones):
+            return None
+        actual = opciones[index]
+        for kind in self.kinds:
+            if actual in self.options.choices_for(kind):
+                return kind
+        return None
+
+    def _focus(self, prefer_kind: str | None = None) -> None:
+        """Deja el foco sobre la opción que va a aplicarse.
+
+        Si `prefer_kind` viene dado y tiene opción marcada, se queda en esa
+        sección: cambiar la calidad no debe saltar el cursor al audio.
+        """
+        opciones = self._flatten()
+        if not opciones:
+            self.selected = 0
+            return
+        marcadas = [i for i, c in enumerate(opciones) if c.is_selected]
+        if prefer_kind:
+            for indice in marcadas:
+                if opciones[indice] in self.options.choices_for(prefer_kind):
+                    self.selected = indice
+                    return
+        self.selected = marcadas[0] if marcadas else 0
+
+    def _move(self, delta: int) -> None:
+        """Mueve el cursor y aplica lo que queda marcado.
+
+        El cursor **es** la selección (como en ``PlayerScreen``): así lo que
+        se ve marcado es exactamente lo que se va a lanzar, y `Enter` no
+        puede confirmar otra cosa por sorpresa.
+        """
+        total = len(self._flatten())
+        if not total:
+            return
+        destino = max(0, min(total - 1, self.selected + delta))
+        if destino == self.selected:
+            return
+        self.selected = destino
+        self._aplicar_cursor()
+
+    def _jump(self, delta: int) -> None:
+        """Salta de sección con ←/→ (o Tab)."""
+        if not self.kinds:
+            return
+        kind = self._section_of(self.selected)
+        if kind is None:
+            self.selected = 0
+            return
+        indice = self.kinds.index(kind)
+        destino = self.kinds[(indice + delta) % len(self.kinds)]
+        self._focus_first(destino)
+
+    def _focus_first(self, kind: str) -> None:
+        opciones = self._flatten()
+        for indice, choice in enumerate(opciones):
+            if choice in self.options.choices_for(kind):
+                self.selected = indice
+                self._aplicar_cursor()
+                return
+        self.selected = 0
+
+    def _aplicar_cursor(self) -> None:
+        """Aplica la opción enfocada a la selección."""
+        kind = self._section_of(self.selected)
+        choice = self.selected_choice
+        if kind is None or choice is None:
+            return
+        if choice.id == self.options.selected_id(kind):
+            return
+        self._aplicar(kind, choice.id)
+
+    # -- acciones -----------------------------------------------------------
+
+    def _aplicar(self, kind: str, choice_id: str | None) -> None:
+        try:
+            self.session.select(kind, choice_id)
+        except SelectTrackError as exc:
+            _error(self.app, exc.message)
+            return
+        self.options = self.session.options(self.player_name)
+        self._focus(prefer_kind=kind)
+
+    def _marcar(self) -> None:
+        """Fija la opción del cursor y la marca con un asterisco.
+
+        Para qué, si el cursor ya aplica: al moverse se va aplicando todo lo
+        que pasa por debajo, y al final no hay forma de distinguir "esto lo
+        elegí yo" de "esto es lo que ya venía". Con `Espacio` la elección se
+        hace **a conciencia** y queda señalada, de modo que se pueden Elegir
+        varias cosas —subtítulos y calidad, por ejemplo— y revisarlas antes de
+        `Enter`.
+
+        `0` quita la marca de la sección al volver a Automático/Desactivados:
+        esa opción no es una elección del usuario, es el valor por defecto.
+        """
+        kind = self._section_of(self.selected)
+        choice = self.selected_choice
+        if kind is None or choice is None:
+            return
+        self._aplicar(kind, choice.id)
+        self.marcados.add((kind, choice.id))
+
+    @property
+    def _esta_marcada(self) -> bool:
+        kind = self._section_of(self.selected)
+        choice = self.selected_choice
+        return bool(kind and choice and (kind, choice.id) in self.marcados)
+
+    def _ultima_de_seccion(self, indice: int) -> bool:
+        """True si la opción `indice` es la última de su sección.
+
+        Se usa para colgar una nota justo debajo de su lista, sin tener que
+        recorrer las filas y comparar con la siguiente.
+        """
+        kind = self._section_of(indice - 1)
+        if kind is None:
+            return True
+        return self._section_of(indice) != kind
+
+    def _nota_subtitulos(self) -> str | None:
+        """Texto junto a la lista de subtítulos, o None si no hace falta.
+
+        Los subtítulos no siempre se pueden aplicar, y depende del
+        reproductor: medido, el demuxer HLS de ffmpeg (mpv y mplayer) **no
+        expone** las pistas que el manifiesto declara aparte (``EXT-X-MEDIA``
+        con ``TYPE=SUBTITLES``) y dice literalmente ``hls: Can't support the
+        subtitle(...)``; VLC sí las ve porque trae su propio demuxer
+        adaptativo.
+
+        Aquí se dice **antes** de elegir, que es cuando sirve: el usuario ve la
+        limitación junto a la decisión y puede cambiar de reproductor después.
+        Un modal posterior le interrumpía ya con la elección hecha.
+
+        No se dice nada (y es correcto callar) cuando:
+
+        - los subtítulos van incrustados en el segmento: entonces son una
+          pista normal y ``--sid`` sí los alcanza en todos los reproductores;
+        - el reproductor ya es VLC, que sí los aplica;
+        - no hay subtítulos que ofrecer.
+        """
+        if not self.options.subtitles:
+            return None
+        capabilities = getattr(self.session, "capabilities", None)
+        if capabilities is None:
+            return None
+        hay_renditions = any(pista.uri for pista in capabilities.subtitle_tracks)
+        if not hay_renditions:
+            # Incrustados en el segmento: funcionan en todos.
+            return None
+        reproductor = (self.player_name or "").strip().lower()
+        if reproductor == "vlc":
+            return None
+        if not reproductor:
+            # Todavía no se ha elegido reproductor (el orden es pistas primero):
+            # hay que nombrar los dos casos sin dar por hecho nada.
+            return (
+                "según el reproductor: VLC los aplica; con MPV o MPLAYER sólo "
+                "si van dentro del vídeo"
+            )
+        return (
+            f"{reproductor.upper()} no aplica los subtítulos de este canal "
+            "(los publica como pista aparte). Con VLC sí funcionan."
+        )
+
+    def _confirmar(self) -> dict:
+        # Se devuelve al App con la selección ya aplicada en la sesión; a
+        # partir de aquí sigue el selector de reproductor (pistas primero,
+        # reproductor después).
+        return {
+            "action": "tracks_choose_player",
+            "channel": self.channel,
+            "selection": self.session.selection,
+        }
+
+    def shortcuts(self) -> str:
+        return ("↑/↓ elegir · Tab sección · Espacio marcar * · 0 Automático · "
+                "Enter ▶ reproductor · m Recordar · ? Ayuda · Esc ←")
+
+    def handle_key(self, key: int) -> dict | None:
+        kind = self._section_of(self.selected)
+        if key in (curses.KEY_UP, ord("k")):
+            self._move(-1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self._move(1)
+        elif key in (curses.KEY_LEFT, curses.KEY_BTAB):
+            self._jump(-1)
+        elif key in (curses.KEY_RIGHT, _KEY_TAB):
+            self._jump(1)
+        elif key == ord("0"):
+            if kind:
+                # Volver a Automático/Desactivados no es elegir: quita la marca
+                # de esa sección para que el asterisco siga significando
+                # "esto lo he elegido yo".
+                self.marcados = {
+                    (k, c) for k, c in self.marcados if k != kind
+                }
+                self._aplicar(kind, QUICK_AUTO)
+        elif key == ord(" "):
+            self._marcar()
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return self._confirmar()
+        elif key in (ord("m"), ord("M")):
+            return {"action": "remember_track_prefs", "channel": self.channel,
+                    "session": self.session}
+        return None
+
+    # -- dibujo -------------------------------------------------------------
+
+    def render(self, stdscr: curses.window) -> None:
+        max_y, max_x = stdscr.getmaxyx()
+        if max_y < 6 or max_x < 30:
+            return
+        ch = self.channel
+        icon = icons.ICON_RADIO if ch.radio else icons.ICON_TV
+        try:
+            stdscr.addstr(1, 0, f" {icon} {ch.name}",
+                          colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        pendientes = self.session.pending
+        if pendientes:
+            texto = "Analizando pistas del canal… (puedes empezar a ver igualmente)"
+            try:
+                stdscr.addstr(2, 2, texto[: max(0, max_x - 3)],
+                              colors.pair(colors.PAIR_DIM))
+            except curses.error:
+                pass
+
+        if not self.kinds:
+            from .widgets import EmptyState
+
+            EmptyState.render(
+                stdscr, max_y // 2, max_x,
+                "Este canal no ofrece pistas que elegir.",
+                "Se reproduce con el audio y la calidad por defecto del proveedor",
+            )
+            return
+
+        filas = self._rows()
+        y = 4
+        x_seccion = 2
+        x_opcion = max(8, min(14, max_x // 3))
+        indice = 0
+        for seccion, choice in filas:
+            if y >= max_y - 2:
+                break
+            if seccion is not None:
+                try:
+                    stdscr.addstr(y, x_seccion, seccion,
+                                  colors.pair(colors.PAIR_ACCENT) | curses.A_BOLD)
+                    stdscr.addstr(y, x_seccion + len(seccion) + 1,
+                                  "─" * max(0, max_x - x_seccion - len(seccion) - 2),
+                                  colors.pair(colors.PAIR_SEPARATOR))
+                except curses.error:
+                    pass
+                y += 1
+                continue
+            elegido = indice == self.selected
+            kind_actual = self._section_of(indice)
+            marcada = (
+                kind_actual is not None
+                and (kind_actual, choice.id) in self.marcados
+            )
+            marca = icons.ICON_PLAY if elegido else " "
+            etiqueta = choice.label
+            # El asterisco va al final: dice "lo he elegido yo" y sobrevive a
+            # que el cursor se mueva a otra sección, que es justo cuando hace
+            # falta recordarlo.
+            if marcada:
+                etiqueta = f"{etiqueta} *"
+            try:
+                if elegido:
+                    stdscr.addstr(y, x_opcion - 2, marca,
+                                  colors.pair(colors.PAIR_SELECTED) | curses.A_BOLD)
+                stdscr.addstr(y, x_opcion, etiqueta[: max(0, max_x - x_opcion - 1)],
+                              colors.pair(colors.PAIR_SELECTED if elegido
+                                          else (colors.PAIR_ACCENT if marcada
+                                                else colors.PAIR_NORMAL))
+                              | (curses.A_BOLD if elegido else 0))
+                if elegido:
+                    stdscr.addstr(y, x_seccion, " ", colors.pair(colors.PAIR_SELECTED))
+                    stdscr.addstr(y, x_seccion + 1, " ", colors.pair(colors.PAIR_SELECTED))
+            except curses.error:
+                pass
+            indice += 1
+            y += 1
+            # Si esta era la última opción de subtítulos, se pone aquí la nota:
+            # pegada a la lista donde se está eligiendo, no al final de la
+            # pantalla que es donde nadie lo lee.
+            if kind_actual == KIND_SUBTITLES and self._ultima_de_seccion(indice):
+                nota = self._nota_subtitulos()
+                if nota and y < max_y - 2:
+                    try:
+                        stdscr.addstr(y, x_seccion,
+                                      f" ▸ {nota}"[: max(0, max_x - x_seccion - 1)],
+                                      colors.pair(colors.PAIR_DIM))
+                    except curses.error:
+                        pass
+                    y += 1
+
+        # Información de lo que no tiene menú: informar no es ofrecer elegir.
+        y += 1
+        if self.options.audio_info and not self.options.audio_selectable:
+            try:
+                stdscr.addstr(y, x_seccion,
+                              f" Audio · {self.options.audio_info}"
+                              f" (única pista)", colors.pair(colors.PAIR_DIM))
+            except curses.error:
+                pass
+            y += 1
+        if self.options.quality_info and not self.options.quality_selectable:
+            try:
+                stdscr.addstr(y, x_seccion,
+                              f" Calidad · {self.options.quality_info}"
+                              f" (única)", colors.pair(colors.PAIR_DIM))
+            except curses.error:
+                pass
+
+    @property
+    def selection(self):
+        """Selección vigente (la misma que se devolverá al reproducir)."""
+        return self.session.selection
+
+    # -- tests ---------------------------------------------------------------
+
+    @property
+    def selected_kind(self) -> str | None:
+        return self._section_of(self.selected)
+
+    @property
+    def selected_choice(self):
+        opciones = self._flatten()
+        if 0 <= self.selected < len(opciones):
+            return opciones[self.selected]
+        return None
+
+
+
 class PlayerScreen(Screen):
     """Selector de reproductor — vista cards con icono."""
 
@@ -1566,6 +1975,8 @@ class NowPlayingScreen(Screen):
         health_monitor: ChannelHealthMonitor | None = None,
         catchup_playback=None,  # noqa: ANN001 - PlaybackRequest | None
         catchup_program=None,  # noqa: ANN001 - Program | None
+        track_session=None,  # noqa: ANN001 - TrackSession | None
+        pin_proxy=None,  # noqa: ANN001 - PinProxy | None
     ) -> None:
         super().__init__(app)
         self.channel = channel
@@ -1596,6 +2007,10 @@ class NowPlayingScreen(Screen):
                     self._programs = epg.programmes_for(cid)
                 except Exception:
                     self._programs = []
+        # Pistas del canal (audio/subtítulos/calidad). Puede llegar None:
+        # un .ts o un canal sin manifiesto se reproduce igual que antes.
+        self.tracks = track_session
+        self.pin_proxy = pin_proxy
         # Salud del canal en tiempo real (hilo daemon no bloqueante)
         if health_monitor is not None:
             self.health = health_monitor
@@ -1607,7 +2022,8 @@ class NowPlayingScreen(Screen):
                 self.health = ChannelHealthMonitor(channel, interval=10.0, timeout=2.0, auto_start=False)
 
     def shortcuts(self) -> str:
-        return "q Detener · ? Ayuda"
+        extra = " · a Audio · s Subtítulos · v Calidad · i Info" if self.tracks else ""
+        return f"q Detener{extra} · ? Ayuda"
 
     def is_alive(self) -> bool:
         try:
@@ -1646,7 +2062,62 @@ class NowPlayingScreen(Screen):
     def handle_key(self, key: int) -> dict | None:
         if key in (ord("q"), ord("Q"), 27, curses.KEY_LEFT, curses.KEY_BACKSPACE):
             return {"action": "stop_playback"}
+        if self.tracks is None:
+            return None
+        # Atajos de pistas. Sólo existen si hay algo que cambiar: si el canal
+        # no expone alternativas, las teclas avisan en vez de no hacer nada
+        # en silencio (SDD §29).
+        if key == ord("a"):
+            return {"action": "open_track_kind", "channel": self.channel,
+                    "player_name": self.player_name, "kind": "audio"}
+        if key == ord("s"):
+            return {"action": "open_track_kind", "channel": self.channel,
+                    "player_name": self.player_name, "kind": "subtitles"}
+        if key == ord("v"):
+            return {"action": "open_track_kind", "channel": self.channel,
+                    "player_name": self.player_name, "kind": "quality"}
+        if key in (ord("i"), ord("I")):
+            return {"action": "recheck_tracks", "channel": self.channel}
         return None
+
+    def stop_tracks(self) -> None:
+        """Apaga todo lo que esta pantalla abrió: sondeo, proxy y socket IPC.
+
+        Se llama al parar la reproducción, al saltar hacia atrás y al salir
+        de la app. Es idempotente y nunca lanza.
+        """
+        sesion = getattr(self, "tracks", None)
+        if sesion is not None:
+            try:
+                sesion.stop()
+            except Exception:
+                pass
+        proxy = getattr(self, "pin_proxy", None)
+        if proxy is not None:
+            try:
+                proxy.stop()
+            except Exception:
+                pass
+            self.pin_proxy = None
+        self._remove_ipc_socket()
+
+    def _remove_ipc_socket(self) -> None:
+        """Borra el socket del IPC si sigue ahí.
+
+        mpv crea el fichero y no lo borra al salir. Vive en un directorio
+        0700, así que no es un problema de seguridad, pero dejarlo puesto
+        acumula basura en ``data/ipc/``.
+        """
+        sesion = getattr(self, "tracks", None)
+        ruta = getattr(sesion, "ipc_path", None) if sesion is not None else None
+        if not ruta:
+            return
+        try:
+            import os
+
+            os.unlink(ruta)
+        except (OSError, TypeError, ValueError):
+            pass
 
     def _current_program(self):  # type: ignore[no-untyped-def]
         """Programa que se está viendo.
@@ -1735,6 +2206,48 @@ class NowPlayingScreen(Screen):
     def _meter_state_text(self, alive: bool) -> str:
         return "Reproduciendo" if alive else "Detenido"
 
+    # --- Pistas: sólo lo que el manifiesto declaró de verdad -----------------
+
+    def _track_lines(self, max_x: int) -> list[tuple[str, int]]:
+        """Filas `Audio/Subtítulos/Calidad/Resolución/Códec` de la tarjeta.
+
+        Se omiten las vacías: sin pistas analizadas la tarjeta queda como
+        estaba, que es lo que exige no romper los streams simples (§32).
+        """
+        sesion = getattr(self, "tracks", None)
+        if sesion is None:
+            return []
+        if sesion.pending and sesion.capabilities is None:
+            return [(" Analizando pistas del canal…", colors.pair(colors.PAIR_DIM) | curses.A_DIM)]
+        datos = sesion.summary()
+        if not any(datos.values()):
+            return []
+        etiquetas = (
+            ("Audio", "audio"),
+            ("Subtítulos", "subtitles"),
+            ("Calidad", "quality"),
+            ("Resolución", "resolution"),
+            ("Códec", "codec"),
+        )
+        kinds = sesion.kinds(self.player_name)
+        lineas: list[tuple[str, int]] = []
+        for etiqueta, clave in etiquetas:
+            valor = datos.get(clave) or ""
+            if not valor:
+                continue
+            attr = colors.pair(colors.PAIR_NORMAL)
+            # Un valor que se puede cambiar desde aquí se marca con la tecla.
+            if clave in ("audio", "subtitles", "quality"):
+                tecla = {"audio": "a", "subtitles": "s", "quality": "v"}[clave]
+                if clave in kinds:
+                    attr = colors.pair(colors.PAIR_PRIMARY)
+                    lineas.append((f" {tecla} {etiqueta}:".ljust(17), attr))
+                    lineas.append((f"{valor}"[: max(0, max_x - 4)], colors.pair(colors.PAIR_NORMAL)))
+                    continue
+            lineas.append((f" {etiqueta}:".ljust(17), colors.pair(colors.PAIR_DIM)))
+            lineas.append((f"{valor}"[: max(0, max_x - 4)], colors.pair(colors.PAIR_NORMAL)))
+        return lineas
+
     def render(self, stdscr: curses.window) -> None:
         max_y, max_x = stdscr.getmaxyx()
         spin = self._spin_chars[self._spin_idx % len(self._spin_chars)]
@@ -1760,6 +2273,7 @@ class NowPlayingScreen(Screen):
         lines.append((f" Canal:      {self.channel.name}", colors.pair(colors.PAIR_NORMAL) | curses.A_BOLD))
         lines.append((f" Grupo:      {grp}", colors.pair(colors.PAIR_DIM)))
         lines.append((f" Reproductor: {player_label}", colors.pair(colors.PAIR_NORMAL)))
+        lines += self._track_lines(max_x)
         if self.is_archive:
             lines.append((f" Fuente:     {icons.ICON_ARCHIVE} Archivo (catch-up)",
                           colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD))
@@ -2290,7 +2804,27 @@ def play_channel(  # noqa: ANN001
     *,
     catchup_playback=None,
     catchup_program=None,
+    selection=None,
+    capabilities=None,
+    track_session=None,
 ) -> None:
+    """Abre `channel` en el reproductor elegido.
+
+    Cuando hay :class:`PlaybackSelection` y capacidades, se hace lo que el
+    plan F5 manda, en este orden:
+
+    1. se resuelve la URL (las referencias Xtream son opacas);
+    2. si la calidad está fijada y el reproductor no la sabe elegir, se
+       levanta el **proxy de pinning** y se reproduce su master; si el proxy
+       no puede, se reproduce el manifest original y se explica en un modal;
+    3. se abre el canal de control de mpv (siempre, cuesta cero) para poder
+       cambiar de pista en caliente;
+    4. se lanzan los argumentos de pistas que el reproductor sí soporta.
+
+    El proxy vive **mientras dure la reproducción**: se lo pasa a
+    :class:`NowPlayingScreen`, que lo apaga al cerrar (plan F5c: apagado
+    siempre, en el ``finally``).
+    """
     # Las URLs Xtream son opacas en el dominio: aquí (y sólo aquí) se
     # recuperan las credenciales. El objeto original no se toca, para que
     # la caché, favoritos y recientes sigan sin secretos (SDD §37).
@@ -2305,9 +2839,49 @@ def play_channel(  # noqa: ANN001
         return
     if resolved != channel.url:
         channel = replace(channel, url=resolved)
+
+    proxy = None
+    proxy_url: str | None = None
+    avisos: list[str] = []
+    if selection is not None and capabilities is not None:
+        proxy, avisos = _start_pin(capabilities, selection, player_name)
+        if proxy is not None:
+            proxy_url = proxy.url
+
+    ipc_path: str | None = None
+    # El canal de control sólo se abre cuando hay una sesión de pistas
+    # viva: si el canal no expone alternativas, no hay nada que cambiar en
+    # caliente y el socket sería trabajo inútil. Con esto, una reproducción
+    # sin pistas es byte a byte la de siempre (§32).
+    if track_session is not None and (player_name or "").strip().lower() == "mpv":
+        try:
+            from thetvview.player.mpv_ipc import ipc_path as _ipc_path
+
+            ipc_path = _ipc_path()
+        except Exception:
+            avisos.append(
+                "No se pudo abrir el canal de control del reproductor: "
+                "los cambios de pista habrá que hacerlos al reabrir el canal."
+            )
+            ipc_path = None
+
+    # Los kwargs de pistas sólo se pasan si hay algo que decir. Con la
+    # llamada vacía, `player.launch()` se invoca exactamente como antes de
+    # esta funcionalidad: es la garantía de que un stream simple no cambia
+    # de camino (SDD §32).
+    extra: dict = {}
+    if selection is not None:
+        extra["selection"] = selection
+        extra["capabilities"] = capabilities
+    if proxy_url:
+        extra["proxy_url"] = proxy_url
+    if ipc_path:
+        extra["ipc_path"] = ipc_path
     try:
-        proc = player.launch(channel, player_name=player_name)
+        proc = player.launch(channel, player_name=player_name, **extra)
     except player.PlayerError as exc:
+        if proxy is not None:
+            proxy.stop()
         _error(app, str(exc))
         return
     # Push de pantalla informativa; auto-pop cuando el proceso termina (ver App.run).
@@ -2322,12 +2896,18 @@ def play_channel(  # noqa: ANN001
                     break
     except Exception:
         pass
+    if track_session is not None:
+        track_session.ipc_path = ipc_path
     app.push(NowPlayingScreen(
         app, channel, effective_name, proc,
         catchup_playback=catchup_playback,
         catchup_program=catchup_program,
+        track_session=track_session,
+        pin_proxy=proxy,
     ))
     app.prefs.set_last_player(effective_name)
+    for aviso in _avisos_sin_repetir(app, channel, effective_name, avisos):
+        app.notify_warning(aviso)
     if catchup_playback is not None:
         arch = (catchup_playback.start.astimezone().strftime("%H:%M")
                 if catchup_playback.start else "?")
@@ -2337,3 +2917,83 @@ def play_channel(  # noqa: ANN001
         )
         return
     app.status.show(f"Reproduciendo '{channel.name}' con {effective_name.upper()} (pid {proc.pid}).")
+
+
+def _avisos_sin_repetir(app, channel, player_name, avisos):  # noqa: ANN001
+    """Quita los avisos ya mostrados para este canal con este reproductor.
+
+    Los avisos de pistas son **informativos**, no preguntas: explican que una
+    elección no se va a aplicar (por ejemplo, subtítulos que el reproductor no
+    ve). Si el usuario reabre el canal con «s» y vuelve a confirmar, no hace
+    falta volver a decírselo: un aviso que se repite en cada pulsación deja
+    de leerse, y un aviso que no se lee no informa de nada.
+
+    El recuerdo es por sesión y por (canal, reproductor): cambiar de canal o
+    de reproductor vuelve a explicar, porque la situación es otra.
+    """
+    if not avisos:
+        return avisos
+    vistos = getattr(app, "_avisos_mostrados", None)
+    if vistos is None:
+        vistos = set()
+        try:
+            app._avisos_mostrados = vistos
+        except Exception:  # noqa: BLE001 - app de pruebas sin atributos
+            return avisos
+    clave_canal = (
+        getattr(channel, "tvg_id", "") or getattr(channel, "name", "") or ""
+    )
+    clave = (clave_canal, str(player_name or ""))
+    nuevos = [aviso for aviso in avisos if (clave, aviso) not in vistos]
+    vistos.update((clave, aviso) for aviso in avisos)
+    return nuevos
+
+
+def _start_pin(capabilities, selection, player_name):  # noqa: ANN001
+    """Levanta el proxy de calidad si hace falta. Devuelve (proxy, avisos).
+
+    Si la calidad es automática no hay nada que fijar y no se abre ningún
+    puerto (AC-08). Si el proxy no puede arrancar, se devuelve None y un
+    aviso: el canal se reproduce con calidad automática, que es mejor que
+    no reproducir (SDD §48).
+    """
+    from thetvview.player.track_args import track_warnings
+    from thetvview.streams.pin_proxy import PinProxyError, start_pin_proxy
+
+    avisos: list[str] = []
+    if selection is None or selection.is_default:
+        return None, avisos
+    avisos.extend(track_warnings(player_name or "", selection, capabilities))
+    if selection.auto_quality or not selection.video_track_id:
+        return None, avisos
+    try:
+        proxy = start_pin_proxy(capabilities, selection)
+    except PinProxyError as exc:
+        return None, avisos + [str(exc)]
+    if proxy is None:
+        # `start_pin_proxy` no levanta por dos motivos muy distintos y ya está
+        # explicado `track_warnings` cuando el formato no admite fijado (sólo
+        # HLS). Decirlo dos veces sería puro ruido, así que aquí sólo se avisa
+        # del otro: que el puerto no se pudo abrir.
+        from thetvview.tracks.models import puede_fijar_calidad
+
+        if puede_fijar_calidad(capabilities):
+            avisos.append(
+                "No se pudo fijar la calidad elegida; se reproduce con calidad "
+                "automática, que es lo que hace el reproductor por defecto."
+            )
+        return None, avisos
+    return proxy, avisos
+
+
+def options_kinds(options, kind: str | None = None) -> list[str]:  # noqa: ANN001
+    """Secciones visibles del selector, en orden estable.
+
+    Si `kind` viene dado (una tecla como ``a`` o ``s`` desde la pantalla de
+    reproducción), se queda sólo con esa sección: así la pantalla explica
+    *sólo* lo que el usuario ha pedido cambiar.
+    """
+    if kind:
+        disponibles = options.selectable_kinds
+        return [kind] if kind in disponibles else []
+    return list(options.selectable_kinds)

@@ -28,6 +28,8 @@ THEME_JSON: Path = DATA_DIR / "theme.json"
 PREFS_JSON: Path = DATA_DIR / "prefs.json"
 RECENTS_JSON: Path = DATA_DIR / "recents.json"
 XTREAM_CACHE_DIR: Path = DATA_DIR / "xtream_cache"
+TRACK_CACHE_DIR: Path = DATA_DIR / "track_cache"
+IPC_DIR: Path = DATA_DIR / "ipc"
 
 SUPPORTED_PLAYERS: tuple[str, ...] = ("mpv", "mplayer", "vlc")
 
@@ -181,6 +183,7 @@ def ensure_dirs() -> None:
         EPG_CACHE_DIR,
         PLAYLIST_CACHE_DIR,
         XTREAM_CACHE_DIR,
+        TRACK_CACHE_DIR,
         PREFS_JSON.parent,
         RECENTS_JSON.parent,
     ):

@@ -25,7 +25,7 @@ from thetvview.security.check import (
 class TestLosChecksPasan(unittest.TestCase):
     """El check completo es una prueba de integración en sí misma."""
 
-    def test_los_12_checks_pasan(self) -> None:
+    def test_los_checks_pasan(self) -> None:
         results = run_checks()
         keys = [r.key for r in results]
         self.assertEqual(keys, [c[0] for c in sec_check.CHECKS])
@@ -54,6 +54,7 @@ class TestLosChecksPasan(unittest.TestCase):
         self.assertEqual(labels[:10], esperados)
         self.assertIn("Zero pip dependencies", labels[10:])
         self.assertIn("Catch-up capability gate", labels[11:])
+        self.assertIn("Track discovery sandbox", labels[12:])
         self.assertEqual(len(set(c[0] for c in sec_check.CHECKS)), len(sec_check.CHECKS))
 
 
@@ -249,3 +250,70 @@ class TestIntegracionTUI(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class TestTrackDiscoverySandbox(unittest.TestCase):
+    """El check 13 (plan F7) tiene que poder ponerse rojo.
+
+    Un invariante que nadie puede romper no es un invariante: aquí se
+    comprueba que cada una de las tres reglas salta cuando se relaja.
+    """
+
+    def _con_archivo_relajado(self, ruta_rel, antes, despues):
+        """Relaja un invariante en el fichero y devuelve cómo deshacerlo.
+
+        Vacía además la caché de imports: si no, el check seguiría viendo
+        el módulo viejo ya cargado y el test no probaría nada.
+        """
+        import sys
+
+        ruta = sec_check.PACKAGE_DIR / ruta_rel
+        original = ruta.read_text(encoding="utf-8")
+        self.assertIn(antes, original)
+        modulo = "thetvview." + ruta_rel.removesuffix(".py").replace("/", ".")
+
+        def _restaurar():
+            ruta.write_text(original, encoding="utf-8")
+            sys.modules.pop(modulo, None)
+
+        self.addCleanup(_restaurar)
+        for nombre in list(sys.modules):
+            if nombre == modulo or nombre.startswith(modulo + "."):
+                sys.modules.pop(nombre, None)
+        ruta.write_text(original.replace(antes, despues), encoding="utf-8")
+
+    def test_detecta_urlopen_fuera_de_safe_http(self) -> None:
+        self._con_archivo_relajado(
+            "streams/probe.py",
+            "def probe_capabilities(",
+            "def _atajo(url):\n"
+            "    return urllib.request.urlopen(url)\n"
+            "\n\n"
+            "def probe_capabilities(",
+        )
+        with self.assertRaises(sec_check.CheckFailure) as ctx:
+            sec_check.check_track_discovery_is_sandboxed()
+        self.assertIn("safe_http", str(ctx.exception))
+
+    def test_detecta_proxy_escuchando_fuera_de_loopback(self) -> None:
+        self._con_archivo_relajado(
+            "streams/pin_proxy.py",
+            '        if host != LOOPBACK:',
+            "        if False:",
+        )
+        with self.assertRaises(sec_check.CheckFailure) as ctx:
+            sec_check.check_track_discovery_is_sandboxed()
+        self.assertIn("loopback", str(ctx.exception))
+
+    def test_detecta_clave_de_canal_sin_redactar(self) -> None:
+        self._con_archivo_relajado(
+            "tracks/prefs.py",
+            "hashlib.sha256(redact_text(url)",
+            "hashlib.sha256(url",
+        )
+        with self.assertRaises(sec_check.CheckFailure) as ctx:
+            sec_check.check_track_discovery_is_sandboxed()
+        self.assertIn("redacta", str(ctx.exception))
+
+    def test_pasa_en_verde(self) -> None:
+        self.assertIn("loopback", sec_check.check_track_discovery_is_sandboxed())

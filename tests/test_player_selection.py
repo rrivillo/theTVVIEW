@@ -14,6 +14,13 @@ from pathlib import Path
 from unittest import mock
 
 from thetvview.models import Channel
+from thetvview.tracks.models import (
+    PROTO_HLS,
+    TEXT,
+    MediaCapabilities,
+    MediaTrack,
+    PlaybackSelection,
+)
 from thetvview.ui import app as ui_app
 from thetvview.ui.screens import PlayerScreen, play_channel
 
@@ -45,12 +52,17 @@ class _StubApp:
         self.prefs = _PrefsStub()
         self.stack: list = []
         self.epg = None  # sin EPG cargado
+        #: Avisos que se han pedido ver (lo que abriría un modal).
+        self.avisos: list[str] = []
 
     def body_height(self) -> int:
         return 10
 
     def push(self, screen) -> None:
         self.stack.append(screen)
+
+    def notify_warning(self, message: str) -> None:
+        self.avisos.append(message)
 
 
 ENTER = 10
@@ -114,6 +126,73 @@ class TestPlayChannel(unittest.TestCase):
             play_channel(stub, ch())
         self.assertIsNone(launch.call_args.kwargs.get("player_name"))
         self.assertEqual(len(stub.stack), 1)
+
+
+class TestSubtitulosSinModalAlReproducir(unittest.TestCase):
+    """Elegir subtítulos y lanzar **no** debe interrumpir con un modal.
+
+    La explicación de los subtítulos va ahora en la pantalla de pistas, antes
+    de elegir. Al reproducir, un canal con subtítulos elegidos debe abrir el
+    reproductor sin decir nada.
+    """
+
+    def _caps(self, uri: str | None = "https://cdn/es.m3u8"):
+        return MediaCapabilities(
+            subtitle_tracks=[
+                MediaTrack(id="s1", type=TEXT, language="es", uri=uri),
+                MediaTrack(id="s2", type=TEXT, language="en", uri=uri),
+            ],
+            protocol=PROTO_HLS,
+        )
+
+    def _abrir(self, stub, reproductor="mpv", uri="https://cdn/es.m3u8"):
+        sel = PlaybackSelection(
+            subtitle_track_id="s2", subtitles_enabled=True, subtitles_decided=True
+        )
+        proc = mock.Mock(pid=99)
+        proc.poll.return_value = None
+        with mock.patch("thetvview.player.launch", return_value=proc):
+            play_channel(stub, ch(), player_name=reproductor, selection=sel,
+                         capabilities=self._caps(uri=uri))
+        return stub.avisos
+
+    def test_mpv_no_interrumpe_al_reproducir(self) -> None:
+        self.assertEqual(self._abrir(_StubApp(), "mpv"), [])
+
+    def test_tampoco_con_vlc_ni_mplayer(self) -> None:
+        for reproductor in ("vlc", "mplayer"):
+            with self.subTest(reproductor=reproductor):
+                self.assertEqual(self._abrir(_StubApp(), reproductor), [])
+
+    def test_subtitulos_incrustados_tampoco(self) -> None:
+        self.assertEqual(self._abrir(_StubApp(), "mpv", uri=None), [])
+
+    def test_la_calidad_sigue_avisando_cuando_no_se_puede_fijar(self) -> None:
+        # El aviso de calidad se queda: ese sí es algo que no se va a aplicar.
+        from thetvview.streams.dash import parse_dash
+
+        dash = parse_dash(
+            '<?xml version="1.0"?>'
+            '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"'
+            ' mediaPresentationDuration="PT10S" minBufferTime="PT2S"><Period>'
+            '<AdaptationSet mimeType="video/mp4" segmentAlignment="true">'
+            '<Representation id="v1" bandwidth="800000" width="640" height="360">'
+            '<SegmentTemplate media="v1-$Number$.m4s" initialization="v1i.m4s"/>'
+            '</Representation>'
+            '<Representation id="v2" bandwidth="3000000" width="1280" height="720">'
+            '<SegmentTemplate media="v2-$Number$.m4s" initialization="v2i.m4s"/>'
+            '</Representation></AdaptationSet></Period></MPD>',
+            final_url="https://e.test/v/manifest.mpd",
+        )
+        stub = _StubApp()
+        sel = PlaybackSelection(video_track_id="v720", auto_quality=False)
+        proc = mock.Mock(pid=99)
+        proc.poll.return_value = None
+        with mock.patch("thetvview.player.launch", return_value=proc):
+            play_channel(stub, ch(), player_name="mpv", selection=sel,
+                         capabilities=dash)
+        self.assertEqual(len(stub.avisos), 1)
+        self.assertIn("calidad automática", stub.avisos[0])
 
 
 class TestAppActions(unittest.TestCase):
