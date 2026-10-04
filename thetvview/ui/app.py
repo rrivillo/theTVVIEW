@@ -19,6 +19,7 @@ from thetvview import resolutions
 from thetvview.epg_parser import Epg, load_url, parse_file, resolve_source
 from thetvview.favorites import FavoritesError, FavoritesManager
 from thetvview.models import Channel, Playlist, Program
+from thetvview.platform_check import OS_WINDOWS, detect_os
 from thetvview.playlist_manager import PlaylistError, PlaylistManager
 from thetvview.prefs import PrefsManager
 from thetvview.recents import RecentsManager
@@ -211,7 +212,27 @@ def prompt_password(stdscr: curses.window, status: StatusBar, label: str) -> str
 #   3. al agotarse el tiempo se sigue el camino de siempre y el sondeo
 #      sigue en segundo plano, así que las opciones aparecen después desde
 #      "Reproduciendo" (teclas a/s/v).
-TRACK_WAIT_SECONDS: float = 2.5
+#
+# El tope **depende del sistema** porque el tiempo de respuesta del primer
+# sondeo no es el mismo en todos: en Windows la primera petición paga el
+# resolver de DNS del sistema (que reintenta y prueba IPv6), el handshake de
+# TLS y la lectura de la configuración de proxy del registro, y el manifiesto
+# llegaba sistemáticamente después de los 2,5 s. Con un tope corto allí, el
+# orden se invertía: se elegía reproductor, aparecían las pistas detrás y
+# había que elegir reproductor **otra vez**. Más espera en Windows y la misma
+# espera de siempre en Linux/macOS: el orden pedido es el mismo en todas las
+# plataformas, sólo cambia cuánto se le concede al proveedor.
+TRACK_WAIT_SECONDS: float = 4.0 if detect_os() == OS_WINDOWS else 2.5
+
+# Margen **extra**, y sólo el justo, para el caso en que el usuario ya ha
+# elegido reproductor y el sondeo *sigue en marcha*. Es la segunda red del
+# orden pedido: si la primera espera no alcanzó, todavía se le concede este
+# margen antes de lanzar. Sin él, con un sondeo lento (o un equipo lento)
+# las pistas aparecían *después* del selector de reproductor.
+#
+# Sigue siendo una espera acotada y con su pantalla explicativa, y no
+# bloquea un canal sin manifiesto (eso lo decide `wait_settles`).
+TRACK_LATE_WAIT_SECONDS: float = 4.0 if detect_os() == OS_WINDOWS else 2.5
 
 # --- Ayuda -------------------------------------------------------------------
 # Estilos de línea usados por build_help_lines(): "section" (encabezado),
@@ -333,10 +354,12 @@ _HELP_HERE: dict[str, list[tuple[str, str]]] = {
         ("key", "0  volver a Automático o a Desactivados."),
         ("key", "Enter  confirmar y pasar a elegir reproductor."),
         ("key", "m  recordar esta elección para este canal."),
-        ("tip", "Puedes marcar varias: por ejemplo subtítulos y una calidad, "
-                "y luego Enter."),
-        ("tip", "El asterisco marca lo que has elegido tú, para revisarlo "
-                "antes de confirmar."),
+        ("tip", "Si llegaste aquí con el reproductor ya elegido (el análisis "
+                "tardó), Enter reproduce con él: no te lo vuelven a pedir."),
+        ("tip", "Puedes marcar una de cada sección: por ejemplo un subtítulo "
+                "y una calidad, y luego Enter."),
+        ("tip", "El asterisco es una sola marca por lista: si marcas otra "
+                "opción, la anterior se desmarca."),
         ("tip", "Sólo aparecen las secciones con más de una opción."),
     ],
 }
@@ -1666,6 +1689,10 @@ class App:
         llegan a aparecer: el orden era el equivocado. El tope es corto y hay
         una pantalla que lo explica, así que el coste nunca es un cuelgue
         silencioso.
+
+        Idempotente y sin efectos aparte de esperar: si el sondeo ya
+        respondió, o el canal no puede tener manifiesto, no hace nada. Eso la
+        deja ser segura de llamar en cualquier momento del flujo.
         """
         if not session.wait_settles or wait <= 0:
             return
@@ -1685,6 +1712,36 @@ class App:
             stdscr.refresh()
         except Exception:
             pass
+
+    def _await_tracks_late(self, session, channel: Channel) -> None:  # noqa: ANN001
+        """Espera corta de cortesía si el sondeo seguía en marcha.
+
+        Se usa en un único sitio: cuando el usuario **pulsa Enter en el
+        selector de reproductor** y las pistas todavía no se han podido
+        ofrecer. Si el sondeo sigue vivo se le concede un margen más
+        (acotado, y sólo si el canal puede tener manifiesto) antes de
+        renunciar a preguntar por el audio, los subtítulos y la calidad.
+
+        Por qué hace falta: con sólo la primera espera, en un equipo lento el
+        orden se rompía —el reproductor se elegía primero y las pistas
+        aparecían después—, y al confirmar esas pistas había que elegir
+        reproductor otra vez. Es un problema de cronología, no de SO: se ve
+        en Windows porque allí el primer sondeo tarda más (DNS, TLS y la
+        lectura del proxy del sistema), pero puede pasar en cualquier
+        plataforma con un proveedor lento.
+        """
+        if session is None or getattr(session, "channel", None) != channel:
+            return
+        if not getattr(session, "pending", False):
+            return  # ya respondió: no hay nada que esperar
+        self._await_tracks(session, TRACK_LATE_WAIT_SECONDS)
+
+    def _reproduccion_en_curso(self) -> bool:
+        """True si hay un canal abierto en un reproductor externo ahora mismo."""
+        return any(
+            isinstance(screen, NowPlayingScreen)
+            for screen in getattr(self, "stack", [])
+        )
 
     def track_capabilities(self):  # noqa: ANN201
         session = self.track_session
@@ -2023,10 +2080,13 @@ class App:
                 # el sondeo terminó tarde y aquí es la primera oportunidad),
                 # se le ofrece ahora antes de lanzar: es el único sitio
                 # donde todos los reproductores hacen lo mismo.
-                if not ya_elegido and self.maybe_open_track_options(
-                    channel, player_name
-                ):
-                    return
+                if not ya_elegido:
+                    # Antes de renunciar a las pistas se les concede un
+                    # margen corto si el sondeo sigue en marcha: es lo que
+                    # evita que el orden se invierta en equipos lentos.
+                    self._await_tracks_late(session, channel)
+                    if self.maybe_open_track_options(channel, player_name):
+                        return
                 play_channel(
                     self,
                     channel,
@@ -2042,6 +2102,21 @@ class App:
                     # Marca de que la elección ya está hecha: al elegir
                     # reproductor no se vuelve a preguntar.
                     session.chosen = True
+                player_name = action.get("player_name")
+                if player_name and not self._reproduccion_en_curso():
+                    # Esta pantalla se abrió con un reproductor ya elegido:
+                    # el sondeo llegó tarde y las pistas se ofreció justo al
+                    # confirmar el reproductor. Se reproduce con el que se
+                    # eligió; volver a preguntar era hacer elegir al usuario
+                    # dos veces lo mismo.
+                    self.handle_action(
+                        {
+                            "action": "play_with",
+                            "channel": channel,
+                            "player_name": player_name,
+                        }
+                    )
+                    return
                 self.push_player_screen(channel)
             case "play_with_selection":
                 play_channel(

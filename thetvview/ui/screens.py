@@ -1473,7 +1473,10 @@ class TrackOptionsScreen(Screen):
     - **``0`` devuelve a Automático/Desactivados** de la sección actual;
       ``Enter`` confirma y devuelve el control al App, que a continuación
       muestra el selector de reproductor (pistas primero, reproductor
-      después).
+      después). Si el reproductor **ya estaba elegido** —este selector se
+      abrió después, porque el sondeo del canal llegó tarde—, ``Enter``
+      reproduce directamente con él: preguntarlo otra vez obligaba al
+      usuario a elegir dos veces lo mismo.
     """
 
     def __init__(  # noqa: ANN001
@@ -1601,14 +1604,23 @@ class TrackOptionsScreen(Screen):
         self._focus(prefer_kind=kind)
 
     def _marcar(self) -> None:
-        """Fija la opción del cursor y la marca con un asterisco.
+        """Marca **una sola** opción por lista: la del cursor.
 
-        Para qué, si el cursor ya aplica: al moverse se va aplicando todo lo
-        que pasa por debajo, y al final no hay forma de distinguir "esto lo
-        elegí yo" de "esto es lo que ya venía". Con `Espacio` la elección se
-        hace **a conciencia** y queda señalada, de modo que se pueden Elegir
-        varias cosas —subtítulos y calidad, por ejemplo— y revisarlas antes de
-        `Enter`.
+        El asterisco es una elección única, como en un selector de archivos:
+        dentro de una lista no puede haber dos cosas marcadas a la vez. Si
+        marcas 360p y luego 720p, el asterisco **se mueve**: 360p lo pierde y
+        720p lo gana, porque lo que has dicho es "720p", no "360p y 720p".
+
+        El motivo de que el asterisco exista, siendo que el cursor ya aplica al
+        moverse: al recorrer la lista se va aplicando todo lo que pasa por
+        debajo, y sin una marca fija no hay forma de distinguir "esto lo elegí
+        yo" de "esto es lo que ya venía". `Espacio` es el gesto de elegir a
+        conciencia; el asterisco dice dónde quedó la decisión.
+
+        Que sea **una por lista** y no una en toda la pantalla es a propósito:
+        cada sección es una lista con su propia pregunta (audio, subtítulos,
+        calidad) y se pueden contestar varias —elegir un subtítulo *y* una
+        calidad— sin que una marca pise a la otra.
 
         `0` quita la marca de la sección al volver a Automático/Desactivados:
         esa opción no es una elección del usuario, es el valor por defecto.
@@ -1618,13 +1630,13 @@ class TrackOptionsScreen(Screen):
         if kind is None or choice is None:
             return
         self._aplicar(kind, choice.id)
+        # Radio: se cae lo que hubiera en ESTA lista antes de poner lo nuevo.
+        self.marcados = {(k, c) for k, c in self.marcados if k != kind}
         self.marcados.add((kind, choice.id))
 
-    @property
-    def _esta_marcada(self) -> bool:
-        kind = self._section_of(self.selected)
-        choice = self.selected_choice
-        return bool(kind and choice and (kind, choice.id) in self.marcados)
+    def marcas_de(self, kind: str) -> list[str]:
+        """Ids marcados de una sección. Nunca más de uno: es un radio."""
+        return [c for k, c in self.marcados if k == kind]
 
     def _ultima_de_seccion(self, indice: int) -> bool:
         """True si la opción `indice` es la última de su sección.
@@ -1686,15 +1698,24 @@ class TrackOptionsScreen(Screen):
         # Se devuelve al App con la selección ya aplicada en la sesión; a
         # partir de aquí sigue el selector de reproductor (pistas primero,
         # reproductor después).
+        #
+        # `player_name` viaja en la acción a propósito: si esta pantalla se
+        # abrió con un reproductor ya elegido (el sondeo llegó tarde y las
+        # pistas se ofrecen al confirmar el reproductor), el App reproduce
+        # con él en vez de volver a preguntar. Sin esto, el usuario elegía
+        # reproductor, veía las pistas y tenía que elegir reproductor otra
+        # vez para que la elección contara.
         return {
             "action": "tracks_choose_player",
             "channel": self.channel,
+            "player_name": self.player_name,
             "selection": self.session.selection,
         }
 
     def shortcuts(self) -> str:
+        confirmar = "Enter ▶ ver" if self.player_name else "Enter ▶ reproductor"
         return ("↑/↓ elegir · Tab sección · Espacio marcar * · 0 Automático · "
-                "Enter ▶ reproductor · m Recordar · ? Ayuda · Esc ←")
+                f"{confirmar} · m Recordar · ? Ayuda · Esc ←")
 
     def handle_key(self, key: int) -> dict | None:
         kind = self._section_of(self.selected)
@@ -1750,6 +1771,17 @@ class TrackOptionsScreen(Screen):
         if not self.kinds:
             from .widgets import EmptyState
 
+            if pendientes:
+                # Sin esto se diría "no hay nada que elegir" mientras el
+                # manifiesto sigue en camino: es exactamente la confusión que
+                # hace que un canal lento parezca un canal sin pistas.
+                EmptyState.render(
+                    stdscr, max_y // 2, max_x,
+                    "Analizando las pistas del canal…",
+                    "En cuanto el proveedor conteste verás aquí el audio, los "
+                    "subtítulos y la calidad que publica",
+                )
+                return
             EmptyState.render(
                 stdscr, max_y // 2, max_x,
                 "Este canal no ofrece pistas que elegir.",

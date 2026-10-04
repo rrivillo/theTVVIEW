@@ -147,8 +147,16 @@ class TrackSession:
         descubrir, así que **no** se espera ni un milisegundo. Sólo cuando la
         dirección apunta a un manifiesto (o el proveedor ya nos devolvió uno
         para ese mismo stream) tiene sentido Spendir unos segundos.
+
+        También entra el caso "el sondeo ya terminó": si respondió, la espera
+        pendiente es cero, pero la propiedad tiene que ser ``True`` para que
+        el flujo pueda distinguir "no hay nada que descubrir" de "todavía no
+        se sabe". Sin esto, el orden pistas → reproductor se rompía en
+        cuanto el sondeo acababa justo después de la primera espera: el
+        selector de pistas se saltaba y el usuario tenía que elegir
+        reproductor, ver las pistas y elegir reproductor otra vez.
         """
-        if self.answered and self.capabilities is not None:
+        if self.answered:
             return True
         return _url_may_be_manifest(self._probe_url() or "")
 

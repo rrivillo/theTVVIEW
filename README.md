@@ -35,7 +35,7 @@ ver y con qué reproductor.
 - Python 3.13 o superior.
 - Al menos un reproductor: `mpv`, `mplayer` o `vlc`.
 - Entorno virtual recomendado (el proyecto usa `.env/`).
-- Terminal con al menos **40 × 10** caracteres y, idealmente, 256 colores.
+- Terminal con al menos **40 columnas × 10 filas** y, idealmente, 256 colores.
 - **Windows**: `pip install windows-curses` (único extra y solo ahí) porque el
   Python oficial no incluye `curses`. Si falta, el programa lo avisa al arrancar.
 
@@ -132,7 +132,12 @@ Listas ──Enter──▶ Canales ──Enter──▶ [Pistas] ──▶ Repr
   │                  ├── f  favoritos   │ publica algo, │               │
   │                  ├── e  guía EPG    │ y sólo tras   │               │
   │                  └── p  reproductor │ ⏱ máx 2,5 s   │               │
-  │                                     │               │               │
+  │                                     │ (4 s en Win)  │               │
+  │                                     │ (+ el mismo   │               │
+  │                                     │  margen si el │               │
+  │                                     │  análisis     │               │
+  │                                     │  sigue en     │               │
+  │                                     │  marcha)      │               │
   ├── a añadir · d borrar · u deshacer   └── Esc ← vuelve en cualquier punto
   └── f favoritos · C contraseña Listas Especiales X
 ```
@@ -140,7 +145,10 @@ Listas ──Enter──▶ Canales ──Enter──▶ [Pistas] ──▶ Repr
 Lo de `[Pistas]` antes que `[Reproductor]` es deliberado: el reproductor no
 cambia qué pistas publica el canal, así que preguntarlo primero sería preguntar
 por algo que no depende de tu elección. Cuando el proveedor no publica
-alternativas, ese paso no aparece y se va directo al reproductor.
+alternativas, ese paso no aparece y se va directo al reproductor. Y si el
+análisis llega tarde y las pistas se ofrecen al confirmar el reproductor,
+`Enter` en esa pantalla **reproduce directamente** con el reproductor ya
+elegido: nunca te hacen elegirlo dos veces.
 
 ### Navegación (común a casi todas las pantallas)
 
@@ -151,6 +159,10 @@ alternativas, ese paso no aparece y se va directo al reproductor.
 | `Inicio` / `Fin` o `g` / `G` | Primero o último elemento. |
 | `Enter` | Abrir lo seleccionado. |
 | `Esc` / `Retroceso` | Volver a la pantalla anterior. |
+
+Un aviso sobre `g`: en **Canales** `g` no es "ir al principio" sino abrir los
+**grupos**, así que para el principio está `Inicio`. En el resto de pantallas de
+lista (`g` = primero, `G` = último) sí se cumple.
 
 En las búsquedas (`/`): `Enter` confirma el filtro, `Esc` lo limpia y
 `Ctrl-U` vacía lo escrito sin cerrar el campo.
@@ -181,6 +193,9 @@ Las Listas Especiales X se resaltan en púrpura; las M3U en amarillo.
 | `p` | Elegir reproductor para el canal. |
 | `R` / `F5` | Actualizar la lista desde su origen. |
 
+`g` sólo abre la pantalla de grupos si la lista tiene **dos o más**: con cero
+o un grupo no hay nada que elegir y te lo dice en la barra de estado.
+
 El título muestra el nombre de la lista, el grupo (sólo cuando estás dentro
 de uno), los canales visibles/totales y un `★` si esa lista tiene favoritos.
 Los canales de radio se marcan con `♪`. A partir de 70 columnas (y de 80
@@ -196,9 +211,10 @@ si el EPG está cargado.
 | **Favoritos** | `Enter` reproducir · `f` quitar · `p` reproductor |
 | **Recientes** | `Enter` volver a ver · `f` guardar en favoritos · `r` borrar historial |
 
-Los canales sin `group-title` se agrupan al final como `(sin grupo)`. El
-catálogo y la pantalla de grupos muestran tarjetas en rejilla: 1 columna por
-defecto, 2 a partir de 100 caracteres de ancho y 3 a partir de 150.
+Los canales sin `group-title` se agrupan al final como `(sin grupo)`, y los
+grupos salen siempre ordenados por nombre. El catálogo y la pantalla de grupos
+muestran tarjetas en rejilla: 1 columna por defecto y 2 a partir de 100
+caracteres de ancho; el catálogo añade una tercera columna a partir de 150.
 
 ### Calidad y reproductor
 
@@ -244,16 +260,36 @@ siempre.
 - **El cursor aplica, el asterisco distingue.** Moverse con `↑`/`↓` va
   aplicando lo que pasa por debajo, así que sin nada más no habría forma
   de separar *"esto ya venía así"* de *"esto lo he elegido yo"*. `Espacio`
-  marca la opción del cursor con un `*` y permite marcar **varias** cosas
-  (subtítulos *y* calidad) para revisarlas antes de `Enter`; `0` quita la
-  marca de la sección, porque volver a `Automático` no es elegir. El
-  asterisco vive en la pantalla, no en las preferencias: al salir se borra.
+  marca la opción del cursor con un `*`.
+- **El asterisco es una sola marca por lista**, como en un selector de
+  archivos: marcas `360p`, luego `720p`, y el asterisco **se mueve** — `360p`
+  lo pierde — porque lo que has dicho es "720p", no las dos. Como cada sección
+  es una lista con su propia pregunta (audio, subtítulos, calidad), sí se
+  puede marcar **una de cada una** (un subtítulo *y* una calidad) sin que una
+  pise a la otra. `0` quita la marca de la sección, porque volver a
+  `Automático` no es elegir. El asterisco vive en la pantalla, no en las
+  preferencias: al salir se borra.
 - **La espera está acotada y se explica**: como el manifiesto se descarga en
-  segundo plano, al abrir el canal se espera **como máximo 2,5 s** —y sólo si
-  el canal puede tener manifiesto; un `.ts` no espera— con una pantalla de
-  "Analizando pistas del canal…". Si no llega a tiempo, se sigue el camino de
-  siempre y las opciones aparecen igualmente después, desde
-  `Reproduciendo` con las teclas `a`/`s`/`v`.
+  segundo plano, al abrir el canal se espera **como máximo 2,5 s** (4 s en
+  Windows, donde la primera petición tarda más: resolver de DNS del sistema,
+  handshake de TLS y configuración de proxy del registro) —y sólo si el canal
+  puede tener manifiesto; un `.ts` no espera— con una pantalla de "Analizando
+  las pistas del canal…". **Un sondeo todavía en marcha nunca se confunde con
+  "este canal no tiene pistas"**: mientras la petición sigue viva, la pantalla
+  dice que está esperando, aunque todavía no haya nada que pintar. Antes ese
+  estado se pintaba como un canal sin pistas y volvía solo, sin explicación.
+  Si el análisis **todavía** sigue en marcha en el momento de confirmar el
+  reproductor, se concede un **margen corto más** (el mismo tope, con su propio
+  aviso) antes de lanzar: es lo que mantiene el orden `pistas → reproductor` en
+  equipos lentos o con proveedores que tardan, donde antes las pistas aparecían
+  después del reproductor y había que elegirlo **dos veces**. Si ni así llega,
+  se sigue el camino de siempre y las opciones aparecen igualmente después,
+  desde `Reproduciendo` con las teclas `a`/`s`/`v`. Cuando el reproductor ya
+  está elegido y se confirman las pistas, la reproducción arranca directamente
+  con él: no se vuelve a preguntar. La espera es siempre la misma y sólo ocurre
+  si la URL puede ser un manifiesto; los `--audio`/`--subtitles`/`--quality` de
+  arranque fijan la pista pero **no** la evitan, porque para saber qué pista es
+  "la de español" o "la de 720p" hay que leer el manifiesto igualmente.
 - **La app se identifica ante el proveedor** con su propio `User-Agent`
   (`theTVVIEW/1.0`), también cuando lanza el reproductor. No es un detalle:
   hay CDNs que responden **403 a cualquier** User-Agent de reproductor (mpv,
@@ -273,10 +309,12 @@ siempre.
   funciona. Se muestra **una sola vez por canal y reproductor**: no es algo que
   haya que confirmar cada vez que reabres el canal con `s`.
 - **La preferencia manda al entrar**: idioma exacto → idioma base → etiqueta →
-  `DEFAULT` del stream → primera disponible. Se puede guardar por canal, por
-  lista o global, con esa misma precedencia. En `prefs.json` no se guarda
-  nunca la URL del canal: la clave es el `tvg-id` o el hash de la URL **ya
-  redactada**.
+  `DEFAULT` del stream → primera disponible. Los ámbitos del formato son canal →
+  proveedor (el host de la lista) → global, y se leen en ese orden; la tecla
+  `m` de la pantalla de pistas es la que **escribe el de canal** (lo que has
+  elegido ahí se aplica a ese canal la próxima vez). En `prefs.json` no se
+  guarda nunca la URL del canal: la clave es el `tvg-id` o el hash de la URL
+  **ya redactada**.
 - **Cambiar en caliente**: con `mpv` el cambio se aplica al instante por su
   canal de control (IPC local); con `vlc` y `mplayer` no es posible y la app
   lo dice en un modal. Desde `Reproduciendo`, las teclas `a` (audio), `s`
@@ -442,9 +480,14 @@ está en otra ventana) con:
   pide un XMLTV: ruta local (`.xml`/`.xmltv` o `.gz`) o URL `http(s)`,
   con el de la cabecera como valor por defecto.
 - La correspondencia se busca por `tvg-id` y, si no aparece, por `tvg-name`
-  (o por el nombre del canal) contra los `<channel>` del XMLTV.
+  (o por el nombre del canal) contra los `<channel>` del XMLTV, comparando el
+  `display-name` **exacto** y sin distinguir mayúsculas. No hay búsqueda
+  parcial: si el XMLTV llama al canal de otra forma, no hay correspondencia.
 - `●` marca el programa que se está emitiendo ahora.
 - `r` fuerza la recarga (en URLs re-descarga; en ficheros re-lee).
+- Si pulsas `e` mientras el EPG de la lista **sigue descargándose**, la app
+  espera a que termine (hasta 60 s) en vez de preguntarte una ruta que ya le
+  van a volver; si se agota, te avisa y te deja elegir.
 - Las URLs se cachean con TTL de 12 h; una fuente que acaba de fallar no se
   reintenta antes de 5 minutos.
 - En **Listas Especiales X** la guía se pide igual que en el resto: un XMLTV
@@ -520,9 +563,9 @@ En la pantalla `Audio y calidad` (la que sale antes del reproductor):
 | --- | --- |
 | `↑` / `↓` | Moverse por las opciones de la sección (el cursor **es** la selección). |
 | `←` / `→` / `Tab` | Saltar de sección (audio, subtítulos, calidad). |
-| `Espacio` | Marcar con `*` la opción del cursor. Se pueden marcar varias. |
+| `Espacio` | Marcar con `*` la opción del cursor. Una marca por sección: al marcar otra, el `*` se mueve. |
 | `0` | Volver a `Automático` / `Desactivados` y quitar la marca de la sección. |
-| `Enter` | Confirmar y pasar a elegir reproductor. |
+| `Enter` | Confirmar y pasar a elegir reproductor (o reproducir directamente, si el reproductor ya estaba elegido). |
 | `m` | Recordar esta elección para este canal. |
 
 Junto a la lista de subtítulos aparece, cuando aplica, una nota que dice
@@ -545,7 +588,10 @@ de reproductor sólo tiene sentido si aún no se ha lanzado nada.
 - Las claves con guion se normalizan a guion bajo (`catchup_days`), y los
   atributos no reconocidos se guardan tal cual, por si acaso.
 - Si la cabecera `#EXTM3U` declara EPG (`x-tvg-url`, `url-tvg`, `tvg-url`,
-  incluso sin comillas), se resuelve y se carga en segundo plano.
+  `x-url-tvg`, `x-epg-url`, `epg-url`; incluso sin comillas, y una o varias
+  fuentes), se resuelve —URLs http(s) tal cual, rutas relativas contra el
+  directorio del fichero o contra la URL de la lista— y se carga en segundo
+  plano.
 
 ### Listas Especiales X
 
@@ -570,7 +616,11 @@ de reproductor sólo tiene sentido si aún no se ha lanzado nada.
 
 Las listas grandes (decenas de miles de canales) se abren rápido gracias a
 tres mecanismos: caché en disco con TTL, caché en memoria por sesión y carga
-del catálogo en un hilo aparte (`warm_catalog`) que no bloquea la UI.
+del catálogo en un hilo aparte (`warm_catalog`) que no bloquea la UI. Esa carga
+previa se hace **por listas de una en una y en segundo plano** (para no
+machacar al proveedor con descargas en paralelo), y **no incluye las Listas
+Especiales X**: necesitan credenciales, así que sólo se abren cuando tú las
+abres.
 
 | Qué | Dónde | Vigencia | Timeout |
 | --- | --- | --- | --- |
@@ -607,7 +657,7 @@ Todo lo persistido vive en `data/` (está en `.gitignore`):
 | `playlists.json` | Catálogo de listas: nombre, origen, tipo y (en Listas Especiales X) servidor y usuario. **Nunca** incluye contraseñas; permisos `0600`. |
 | `favorites.json` | Canales favoritos (identidad = `url`). |
 | `recents.json` | Últimos 20 elementos reproducidos (con la URL redactada si traía credenciales). |
-| `prefs.json` | Último reproductor usado, criterio de orden de grupos, tema y preferencias de pistas (audio, subtítulos, calidad), con la misma precedencia canal → lista → global. |
+| `prefs.json` | Último reproductor usado, tema y preferencias de pistas (audio, subtítulos, calidad), con la precedencia canal → proveedor → global. También guarda `last_group_sort` y `ask_track_options`, que la TUI todavía no cambia desde los menús (los grupos salen siempre por nombre y `(sin grupo)` al final). |
 | `theme.json` | Tema claro/oscuro. |
 | `epg_cache/` | XMLTV descargados. |
 | `playlist_cache/` | Playlists M3U descargadas. |
@@ -622,14 +672,15 @@ empezar de cero, borra la carpeta `data/` (se recrea sola).
 `prefs.json` es también el único sitio donde viven las preferencias de
 pistas, y sus claves nunca son la URL del canal: son `tvg:…`, `channel:<hash
 de la URL redactada>` o `provider:<host>`. Es la misma regla que en el resto
-de la app: al disco sólo llegan datos sin credenciales.
+de la app: al disco sólo llegan datos sin credenciales. Del hash se conservan
+32 caracteres: es un identificador estable, no un secreto.
 
 ---
 
 ## Tests
 
 ```bash
-# Suite completa (~1590 tests, ~2 min)
+# Suite completa (1600 tests, ~2 min)
 python -m unittest -v
 
 # Solo tests de una parte
@@ -691,7 +742,7 @@ thetvview/
 │   ├── language.py     # es/es-ES/spa/Spanish/Español → es + etiqueta
 │   ├── labels.py       # etiquetas de audio, subtítulos y vídeo
 │   ├── manager.py      # qué se ofrece y por qué; reconciliación
-│   ├── prefs.py        # preferencias por canal / lista / global
+│   ├── prefs.py        # preferencias por canal / proveedor / global
 │   ├── cli.py          # --audio / --subtitles / --quality de una sesión
 │   └── survey.py       # python -m thetvview.tracks.survey (encuesta)
 ├── player/             # backend: qué sabe hacer cada reproductor
@@ -756,16 +807,18 @@ degradando en silencio.
 | *Sin guía en Listas Especiales X* | La TUI todavía pide un XMLTV para la parrilla (el EPG del panel no se consulta): indica una ruta local o una URL al abrir la guía. |
 | *Sin archivo (catch-up)* | El proveedor no lo declara para ese canal: revisa que traiga `tv_archive` **y** `tv_archive_duration`, o `catchup` + `catchup-days` + `catchup-source` en el `#EXTINF`. |
 | *Lista vacía* | Revisa que el fichero tenga canales; los `.ts` también valen. |
-| *Ventana demasiado pequeña* | Agranda la terminal (mínimo 40 × 10). |
+| *Ventana demasiado pequeña* | Agranda la terminal: el mínimo son 40 columnas × 10 filas, y la app lo dice con las medidas actuales. |
 | *Una URL no responde* | Espera al TTL o fuerza recarga con `R`; si hay caché previa se usa esa. |
 | *Bloqueada por red privada* | Es una IP de LAN, loopback o metadatos: confirma la excepción **por lista** al añadirla, o usa una fuente pública. |
 | *Contraseña de Listas Especiales X cambiada en el servidor* | `C` en el catálogo para actualizarla. |
 | *La contraseña no se recuerda entre sesiones* | No hay keyring del sistema disponible; en ese caso la app sólo la guarda en memoria. |
 | *Colores raros* | Se usan 256 colores si existen y 8 si no; `NO_COLOR=1` los desactiva por completo. |
 | *No me aparece el menú de audio o calidad* | Lo más probable es que el proveedor no lo publique. La encuesta (`python -m thetvview.tracks.survey`) distingue por qué: una sola pista, MPEG-TS, 403, 404 o timeout. No ofrecer nada ahí es lo correcto. |
+| *El menú de pistas no aparece aunque antes sí* | El master en vivo cambió: se guardan 15 minutos las variantes ya retiradas, y la caché en memoria vive 60 s. `i` desde `Reproduciendo` vuelve a analizarlo ahora. |
+| *`g` no abre los grupos* | La lista necesita **dos o más** grupos: con cero o uno no hay nada que elegir y la app lo dice en la barra de estado. |
 | *El canal se ve pero no oigo* | Pasó al elegir calidad: revisa si el proxy quedó levantado con un master sin su grupo de audio. `i` desde `Reproduciendo` vuelve a analizar el manifiesto. |
 | *Los subtítulos no aparecen con MPV* | Es una limitación del demuxer HLS de ffmpeg, no de la app: los declarados como pista aparte (`EXT-X-MEDIA TYPE=SUBTITLES`) no los expone. Con VLC funcionan. |
-| *La app tarda un poco al abrir un canal* | Son los 2,5 s de espera acotada del sondeo de manifiesto, y sólo en canales que pueden tenerlo. Con `i` o con `--audio`/`--quality` de arranque se evita. |
+| *La app tarda un poco al abrir un canal* | Son los 2,5 s de espera acotada del sondeo de manifiesto (4 s en Windows), y sólo en canales cuya URL puede ser un manifiesto: un `.ts` no espera. Es una espera con su pantalla explicando qué pasa, y durante ella la interfaz sigue viva. |
 | *¿De dónde salen los datos?* | Borra `data/` para reiniciar de cero. |
 
 ---

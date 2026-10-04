@@ -331,15 +331,26 @@ class TestNavegacion(unittest.TestCase):
 class TestAcciones(unittest.TestCase):
     def test_enter_confirma_y_sigue_al_reproductor(self) -> None:
         # Orden pedido: pistas primero, reproductor después. Enter devuelve
-        # el control al App, que ya tiene la selección aplicada.
-        pantalla, _ = _pantalla(caps_multi())
+        # el control al App, que ya tiene la selección aplicada y todavía no
+        # sabe con qué reproductor se va a ver: por eso no viaja ninguno.
+        pantalla, _ = _pantalla(caps_multi(), player=None)
         pantalla.handle_key(DOWN)  # Español (el primero)
         pantalla.handle_key(DOWN)  # English
         accion = pantalla.handle_key(ENTER)
         self.assertIsNotNone(accion)
         self.assertEqual(accion["action"], "tracks_choose_player")
         self.assertEqual(accion["selection"].audio_track_id, "a2")
-        self.assertNotIn("player_name", accion)
+        self.assertIsNone(accion["player_name"])
+
+    def test_enter_conserva_el_reproductor_ya_elegido(self) -> None:
+        # Esta pantalla también se abre *después* del reproductor, cuando el
+        # sondeo del canal llegó tarde. Si el Enter no lleva el reproductor
+        # consigo, el App no tiene más remedio que volver a preguntarlo: el
+        # usuario elige dos veces lo mismo.
+        pantalla, _ = _pantalla(caps_multi(), player="mpv")
+        accion = pantalla.handle_key(ENTER)
+        self.assertEqual(accion["action"], "tracks_choose_player")
+        self.assertEqual(accion["player_name"], "mpv")
 
     def test_tecla_cero_vuelve_a_automatico(self) -> None:
         pantalla, _ = _pantalla(caps_multi())
@@ -784,6 +795,53 @@ class TestReanalisisNoBloquea(unittest.TestCase):
         self.assertTrue(app.notified)
 
 
+class _SesionTarde(_SesionFalsa):
+    """Sondeo que responde **después** de la primera espera.
+
+    Reproduce lo que pasaba en Windows con un proveedor lento: al elegir el
+    canal, la espera inicial no da tiempo a que llegue el manifiesto, se
+    ofrece el selector de reproductor, y el resultado aparece un momento
+    después. Hasta que responde, la sesión no tiene nada que ofrecer, igual
+    que la real.
+    """
+
+    def __init__(self, caps) -> None:
+        super().__init__(None)  # manager vacío: el manifiesto aún no ha vuelto
+        self._caps = caps
+        self.answered = False
+        self._pending = True
+
+    @property
+    def pending(self) -> bool:
+        return self._pending
+
+    @pending.setter
+    def pending(self, value: bool) -> None:
+        self._pending = bool(value)
+
+    def responder_en(self, segundos: float) -> None:
+        """Contesta pasado un rato, como el hilo del sondeo real."""
+        import threading
+        import time as _time
+
+        def _contestar() -> None:
+            _time.sleep(segundos)
+            self.manager = TrackManager(self._caps, None)
+            self._pending = False
+            self.answered = True
+
+        threading.Thread(target=_contestar, daemon=True).start()
+
+    @property
+    def wait_settles(self) -> bool:
+        # El caso que hay que cubrir: en cuanto **responde**, la espera
+        # pendiente es cero pero la propiedad debe seguir siendo True, porque
+        # es lo que le concede al flujo el margen de cortesía.
+        from thetvview.ui.tracks import _url_may_be_manifest
+
+        return self.answered or _url_may_be_manifest(self.channel.url)
+
+
 class TestOrdenPistasAntesDelReproductor(unittest.TestCase):
     """El orden que se pidió: pistas primero, reproductor después.
 
@@ -847,6 +905,116 @@ class TestOrdenPistasAntesDelReproductor(unittest.TestCase):
         self.assertIsInstance(app.pushed[-1], __import__(
             "thetvview.ui.screens", fromlist=["PlayerScreen"]
         ).PlayerScreen)
+
+    def test_sondeo_tardio_no_pregunta_dos_veces_el_reproductor(self) -> None:
+        # El bug que se vio en Windows: el manifiesto llegaba después de la
+        # primera espera, así que el orden se invertía (reproductor → pistas)
+        # y al confirmar las pistas se volvía a pedir el reproductor. Con el
+        # reproductor ya elegido, confirmar reproduce directamente.
+        canal = Channel(name="C", url="https://h/x.m3u8")
+        sesion = _SesionFalsa(caps_multi())
+        sesion.channel = canal
+        app = self._app(sesion)
+        with mock.patch("thetvview.ui.app.play_channel") as play:
+            # 1) El usuario elige reproductor y el sondeo aún no había
+            #    terminado: se le ofrecen las pistas antes de lanzar.
+            App.handle_action(app, {"action": "play_with", "channel": canal,
+                                    "player_name": "mpv"})
+            self.assertFalse(play.called)
+            pistas = app.pushed[-1]
+            self.assertIsInstance(pistas, TrackOptionsScreen)
+            # 2) Confirma las pistas: se reproduce con el reproductor que ya
+            #    eligió, sin preguntar otra vez.
+            accion = pistas.handle_key(ENTER)
+            self.assertEqual(accion["player_name"], "mpv")
+            App.handle_action(app, accion)
+        self.assertTrue(play.called, "no se reprodujo tras elegir las pistas")
+        self.assertEqual(play.call_args.kwargs["player_name"], "mpv")
+        self.assertEqual(len(app.pushed), 1, "se preguntó el reproductor dos veces")
+
+    def test_mientras_se_ve_no_se_relanza_una_segunda_vez(self) -> None:
+        # Las teclas a/s/v de "Reproduciendo" abren el mismo selector con un
+        # reproductor ya elegido, pero ahí el canal **ya está abierto**:
+        # confirmar no puede lanzar un segundo reproductor.
+        canal = Channel(name="C", url="https://h/x.m3u8")
+        sesion = _SesionFalsa(caps_multi())
+        sesion.channel = canal
+        app = self._app(sesion)
+        app.stack = [mock.Mock(spec=NowPlayingScreen)]
+        with mock.patch("thetvview.ui.app.play_channel") as play:
+            App.handle_action(app, {"action": "tracks_choose_player",
+                                    "channel": canal, "player_name": "mpv"})
+        self.assertFalse(play.called, "relanzó el canal que ya se está viendo")
+        self.assertEqual(len(app.pushed), 1)
+
+    def test_sondeo_en_marcha_espera_un_margen(self) -> None:
+        # Si el sondeo sigue vivo al confirmar el reproductor, se le concede
+        # un margen corto y acotado antes de renunciar a las pistas: es lo que
+        # mantiene el orden en un equipo lento.
+        canal = Channel(name="C", url="https://h/x.m3u8")
+        sesion = _SesionFalsa(caps_multi())
+        sesion.channel = canal
+        sesion.pending = True
+        sesion.wait_settles = True
+        app = self._app(sesion)
+        with mock.patch.object(App, "_await_tracks") as espera, \
+                mock.patch("thetvview.ui.app.play_channel"):
+            App.handle_action(app, {"action": "play_with", "channel": canal,
+                                    "player_name": "mpv"})
+        self.assertTrue(espera.called, "no esperó al sondeo que seguía en marcha")
+        from thetvview.ui import app as ui_app
+
+        self.assertEqual(espera.call_args[0][1], ui_app.TRACK_LATE_WAIT_SECONDS)
+
+    def test_si_ya_respondio_no_se_espera_nada(self) -> None:
+        canal = Channel(name="C", url="https://h/x.m3u8")
+        sesion = _SesionFalsa(caps_multi())
+        sesion.channel = canal
+        sesion.pending = False
+        app = self._app(sesion)
+        with mock.patch.object(App, "_await_tracks") as espera, \
+                mock.patch("thetvview.ui.app.play_channel"):
+            App.handle_action(app, {"action": "play_with", "channel": canal,
+                                    "player_name": "mpv"})
+        self.assertFalse(espera.called)
+
+    def test_el_margen_esta_acotado(self) -> None:
+        # Ni la primera espera ni el margen de cortesía pueden convertirse en
+        # una espera sin fin: los dos son valores cortos y fijos.
+        from thetvview.ui import app as ui_app
+
+        self.assertGreater(ui_app.TRACK_LATE_WAIT_SECONDS, 0)
+        self.assertLessEqual(ui_app.TRACK_LATE_WAIT_SECONDS, 4.0)
+
+    def test_responde_tarde_aun_así_se_pregunta_por_las_pistas(self) -> None:
+        # El caso límite que rompía el orden: el sondeo termina **justo
+        # después** de la primera espera. `wait_settles` debe seguir siendo
+        # True (ya respondió) para que el margen de cortesía se conceda y las
+        # pistas se ofrezcan antes de lanzar, no después.
+        canal = Channel(name="C", url="https://h/x.m3u8")
+        sesion = _SesionTarde(caps_multi())
+        sesion.channel = canal
+        sesion.responder_en(0.1)
+        app = self._app(sesion)
+        with mock.patch("thetvview.ui.app.play_channel") as play:
+            App.handle_action(app, {"action": "play_with", "channel": canal,
+                                    "player_name": "mpv"})
+        self.assertFalse(play.called)
+        self.assertIsInstance(app.pushed[-1], TrackOptionsScreen)
+
+    def test_la_espera_inicial_tampoco_se_salta_si_ya_respondio(self) -> None:
+        # La otra mitad de lo mismo: si el sondeo ya terminó cuando el canal
+        # se abre, `wait_settles` no puede depender de que la URL "parezca" un
+        # manifiesto. Con una dirección opaca (una referencia Xtream, por
+        # ejemplo) la espera se saltaría y las pistas llegarían tarde otra vez.
+        from thetvview.streams.probe import ProbeResult
+        from thetvview.ui.tracks import TrackSession
+
+        sesion = TrackSession(
+            _AppRutas(), Channel(name="C", url="xtream-ts://panel/live/u/p/42")
+        )
+        sesion.result = ProbeResult(capabilities=caps_multi())
+        self.assertTrue(sesion.wait_settles)
 
     def test_con_elegido_ya_no_se_pregunta_al_lanzar(self) -> None:
         canal = Channel(name="C", url="https://h/x.m3u8")
@@ -1073,13 +1241,94 @@ class TestMarcarConEspacio(unittest.TestCase):
         self.assertEqual({k for k, _ in pantalla.marcados},
                          {"subtitles", "quality"})
 
-    def test_las_marcas_son_por_seccion_y_opcion(self) -> None:
+    def test_marcar_otra_traslada_el_asterisco(self) -> None:
+        """Es un radio: marcar otra deja a la primera sin asterisk.
+
+        Es lo que pedía el ejemplo: 360p marcada, luego 720p con Espacio ->
+        360p se desmarca y 720p queda. No pueden convivir dos en una lista.
+        """
+        pantalla, _ = _pantalla(caps_con_subs())
+        pantalla._focus_first("quality")
+        pantalla.handle_key(curses.KEY_DOWN)      # 360p
+        pantalla.handle_key(ord(" "))
+        self.assertEqual(pantalla.marcas_de("quality"), ["v360"])
+        pantalla.handle_key(curses.KEY_DOWN)      # 720p
+        pantalla.handle_key(ord(" "))
+        self.assertEqual(pantalla.marcas_de("quality"), ["v720"])
+        # Ni una más de las que había antes.
+        self.assertEqual(len(pantalla.marcas_de("quality")), 1)
+        # Y el dibujo muestra un único asterisco en toda la sección.
+        marcados = [t for t in _pintar(pantalla) if t.rstrip().endswith("*")]
+        self.assertEqual(len([m for m in marcados if "360p" in m]), 0, marcados)
+        self.assertEqual(len([m for m in marcados if "720p" in m]), 1, marcados)
+
+    def test_marcar_dos_veces_la_misma_no_crea_duplicados(self) -> None:
         pantalla, _ = _pantalla(caps_con_subs())
         pantalla._focus_first("quality")
         pantalla.handle_key(ord(" "))
         primera = set(pantalla.marcados)
-        pantalla.handle_key(ord(" "))  # idempotente
+        pantalla.handle_key(ord(" "))
         self.assertEqual(pantalla.marcados, primera)
+
+    def test_cada_lista_mantiene_su_propia_marca(self) -> None:
+        # Una por lista: elegir subtítulo y calidad deja una marca en cada una,
+        # sin que la segunda pise a la primera.
+        pantalla, _ = _pantalla(caps_con_subs())
+        pantalla._focus_first("subtitles")
+        pantalla.handle_key(curses.KEY_DOWN)
+        pantalla.handle_key(ord(" "))
+        pantalla._focus_first("quality")
+        pantalla.handle_key(ord(" "))
+        self.assertEqual(len(pantalla.marcas_de("subtitles")), 1)
+        self.assertEqual(len(pantalla.marcas_de("quality")), 1)
+
+    def test_el_subtitulo_no_desaparece_al_marcar_calidad(self) -> None:
+        """Regla exacta: no se eligen varias opciones **por categoría**.
+
+        Marcar el subtítulo y luego la calidad deja las dos marcas; lo único
+        que no puede pasar es que una categoría tenga dos marcados. Por eso
+        cambiar de calidad mueve la marca de calidad y deja la del subtítulo
+        intacta.
+        """
+        pantalla, _ = _pantalla(caps_con_subs())
+        pantalla._focus_first("subtitles")
+        pantalla.handle_key(curses.KEY_DOWN)      # Español
+        pantalla.handle_key(ord(" "))
+        self.assertEqual(pantalla.marcas_de("subtitles"), ["s1"])
+
+        pantalla._focus_first("quality")
+        pantalla.handle_key(curses.KEY_DOWN)      # 360p
+        pantalla.handle_key(ord(" "))
+        # El subtítulo sigue ahí.
+        self.assertEqual(pantalla.marcas_de("subtitles"), ["s1"])
+        self.assertEqual(pantalla.marcas_de("quality"), ["v360"])
+
+        pantalla.handle_key(curses.KEY_DOWN)      # 720p
+        pantalla.handle_key(ord(" "))
+        # Sólo se mueve la de calidad.
+        self.assertEqual(pantalla.marcas_de("subtitles"), ["s1"])
+        self.assertEqual(pantalla.marcas_de("quality"), ["v720"])
+
+    def test_las_tres_categorias_pueden_estar_marcadas(self) -> None:
+        pantalla, _ = _pantalla(caps_con_subs())
+        for kind in ("audio", "subtitles", "quality"):
+            pantalla._focus_first(kind)
+            pantalla.handle_key(ord(" "))
+        self.assertEqual(
+            sorted(pantalla.marcados),
+            [("audio", "auto"), ("quality", "auto"), ("subtitles", "auto")],
+        )
+
+    def test_una_categoria_nunca_tiene_dos_marcas(self) -> None:
+        """Invariante general, sea cual sea el camino que se llegue."""
+        pantalla, _ = _pantalla(caps_con_subs())
+        for kind in ("audio", "subtitles", "quality"):
+            pantalla._focus_first(kind)
+            for _ in range(len(pantalla.options.choices_for(kind))):
+                pantalla.handle_key(ord(" "))
+                for otra in ("audio", "subtitles", "quality"):
+                    with self.subTest(categoria=otra):
+                        self.assertLessEqual(len(pantalla.marcas_de(otra)), 1)
 
     def test_cero_quita_la_marca_de_la_seccion(self) -> None:
         pantalla, _ = _pantalla(caps_con_subs())

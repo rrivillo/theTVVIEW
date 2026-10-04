@@ -25,6 +25,7 @@ data/epg_cache/
 data/playlist_cache/
 data/prefs.json
 data/recents.json
+data/theme.json
 data/ux_last.json
 data/xtream_cache/
 data/track_cache/
