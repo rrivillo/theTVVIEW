@@ -210,8 +210,9 @@ def prompt_password(stdscr: curses.window, status: StatusBar, label: str) -> str
 #   1. sólo se espera si el canal puede tener manifiesto (`.ts` no entra);
 #   2. hay pantalla de espera con lo que está haciendo, no un cuelgue mudo;
 #   3. al agotarse el tiempo se sigue el camino de siempre y el sondeo
-#      sigue en segundo plano, así que las opciones aparecen después desde
-#      "Reproduciendo" (teclas a/s/v).
+#      sigue en segundo plano, así que las pistas llegan después: se ofrecen
+#      la próxima vez que se elige reproductor (`p`), nunca con el canal ya
+#      abierto, porque una pista fija sólo se aplica al lanzar.
 #
 # El tope **depende del sistema** porque el tiempo de respuesta del primer
 # sondeo no es el mismo en todos: en Windows la primera petición paga el
@@ -339,13 +340,10 @@ _HELP_HERE: dict[str, list[tuple[str, str]]] = {
     ],
     "NowPlayingScreen": [
         ("key", "q  detener la reproducción y volver a la lista."),
-        ("key", "a  cambiar el idioma del audio."),
-        ("key", "s  cambiar o apagar los subtítulos."),
-        ("key", "v  cambiar la calidad."),
         ("key", "i  volver a analizar las pistas del canal."),
+        ("tip", "Audio, subtítulos y calidad se eligen antes, al abrir el canal."),
+        ("tip", "Para verlos otra vez: p, elige reproductor, y vuelve a preguntarlos."),
         ("tip", "El vídeo se ve en otra ventana; aquí ves el estado."),
-        ("tip", "Con MPV el cambio se aplica al instante; con los otros,"),
-        ("body", "el cambio se aplica al reabrir el canal."),
     ],
     "TrackOptionsScreen": [
         ("key", "↑ / ↓  moverte por las opciones."),
@@ -429,7 +427,7 @@ def build_help_lines(screen) -> list[tuple[str, str]]:
         ("body", "Guía: r recargar · Enter ver el canal."),
         ("body", "Calidad / Reproductor: flechas y Enter para confirmar."),
         ("body", "Pistas: ↑↓ elige · 0 Automático · Enter ver · m recordar."),
-        ("body", "Reproduciendo: q detiene · a/s/v cambian pista · i info."),
+        ("body", "Reproduciendo: q detiene · i revisa las pistas."),
         ("blank", ""),
         ("section", "Cómo buscar (Canales y Grupos)"),
         ("body", "1. Pulsa / y escribe en el modal: la lista se filtra sola."),
@@ -1826,7 +1824,7 @@ class App:
         return True
 
     def open_track_options(self, channel: Channel, player_name: str | None, *, kind: str | None = None) -> None:
-        """Abre el selector para una sección concreta (teclas a/s/v)."""
+        """Abre el selector para una sección concreta (`kind`)."""
         from .screens import TrackOptionsScreen
         from thetvview.tracks.manager import SelectTrackError
 

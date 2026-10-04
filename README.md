@@ -283,10 +283,11 @@ siempre.
   aviso) antes de lanzar: es lo que mantiene el orden `pistas → reproductor` en
   equipos lentos o con proveedores que tardan, donde antes las pistas aparecían
   después del reproductor y había que elegirlo **dos veces**. Si ni así llega,
-  se sigue el camino de siempre y las opciones aparecen igualmente después,
-  desde `Reproduciendo` con las teclas `a`/`s`/`v`. Cuando el reproductor ya
-  está elegido y se confirman las pistas, la reproducción arranca directamente
-  con él: no se vuelve a preguntar. La espera es siempre la misma y sólo ocurre
+  se sigue el camino de siempre: las pistas llegan igualmente después y se
+  ofrecen la próxima vez que se elige reproductor (`p`), no con el canal ya
+  abierto. Cuando el reproductor ya está elegido y se confirman las pistas, la
+  reproducción arranca directamente con él: no se vuelve a preguntar. La
+  espera es siempre la misma y sólo ocurre
   si la URL puede ser un manifiesto; los `--audio`/`--subtitles`/`--quality` de
   arranque fijan la pista pero **no** la evitan, porque para saber qué pista es
   "la de español" o "la de 720p" hay que leer el manifiesto igualmente.
@@ -307,7 +308,7 @@ siempre.
   subtítulos que el reproductor elegido no va a poder ver, aparece un **modal
   informativo** —no una pregunta— que dice qué va a pasar y que con VLC sí
   funciona. Se muestra **una sola vez por canal y reproductor**: no es algo que
-  haya que confirmar cada vez que reabres el canal con `s`.
+  haya que confirmar cada vez que reabres el canal.
 - **La preferencia manda al entrar**: idioma exacto → idioma base → etiqueta →
   `DEFAULT` del stream → primera disponible. Los ámbitos del formato son canal →
   proveedor (el host de la lista) → global, y se leen en ese orden; la tecla
@@ -315,11 +316,17 @@ siempre.
   elegido ahí se aplica a ese canal la próxima vez). En `prefs.json` no se
   guarda nunca la URL del canal: la clave es el `tvg-id` o el hash de la URL
   **ya redactada**.
-- **Cambiar en caliente**: con `mpv` el cambio se aplica al instante por su
-  canal de control (IPC local); con `vlc` y `mplayer` no es posible y la app
-  lo dice en un modal. Desde `Reproduciendo`, las teclas `a` (audio), `s`
-  (subtítulos), `v` (calidad) e `i` (volver a analizar el manifiesto) hacen lo
-  mismo sin salir del canal.
+- **Nada se cambia con el canal abierto**: audio, subtítulos y calidad se eligen
+  **antes**, en la pantalla `Audio y calidad`, y se aplican al lanzar el
+  reproductor. Por eso la pantalla `Reproduciendo` no tiene atajos de pista: una
+  pista fija ya no tendría a qué aplicarse. La única excepción es que el sondeo
+  del manifiesto llegara tarde; entonces se vuelve a elegir reproductor con `p`
+  y ahí se preguntan las pistas. La tecla `i` sigue reanalizando el manifiesto
+  del canal que se está viendo.
+- **Los cambios que sí se aplican en caliente**: con `mpv` el reproductor acepta
+  el cambio por su canal de control (IPC local) durante la reproducción; con
+  `vlc` y `mplayer` no es posible, y por eso la elección se hace antes de
+  lanzar.
 - **Cómo comprobar si una lista sirve de algo para esto**: la app trae una
   encuesta que usa **el mismo camino real** (no una simulación) y dice, canal
   a canal, qué se encontró:
@@ -547,15 +554,18 @@ Funcionan en cualquier pantalla salvo mientras escribes en una búsqueda.
 | `!` | Comprobar la seguridad (`security-check`); el resultado sale en un modal. |
 | Ratón | Clic para seleccionar, doble clic para abrir. |
 
-En la pantalla `Reproduciendo` hay cuatro teclas más, sólo si el canal
+En la pantalla `Reproduciendo` sólo queda una tecla más, y sólo si el canal
 publica alternativas:
 
 | Tecla | Acción |
 | --- | --- |
-| `a` | Cambiar el idioma del audio. |
-| `s` | Cambiar o apagar los subtítulos. |
-| `v` | Cambiar la calidad. |
 | `i` | Volver a analizar el manifiesto (pistas nuevas o que desaparecieron). |
+
+Audio, subtítulos y calidad **no** se cambian desde `Reproduciendo`: eso se
+pregunta antes, en la pantalla `Audio y calidad`, que es la que sale al abrir el
+canal. Con el canal ya abierto no hay atajo para ellos; si el sondeo del
+manifiesto llegó tarde, se vuelve a elegir reproductor con `p` y ahí se
+preguntan.
 
 En la pantalla `Audio y calidad` (la que sale antes del reproductor):
 

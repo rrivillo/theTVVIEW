@@ -10,8 +10,8 @@ Reglas que se verifican aquí:
 - con una sola pista **no hay menú** y la reproducción sigue igual (AC-09);
 - con dos o más, `Enter` devuelve la acción con la selección;
 - `0` vuelve a Automático/Desactivados;
-- las teclas `a`/`s`/`v`/`i` de "Reproduciendo" sólo existen cuando hay algo
-  que cambiar, y si no lo hay avisan en vez de fallar en silencio.
+- la tecla `i` de "Reproduciendo" sólo existe cuando hay algo que analizar; las
+  de pista (`a`/`s`/`v`) **no existen**: ya se eligieron antes del reproductor;
 """
 
 from __future__ import annotations
@@ -400,7 +400,14 @@ class TestConUnaSolaOpcionNoHayMenu(unittest.TestCase):
         self.assertTrue(pantalla.options.has_menu)
 
 
-class TestNowPlayingTeclasDePista(unittest.TestCase):
+class TestNowPlayingSinAtajosDePista(unittest.TestCase):
+    """Con el canal abierto no se cambia de pista: se eligió antes del reproductor.
+
+    La regla es de una sola dirección y se comprueba por los tres lados: la
+    tecla no hace nada, no está en la toolbar y la tarjeta no la anuncia. Si
+    volviera una de las tres, la pantalla estaría mintiendo.
+    """
+
     def _screen(self, sesion=None) -> NowPlayingScreen:
         app = mock.Mock()
         app.epg = None
@@ -422,13 +429,12 @@ class TestNowPlayingTeclasDePista(unittest.TestCase):
         self.assertIsNone(pantalla.handle_key(ord("a")))
         self.assertIsNone(pantalla.handle_key(ord("s")))
 
-    def test_con_sesion_abren_el_selector(self) -> None:
+    def test_las_teclas_de_pista_no_abren_el_selector(self) -> None:
+        # Ni con sesión multi-pista: `a`/`s`/`v` no hacen nada aquí.
         pantalla = self._screen(_SesionFalsa(caps_multi()))
-        for tecla, kind in (("a", "audio"), ("s", "subtitles"), ("v", "quality")):
+        for tecla in ("a", "s", "v"):
             with self.subTest(tecla=tecla):
-                accion = pantalla.handle_key(ord(tecla))
-                self.assertEqual(accion["action"], "open_track_kind")
-                self.assertEqual(accion["kind"], kind)
+                self.assertIsNone(pantalla.handle_key(ord(tecla)))
 
     def test_i_pide_reanalizar(self) -> None:
         pantalla = self._screen(_SesionFalsa(caps_multi()))
@@ -439,20 +445,23 @@ class TestNowPlayingTeclasDePista(unittest.TestCase):
         pantalla = self._screen(_SesionFalsa(caps_multi()))
         self.assertEqual(pantalla.handle_key(ord("q"))["action"], "stop_playback")
 
-    def test_shortcuts_mencionan_las_teclas(self) -> None:  # noqa: D102
+    def test_shortcuts_solo_con_quedan_i_y_q(self) -> None:
         con = self._screen(_SesionFalsa(caps_multi())).shortcuts()
-        self.assertIn("a Audio", con)
-        self.assertIn("s Subt", con)
+        self.assertEqual(con, "q Detener · i Info · ? Ayuda")
         sin = self._screen(None).shortcuts()
-        self.assertNotIn("a Audio", sin)
+        self.assertEqual(sin, "q Detener · ? Ayuda")
 
-    def test_tarjeta_muestra_audio_y_calidad(self) -> None:
+    def test_tarjeta_muestra_las_pistas_sin_tecla(self) -> None:
         pantalla = self._screen(_SesionFalsa(caps_multi()))
         filas = pantalla._track_lines(80)
         texto = "\n".join(f[0] for f in filas)
         self.assertIn("Audio", texto)
         self.assertIn("es", texto)
         self.assertIn("Calidad", texto)
+        # Informativa, no accionable: ninguna fila lleva la letra de un atajo.
+        self.assertNotIn("a Audio", texto)
+        self.assertNotIn("s Subt", texto)
+        self.assertNotIn("v Calidad", texto)
 
     def test_tarjeta_analizando(self) -> None:
         sesion = _SesionFalsa(None, pendientes=True)
@@ -933,9 +942,10 @@ class TestOrdenPistasAntesDelReproductor(unittest.TestCase):
         self.assertEqual(len(app.pushed), 1, "se preguntó el reproductor dos veces")
 
     def test_mientras_se_ve_no_se_relanza_una_segunda_vez(self) -> None:
-        # Las teclas a/s/v de "Reproduciendo" abren el mismo selector con un
-        # reproductor ya elegido, pero ahí el canal **ya está abierto**:
-        # confirmar no puede lanzar un segundo reproductor.
+        # El mismo selector de "Reproduciendo" (por ejemplo, si el sondeo llegó
+        # tarde y se abre con `p`) llega con un reproductor ya elegido, pero ahí
+        # el canal **ya está abierto**: confirmar no puede lanzar un segundo
+        # reproductor.
         canal = Channel(name="C", url="https://h/x.m3u8")
         sesion = _SesionFalsa(caps_multi())
         sesion.channel = canal

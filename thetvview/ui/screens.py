@@ -2054,7 +2054,11 @@ class NowPlayingScreen(Screen):
                 self.health = ChannelHealthMonitor(channel, interval=10.0, timeout=2.0, auto_start=False)
 
     def shortcuts(self) -> str:
-        extra = " · a Audio · s Subtítulos · v Calidad · i Info" if self.tracks else ""
+        # Audio, subtítulos y calidad ya se eligieron antes de elegir
+        # reproductor (ver TrackOptionsScreen): aquí no se ofrecen porque con
+        # el canal abierto no se pueden cambiar (una pista fija se aplica al
+        # lanzar). La toolbar queda con lo que sí tiene sentido aquí.
+        extra = " · i Info" if self.tracks else ""
         return f"q Detener{extra} · ? Ayuda"
 
     def is_alive(self) -> bool:
@@ -2096,18 +2100,12 @@ class NowPlayingScreen(Screen):
             return {"action": "stop_playback"}
         if self.tracks is None:
             return None
-        # Atajos de pistas. Sólo existen si hay algo que cambiar: si el canal
-        # no expone alternativas, las teclas avisan en vez de no hacer nada
-        # en silencio (SDD §29).
-        if key == ord("a"):
-            return {"action": "open_track_kind", "channel": self.channel,
-                    "player_name": self.player_name, "kind": "audio"}
-        if key == ord("s"):
-            return {"action": "open_track_kind", "channel": self.channel,
-                    "player_name": self.player_name, "kind": "subtitles"}
-        if key == ord("v"):
-            return {"action": "open_track_kind", "channel": self.channel,
-                    "player_name": self.player_name, "kind": "quality"}
+        # Sólo queda `i`. Las pistas (audio, subtítulos y calidad) **no**
+        # tienen atajo aquí y no por descuido: se eligen en
+        # TrackOptionsScreen, antes de elegir reproductor, porque el
+        # reproductor no cambia qué pistas publica el canal. Con el canal ya
+        # abierto, `a`, `s` y `v` no hacen nada: una pista fija se aplica al
+        # lanzar. Para volver a verlas hay que reabrir el canal (`p`).
         if key in (ord("i"), ord("I")):
             return {"action": "recheck_tracks", "channel": self.channel}
         return None
@@ -2245,6 +2243,9 @@ class NowPlayingScreen(Screen):
 
         Se omiten las vacías: sin pistas analizadas la tarjeta queda como
         estaba, que es lo que exige no romper los streams simples (§32).
+
+        Ninguna fila lleva tecla: con el canal ya abierto no se cambia de
+        pista, así que aquí sólo se informa de lo que se está viendo.
         """
         sesion = getattr(self, "tracks", None)
         if sesion is None:
@@ -2261,21 +2262,14 @@ class NowPlayingScreen(Screen):
             ("Resolución", "resolution"),
             ("Códec", "codec"),
         )
-        kinds = sesion.kinds(self.player_name)
         lineas: list[tuple[str, int]] = []
         for etiqueta, clave in etiquetas:
             valor = datos.get(clave) or ""
             if not valor:
                 continue
-            attr = colors.pair(colors.PAIR_NORMAL)
-            # Un valor que se puede cambiar desde aquí se marca con la tecla.
-            if clave in ("audio", "subtitles", "quality"):
-                tecla = {"audio": "a", "subtitles": "s", "quality": "v"}[clave]
-                if clave in kinds:
-                    attr = colors.pair(colors.PAIR_PRIMARY)
-                    lineas.append((f" {tecla} {etiqueta}:".ljust(17), attr))
-                    lineas.append((f"{valor}"[: max(0, max_x - 4)], colors.pair(colors.PAIR_NORMAL)))
-                    continue
+            # Todo es información: aquí ya no se cambia ninguna pista, así que
+            # ninguna fila lleva tecla. Audio, subtítulos y calidad se eligieron
+            # antes de abrir el reproductor.
             lineas.append((f" {etiqueta}:".ljust(17), colors.pair(colors.PAIR_DIM)))
             lineas.append((f"{valor}"[: max(0, max_x - 4)], colors.pair(colors.PAIR_NORMAL)))
         return lineas

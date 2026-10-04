@@ -23,8 +23,9 @@ class Prefs:
     #: "auto" para dejar el ABR al reproductor, o una altura ("720p") / un id
     #: de variante concreta.
     preferred_quality: str | None = None
-    #: Si False, la app no propone el selector de pistas (sigue pudiendo
-    #: cambiarse desde "Reproduciendo").
+    #: Si False, la app no propone el selector de pistas. Con el canal ya
+    #: abierto ya no se cambian (se eligieron antes del reproductor): para
+    #: verlas hay que volver a elegir reproductor con `p`.
     ask_track_options: bool = True
     #: Preferencias por canal/proveedor. Las claves son ``tvg:...``,
     #: ``channel:<sha256 de la URL redactada>`` o ``provider:<host>``; los
