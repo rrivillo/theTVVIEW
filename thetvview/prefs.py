@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict, field
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 from . import config
 
@@ -32,6 +32,38 @@ class Prefs:
     #: valores nunca contienen URLs ni credenciales (SDD §37).
     track_prefs: dict[str, dict[str, Any]] = field(default_factory=dict)
 
+    # --- Multi-stream (SDD-M §33, plan Fase 7) -----------------------------
+    # El §33 del SDD-M propone un TOML con [player], [playback], [reconnect]
+    # y [diagnostics]. Aquí vive en `prefs.json`, que es el formato que el
+    # repo ya usa, con su único cargador y sus tests (decisión D6): un segundo
+    # formato de configuración sería un segundo sitio donde cambiar una opción.
+    #
+    #: Reproductor preferido. None = "el que la tabla diga que puede abrir
+    #: este transporte", no "el último usado": son cosas distintas y
+    #: confundirlas haría que un RTSP acabara en el binario que el usuario usó
+    #: para un HLS. `player.router` lo trata como el criterio 1 del §27, por
+    #: encima de la prioridad, y sólo si puede abrir el transporte.
+    preferred_backend: str | None = None
+    #: Segundos para abrir la conexión antes de darla por perdida (§18).
+    #: `None` = el valor del reproductor. Fijarlo aquí tiene sentido sobre todo
+    #: para RTSP y UDP, donde una cámara apagada se queda esperando en silencio
+    #: mucho más que un canal HTTP.
+    connect_timeout: int | None = None
+    #: Segundos para que el medio empiece a llegar (§18).
+    startup_timeout: int | None = None
+    #: Intentos de reconexión como máximo (§17). El tope de **cambio de
+    #: reproductor** es otro y vive en `player.router.MAX_BACKEND_ATTEMPTS`
+    #: (§26): confundirlos convertiría un canal malo en veinte esperas.
+    reconnect_max_attempts: int = 5
+    #: Perfil de red (§19). "balanced" = el de siempre; "low_latency" y
+    #: "stable" se traducen a banderas reales del reproductor, no a un búfer en
+    #: este proceso.
+    playback_profile: str = "balanced"
+    #: Si False, el menú de diagnóstico no propone comprobar la conexión (que
+    #: sale a la red). El informe **sin** conexión siempre está disponible:
+    #: es puro y no cuesta nada.
+    diagnostics_enabled: bool = True
+
 
 class PrefsManager:
     def __init__(self, path: Path | str | None = None) -> None:
@@ -52,6 +84,16 @@ class PrefsManager:
                 preferred_quality=_opt_str(data.get("preferred_quality")),
                 ask_track_options=bool(data.get("ask_track_options", True)),
                 track_prefs=_scopes(data.get("track_prefs")),
+                preferred_backend=_opt_backend(data.get("preferred_backend")),
+                connect_timeout=_opt_int(data.get("connect_timeout")),
+                startup_timeout=_opt_int(data.get("startup_timeout")),
+                reconnect_max_attempts=_opt_int(
+                    data.get("reconnect_max_attempts"), default=5, minimum=0, maximum=20
+                ),
+                playback_profile=_perfil(data.get("playback_profile")),
+                diagnostics_enabled=bool(
+                    data.get("diagnostics_enabled", True)
+                ),
             )
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return Prefs()
@@ -88,6 +130,68 @@ def _opt_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _opt_backend(value: Any) -> str | None:
+    """Nombre de reproductor, o None si no es un nombre.
+
+    A diferencia de :func:`_opt_str`, **no** convierte cualquier cosa a texto:
+    un ``42`` en ``prefs.json`` no es el nombre de un reproductor, y
+    aceptarlo haría que el router creyera que el usuario eligió uno que no
+    existe. Mejor ningún preferido que un preferido inventado.
+    """
+    if not isinstance(value, str):
+        return None
+    texto = value.strip().lower()
+    return texto or None
+
+
+@overload
+def _opt_int(
+    value: Any, *, minimum: int = ..., maximum: int = ...
+) -> int | None: ...
+
+
+@overload
+def _opt_int(
+    value: Any, *, default: int, minimum: int = ..., maximum: int = ...
+) -> int: ...
+
+
+def _opt_int(
+    value: Any,
+    *,
+    default: int | None = None,
+    minimum: int = 0,
+    maximum: int = 3600,
+) -> int | None:
+    """Entero de `prefs.json`, acotado. Basura → `default`.
+
+    Acotar no es cosmético: `reconnect_max_attempts` viene de un fichero que
+    el usuario puede editar a mano, y un 100000 ahí significa una app que no
+    responde. Fuera de rango se usa el valor por defecto, que es lo
+    conocido-bueno.
+
+    Las sobrecargas existen para que el compilador sepa que, si se pasa
+    `default`, el resultado **siempre** es un entero. Sin ellas el tipo es
+    `int | None` y el que llama a un campo que no admite `None` recibe un
+    error… o, peor, un `None` colándose en un `Prefs`.
+    """
+    if value is None:
+        return default
+    try:
+        numero = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    if numero < minimum or numero > maximum:
+        return default
+    return numero
+
+
+def _perfil(value: Any) -> str:
+    """Perfil de red (§19), normalizado. Desconocido → "balanced"."""
+    texto = _opt_str(value) or "balanced"
+    return texto if texto in ("low_latency", "balanced", "stable") else "balanced"
 
 
 def _scopes(value: Any) -> dict[str, dict[str, Any]]:

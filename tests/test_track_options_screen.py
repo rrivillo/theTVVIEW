@@ -445,11 +445,23 @@ class TestNowPlayingSinAtajosDePista(unittest.TestCase):
         pantalla = self._screen(_SesionFalsa(caps_multi()))
         self.assertEqual(pantalla.handle_key(ord("q"))["action"], "stop_playback")
 
-    def test_shortcuts_solo_con_quedan_i_y_q(self) -> None:
+    def test_shortcuts_solo_con_quedan_i_y_q_y_diagnostico(self) -> None:
+        # `d` (diagnóstico) aparece siempre, con pistas o sin ellas: es lo que
+        # contesta «¿por qué no abre?» cuando un canal muere al instante, y en
+        # ese momento las pistas son lo último que importa (SDD-M §21).
         con = self._screen(_SesionFalsa(caps_multi())).shortcuts()
-        self.assertEqual(con, "q Detener · i Info · ? Ayuda")
+        self.assertEqual(con, "q Detener · d Diagnóstico · i Info · ? Ayuda")
         sin = self._screen(None).shortcuts()
-        self.assertEqual(sin, "q Detener · ? Ayuda")
+        self.assertEqual(sin, "q Detener · d Diagnóstico · ? Ayuda")
+
+    def test_d_abre_el_diagnostico(self) -> None:
+        accion = self._screen(None).handle_key(ord("d"))
+        assert accion is not None
+        self.assertEqual(accion["action"], "diagnose_channel")
+        # Mayúscula también: es una tecla que se documenta en mayúsculas.
+        accion_mayus = self._screen(None).handle_key(ord("D"))
+        assert accion_mayus is not None
+        self.assertEqual(accion_mayus["action"], "diagnose_channel")
 
     def test_tarjeta_muestra_las_pistas_sin_tecla(self) -> None:
         pantalla = self._screen(_SesionFalsa(caps_multi()))

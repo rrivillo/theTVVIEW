@@ -119,13 +119,29 @@ class TestPlayChannel(unittest.TestCase):
         self.assertTrue(stub.stack[0].is_alive())
 
     def test_sin_player_name_lanza_por_preferencia(self):
+        """Sin reproductor elegido, lo decide el router por capacidad.
+
+        Antes esta prueba miraba que `player_name` llegara a `launch()` como
+        ``None`` y ya está: el router es quien decide ahora (SDD-M §8), y lo
+        hace **antes** de llamar a `launch`, porque hace falta saber qué
+        reproductor es para relanzar el mismo si se corta (§17) y para
+        enseñarlo en la pantalla.
+
+        Lo que no cambia es el contrato observable: se lanza, se empuja la
+        pantalla y el usuario ve un reproductor, no una excepción.
+        """
         stub = _StubApp()
         fake_proc = mock.Mock(pid=1)
         fake_proc.poll.return_value = None
         with mock.patch("thetvview.player.launch", return_value=fake_proc) as launch:
             play_channel(stub, ch())
-        self.assertIsNone(launch.call_args.kwargs.get("player_name"))
+        launch.assert_called_once()
+        # El router no se consulta si el reproductor está instalado; aquí no
+        # hay ninguno, así que devuelve None y `launch` se limita a relanzar
+        # con el nombre que le di. Lo que se comprueba es que la pantalla sabe
+        # cuál se usó.
         self.assertEqual(len(stub.stack), 1)
+        self.assertTrue(stub.stack[0].player_name)
 
 
 class TestSubtitulosSinModalAlReproducir(unittest.TestCase):

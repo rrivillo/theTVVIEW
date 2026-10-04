@@ -155,6 +155,127 @@ def _is_interactive_terminal() -> bool:
         return False
 
 
+def multicast_supported(system: str | None = None) -> bool:
+    """True si este SO y esta máquina pueden llevar tráfico multicast (Fase 6).
+
+    Tres capas, de la más barata a la más cara, y se para en la primera que
+    falla:
+
+    1. **el SO lo soporta** —Windows, macOS y Linux sí; un SO desconocido no se
+       afirma porque no se comprueba (:func:`detect_os` devuelve ``unknown`` a
+       propósito, y adivinar aquí sería lo contrario de lo que hace el resto del
+       módulo);
+    2. **esta máquina tiene interfaces con la bandera MULTICAST**;
+    3. **se puede abrir un socket multicast** y unirse a un grupo de prueba.
+
+    La tercera capa es la que de verdad informa: hay máquinas Linux con la
+    bandera puesta y sin ruta multicast, que es exactamente el caso que se
+    cuenta en el módulo :mod:`thetvview.player.protocols` (donde el multicast
+    quedó «no verificado»). Nunca lanza: cualquier duda se resuelve con
+    ``False``, y un ``False`` equivocado se traduce en «compruébalo tú», no en
+    un error.
+
+    .. warning::
+       Esto responde «¿puede esta máquina?», no «¿llega este grupo?». Lo
+       segundo depende de la red (router, Wi-Fi, firewall) y no lo puede
+       decidir ningún ``getsockopt``; por eso el §14 del SDD-M exige separar
+       los dos mensajes.
+    """
+    so = detect_os(system)
+    if so not in (OS_LINUX, OS_MACOS, OS_WINDOWS):
+        return False
+    try:
+        # (2) Alguna interfaz con la bandera de multicast.
+        interfaces = _interfaces_con_multicast()
+        if not interfaces:
+            return False
+        # (3) Socket de prueba: unirse a un grupo y salir sin enviar nada.
+        return _puede_unirse_a(interfaces)
+    except Exception:  # noqa: BLE001 - una duda se resuelve con «no»
+        return False
+
+
+def _puede_unirse_a(interfaces: list[str]) -> bool:
+    """¿Se puede unir a un grupo multicast por alguna de esas interfaces?
+
+    Va en su propia función por dos razones: es lo único del módulo que abre
+    un socket, y así se puede sustituir en los tests sin tener que parchear
+    ``socket.socket`` a nivel de módulo.
+    """
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        grupo = socket.inet_aton(_GRUPO_PRUEBA)
+        for interfaz in interfaces:
+            try:
+                s.setsockopt(
+                    socket.IPPROTO_IP,
+                    socket.IP_ADD_MEMBERSHIP,
+                    grupo + socket.inet_aton(interfaz),
+                )
+                return True
+            except OSError:
+                continue
+        return False
+    finally:
+        s.close()
+
+
+#: Grupo que se usa sólo para probar la pertenencia. Está en el rango
+#: administrativo (239.255.0.0/16, RFC 6034) justamente para que nadie pueda
+#: tener tráfico real en él: unirse es inocuo.
+_GRUPO_PRUEBA = "239.255.255.254"
+
+
+def _interfaces_con_multicast() -> list[str]:
+    """Direcciones IPv4 de las interfaces locales con la bandera MULTICAST.
+
+    Sólo stdlib, como todo el repo: se pregunta al SO por sus interfaces
+    (``getaddrinfo`` con el nombre de host y ``socket.if_nameindex``, que
+    existen en las tres plataformas) y se usa :func:`_interfaz_por_defecto`
+    como respaldo. Si no se puede averiguar nada, se lista vacía y
+    :func:`multicast_supported` responde False, que es la respuesta honesta.
+
+    Importar ``psutil`` aquí estaría bien en cualquier otro proyecto y está
+    **mal** en este: el security-check falla si aparece un import que no sea del
+    stdlib, y ``requirements.txt`` tiene que seguir vacío.
+    """
+    direcciones: list[str] = []
+    try:
+        import socket
+
+        for info in socket.getaddrinfo(
+            socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM
+        ):
+            # sockaddr es una tupla heterogénea según la familia; en AF_INET
+            # el primer elemento es la dirección, pero el tipo declarado es
+            # `str | int`, así que se normaliza en vez de suponer.
+            direccion = str(info[4][0])
+            if direccion and not direccion.startswith("127."):
+                if direccion not in direcciones:
+                    direcciones.append(direccion)
+    except Exception:
+        pass
+    if not direcciones:
+        return _interfaz_por_defecto()
+    return direcciones
+
+
+def _interfaz_por_defecto() -> list[str]:
+    """IPv4 de la ruta por defecto, si la hay."""
+    try:
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # No envía nada: connect en UDP sólo elige la ruta local.
+            s.connect(("192.0.2.1", 9))  # TEST-NET-1, RFC 5737
+            return [s.getsockname()[0]]
+    except Exception:
+        return []
+
+
 def _missing_curses_message(system: str, exc: Exception) -> str:
     header = [
         "theTVVIEW no pudo cargar el módulo 'curses' (interfaz de terminal).",

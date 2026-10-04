@@ -1451,6 +1451,51 @@ class App:
         res = self._run_modal(Modal(title, message, ["Cancelar", "Aceptar"]))
         return res == "aceptar"
 
+    def show_diagnose(self, channel: Channel, *, con_conexion: bool = False) -> None:
+        """Informe de diagnóstico de un canal en un modal (SDD-M §21).
+
+        Lo único que se muestra es tipo, esquema, candidatos y veredicto: **la
+        URL no sale**, ni cruda ni redactada. Todo el texto pasa por
+        ``redact_text`` dentro de :mod:`thetvview.streams.diagnose`, que es
+        donde nace (decisión D5: no hay módulo de ``logging``, se redacta en el
+        punto donde se crea el texto).
+
+        Args:
+            con_conexion: si True, además comprueba DNS/HTTP de verdad. Eso
+                **abre red**, así que no se hace por sorpresa: lo pide el
+                usuario con una tecla aparte. Pasa por el cliente seguro, con
+                la excepción anti-SSRF de la fuente y sin esperar al usuario
+                desde el hilo principal más de lo necesario.
+        """
+        from thetvview.streams.diagnose import (
+            StepState,
+            diagnose,
+            diagnose_connection,
+            render_report,
+        )
+
+        informe = diagnose(channel)
+        pasos = None
+        if con_conexion:
+            # La excepción anti-SSRF es **de la fuente que aportó el canal**,
+            # no global (SDD §11). Se busca el origen de la lista abierta; si
+            # no se sabe, `False`, que es el valor por defecto seguro.
+            source = getattr(getattr(self, "playlist", None), "source", "") or ""
+            permitir = bool(source) and self._allow_private_for(source)
+            try:
+                pasos = diagnose_connection(channel, allow_private=permitir)
+            except Exception as exc:  # noqa: BLE001 - un diagnóstico nunca rompe
+                pasos = []
+                informe.add(
+                    "comprobación de conexión",
+                    StepState.UNKNOWN,
+                    f"no se pudo comprobar: {type(exc).__name__}",
+                )
+        texto = render_report(informe, pas=pasos)
+        # `_show_notice` (y no `notify`): el informe es largo y ya viene
+        # encabezado, así que no se duplica en la barra de estado.
+        self._show_notice(f"Diagnóstico · {channel.name}", texto)
+
     def _run_modal(self, modal) -> str | None:  # noqa: ANN001
         """Bucle de modal centrado; devuelve el botón o None si no hay UI.
 
@@ -2092,6 +2137,12 @@ class App:
                     selection=self.track_selection(),
                     capabilities=self.track_capabilities(),
                     track_session=self.track_session,
+                )
+            case "diagnose_channel":
+                self.show_diagnose(action["channel"])
+            case "diagnose_channel_connection":
+                self.show_diagnose(
+                    action["channel"], con_conexion=True
                 )
             case "tracks_choose_player":
                 channel = action["channel"]

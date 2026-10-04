@@ -26,6 +26,12 @@ __all__ = [
     "PROTO_HLS",
     "PROTO_DASH",
     "PROTO_MPEGTS",
+    "PROTO_RTMP",
+    "PROTO_RTMPS",
+    "PROTO_RTSP",
+    "PROTO_UDP",
+    "PROTO_MP4",
+    "PROTO_FLV",
     "PROTO_UNKNOWN",
     "DEGRADED_NONE",
     "DEGRADED_NOT_EXPOSED",
@@ -56,17 +62,45 @@ CLOSED_CAPTIONS: TrackType = TrackType.CLOSED_CAPTIONS
 
 
 class Protocol(str, Enum):
-    """Protocolo detectado en la URL del canal (SDD §6)."""
+    """Protocolo del **contenido** de un canal (SDD §6, SDD-M §4.1).
+
+    Deliberadamente **no** incluye los esquemas: ``rtsp`` y ``rtmp`` son
+    transportes (ver :mod:`thetvview.streams.transport`), no formatos de
+    contenedor. Un mismo «directo» viaja por HTTP, RTMP o RTSP y el formato
+    del contenido no cambia, así que mezclar ambos en un enum obligaría a
+    decir «RTSP o HLS» cuando la pregunta correcta es «¿RTSP? ¿y qué formato
+    lleva dentro?».
+
+    Los valores de HLS/DASH/MPEG-TS/UNKNOWN son los de siempre; los nuevos no
+    son tipos de contenido sino **el scheme**, y llegan aquí sólo porque el
+    scheme es la única señal disponible cuando no se ha descargado nada: sin
+    body ni ``Content-Type`` no hay con qué distinguirlos.
+    """
 
     HLS = "hls"
     DASH = "dash"
     MPEGTS = "mpegts"
+    #: Transporte identificado y **suficiente**: para RTMP/RTSP/UDP el
+    #: reproductor negocia el formato con el servidor, y la app no lo sabe.
+    RTMP = "rtmp"
+    RTMPS = "rtmps"
+    RTSP = "rtsp"
+    UDP = "udp"
+    #: MP4 y FLV servidos tal cual: directo de pista única, no seleccionable.
+    MP4 = "mp4"
+    FLV = "flv"
     UNKNOWN = "unknown"
 
 
 PROTO_HLS: str = Protocol.HLS.value
 PROTO_DASH: str = Protocol.DASH.value
 PROTO_MPEGTS: str = Protocol.MPEGTS.value
+PROTO_RTMP: str = Protocol.RTMP.value
+PROTO_RTMPS: str = Protocol.RTMPS.value
+PROTO_RTSP: str = Protocol.RTSP.value
+PROTO_UDP: str = Protocol.UDP.value
+PROTO_MP4: str = Protocol.MP4.value
+PROTO_FLV: str = Protocol.FLV.value
 PROTO_UNKNOWN: str = Protocol.UNKNOWN.value
 
 

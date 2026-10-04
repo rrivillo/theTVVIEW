@@ -441,9 +441,16 @@ los tres:
 - El reproductor se lanza con `subprocess` y **argv en lista**, nunca con
   `shell=True`, y el argv termina siempre en `-- <url>` para que una URL
   hostile no se interprete como opción.
-- Antes de construir nada, la URL se valida contra la política de esquemas
-  (`http`/`https`): un `file://`, un `javascript:` o una URL que empiece por
-  `-` no llegan al reproductor.
+- Antes de construir nada, la URL se valida contra la política de esquemas:
+  `http`/`https` siempre, y además `rtmp`, `rtmps`, `rtsp` y `udp` **sólo
+  para reproducir** (para descargar datos siguen fuera). Un `file://`, un
+  `javascript:` o una URL que empiece por `-` no llegan al reproductor.
+- **El reproductor se elige por lo que sabe abrir, no por ser el primero que
+  se encuentre.** La tabla `player/protocols.py` dice qué transporte abre cada
+  binario, y está **medida** contra los binarios de esta máquina con el mismo
+  comando que recibiría el usuario. Si el elegido muere al instante se prueban
+  los siguientes, como mucho dos, y no se repite uno que ya falló con ese
+  canal.
 - Se prioriza **h264** (el estándar de facto en IPTV): `--vd=ffh264` en mpv,
   `-vc ffh264,ffmpeg2,…` en mplayer, `--avcodec-codec=h264` en vlc.
 - El nombre del canal se pasa como título de la ventana del reproductor
@@ -460,6 +467,76 @@ los tres:
 - Si el reproductor muere en menos de 4 s, se explica que el stream no llegó
   a abrir (lo habitual es una línea caducada o bloqueada en el proveedor), no
   un error local.
+- Si el canal se corta con el reproductor ya en marcha, un supervisor lo
+  detecta y **reconecta el mismo motor** hasta cinco veces, con esperas de
+  1 s, 2 s, 5 s y 10 s. Al rendirse, el mensaje dice cuántas veces se cortó.
+
+### Qué tipos de canal se abren
+
+El tipo de un canal y el modo en que viaja son **dos cosas distintas**, y la
+app las guarda por separado: `https://servidor/live/canal.m3u8` y
+`https://servidor/live/canal` comparten transporte y no se parecen en nada.
+
+| Transporte | Qué es | Quién lo abre (medido aquí) |
+|---|---|---|
+| `http` / `https` | HLS, MPEG-TS, MP4, FLV | los tres |
+| `rtmp` / `rtmps` | directo RTMP, con y sin TLS | mpv y VLC (mplayer **no** abre `rtmps`) |
+| `rtsp` | cámaras IP | los tres, con y sin credenciales |
+| `udp` | directo por UDP | mpv y mplayer (VLC **no**) |
+
+Lo que **no** se ofrece, y por qué, está en `player/protocols.py` con el motivo
+al lado:
+
+- **`rtsps://`** (RTSP sobre TLS): no se ha podido comprobar que los
+  reproductores de esta máquina lo abran, y la app no ofrece lo que no ha
+  medido. Escribe `rtsp://` y, si tu cámara usa TLS, no funciona todavía.
+- **UDP multicast**: se ha podido medir UDP unicast, no multicast, porque esta
+  máquina no tiene ruta multicast utilizable. La diferencia importa: un grupo
+  multicast es red privada por definición y, si el reproductor lo abriera pero
+  el grupo no llegara, el problema sería de tu red (interfaz, firewall, router)
+  y el mensaje lo dice así.
+
+Un canal con transporte que ningún reproductor instalado abre **no se ofrece y
+no es un error**: no se intentó reproducir nada. El modal explica si lo que
+falta es un reproductor o, en el caso de multicast, la red.
+
+### Cámaras IP (RTSP con contraseña)
+
+Una lista con líneas `rtsp://usuario:clave@192.168.1.9:554/stream1` funciona, y
+la contraseña **no** se escribe en ninguna parte:
+
+- Al cargar la lista, un modal te explica qué va a pasar con esas credenciales,
+  porque a partir de ahí la lista ya no se parece a la que escribiste.
+- La clave se guarda en el almacén de secretos del sistema (el mismo donde ya
+  vivían las contraseñas de las Listas Especiales X) y el canal se queda con una
+  referencia opaca `ipcam://…` que no contiene ni la contraseña **ni la dirección
+  de la cámara**.
+- Ese modal sale **una vez** por sesión y por fuente: si la vuelves a abrir y
+  quieres volver a leerlo, vuelve a cargar la lista desde cero (o borra la
+  entrada y añádela otra vez).
+- Esa referencia es lo que se guarda en favoritos y recientes, así que también
+  funcionan con cámaras: no hay nada que redactar porque no hay nada sensible.
+- La contraseña sólo se recupera en el instante de construir el comando del
+  reproductor.
+- Una cámara está en tu red local, así que su lista necesita el permiso de red
+  privada que ya se pide al añadir una fuente.
+- Si la clave cambia en la lista, vuelve a cargarla: es el momento en que se
+  registra la nueva.
+
+### Diagnóstico de un canal
+
+Con el canal reproduciendo, la tecla `d` abre un informe en un modal con lo que
+la app sabe y lo que no:
+
+- Tipo detectado, esquema y MIME, y **por qué** se decidió así.
+- Qué reproductores pueden abrirlo, cada uno con `[OK]` o su motivo, y cuál se
+  eligió.
+- El veredicto: `READY` o el motivo por el que no.
+
+El informe **no incluye la URL** —ni cruda ni redactada—, sólo el tipo y el
+motivo. Es lo que puedes copiar a un canal de soporte sin filtrar un token.
+
+### Pantalla de reproducción
 
 ### Pantalla de reproducción
 
@@ -474,9 +551,13 @@ está en otra ventana) con:
   `Excelente` según latencia media, jitter y porcentaje de éxito. Si el canal
   no es `http(s)` (rtmp, udp…) se indica que no es medible.
 - `q` detiene la reproducción y vuelve a la pantalla anterior.
+- `d` abre el diagnóstico del canal (ver arriba) sin tocar la red.
+- El estado del reproductor se refleja en el medidor: `Reproduciendo`,
+  `Reconectando` si se cortó, `Detenido` al parar.
 - Al salir se apagan todo lo que esa pantalla había abierto: el sondeo en
-  segundo plano, el proxy de calidad y el socket de control de mpv. Dejarlo
-  puesto acumularía procesos y basura en `data/ipc/`.
+  segundo plano, el proxy de calidad, el supervisor de reconexión y el socket
+  de control de mpv. Dejarlo puesto acumularía procesos y basura en
+  `data/ipc/`.
 
 ### Guía EPG
 
@@ -554,12 +635,12 @@ Funcionan en cualquier pantalla salvo mientras escribes en una búsqueda.
 | `!` | Comprobar la seguridad (`security-check`); el resultado sale en un modal. |
 | Ratón | Clic para seleccionar, doble clic para abrir. |
 
-En la pantalla `Reproduciendo` sólo queda una tecla más, y sólo si el canal
-publica alternativas:
+En la pantalla `Reproduciendo` quedan dos teclas:
 
 | Tecla | Acción |
 | --- | --- |
-| `i` | Volver a analizar el manifiesto (pistas nuevas o que desaparecieron). |
+| `d` | Diagnóstico del canal: qué es, qué reproductor puede abrirlo y cuál se eligió. |
+| `i` | Volver a analizar el manifiesto (pistas nuevas o que desaparecieron), sólo si el canal publica alternativas. |
 
 Audio, subtítulos y calidad **no** se cambian desde `Reproduciendo`: eso se
 pregunta antes, en la pantalla `Audio y calidad`, que es la que sale al abrir el
@@ -602,6 +683,10 @@ de reproductor sólo tiene sentido si aún no se ha lanzado nada.
   fuentes), se resuelve —URLs http(s) tal cual, rutas relativas contra el
   directorio del fichero o contra la URL de la lista— y se carga en segundo
   plano.
+- Las líneas `rtmp://`, `rtmps://`, `rtsp://` y `udp://` también son canales
+  válidos, siempre que algún reproductor instalado sepa abrirlas (ver «Qué
+  tipos de canal se abren»). Las de cámara con contraseña se registran solas al
+  cargar la lista.
 
 ### Listas Especiales X
 
@@ -667,7 +752,7 @@ Todo lo persistido vive en `data/` (está en `.gitignore`):
 | `playlists.json` | Catálogo de listas: nombre, origen, tipo y (en Listas Especiales X) servidor y usuario. **Nunca** incluye contraseñas; permisos `0600`. |
 | `favorites.json` | Canales favoritos (identidad = `url`). |
 | `recents.json` | Últimos 20 elementos reproducidos (con la URL redactada si traía credenciales). |
-| `prefs.json` | Último reproductor usado, tema y preferencias de pistas (audio, subtítulos, calidad), con la precedencia canal → proveedor → global. También guarda `last_group_sort` y `ask_track_options`, que la TUI todavía no cambia desde los menús (los grupos salen siempre por nombre y `(sin grupo)` al final). |
+| `prefs.json` | Último reproductor usado, tema y preferencias de pistas (audio, subtítulos, calidad), con la precedencia canal → proveedor → global. También guarda `last_group_sort` y `ask_track_options`, que la TUI todavía no cambia desde los menús (los grupos salen siempre por nombre y `(sin grupo)` al final), y las de multi-stream: `preferred_backend`, `connect_timeout`, `startup_timeout`, `reconnect_max_attempts`, `playback_profile` y `diagnostics_enabled`. |
 | `theme.json` | Tema claro/oscuro. |
 | `epg_cache/` | XMLTV descargados. |
 | `playlist_cache/` | Playlists M3U descargadas. |
@@ -685,12 +770,28 @@ de la URL redactada>` o `provider:<host>`. Es la misma regla que en el resto
 de la app: al disco sólo llegan datos sin credenciales. Del hash se conservan
 32 caracteres: es un identificador estable, no un secreto.
 
+Las preferencias de multi-stream (`preferred_backend`, `connect_timeout`,
+`startup_timeout`, `reconnect_max_attempts`, `playback_profile`,
+`diagnostics_enabled`) están **acotadas al leerlas**: lo que esté fuera de
+rango se sustituye por el valor por defecto. El fichero lo edita una persona
+con un editor de texto, y un `reconnect_max_attempts: 100000` no debe poder
+convertir la app en algo que no responde. Editables a mano:
+
+| Clave | Valores | Para qué |
+| --- | --- | --- |
+| `preferred_backend` | `mpv`, `mplayer`, `vlc` | Ir primero con este, si puede abrir el transporte del canal. No es lo mismo que el último usado. |
+| `connect_timeout` | segundos | Cuánto esperar a que se abra la conexión. |
+| `startup_timeout` | segundos | Cuánto esperar a que empiece a llegar el medio. |
+| `reconnect_max_attempts` | 0-20 (5) | Cuántas veces reconectar **el mismo** reproductor si el canal se corta. El tope de cambiar de reproductor es otro y no se edita: son 2, y viven en `player/router.py`. |
+| `playback_profile` | `low_latency`, `balanced` (por defecto), `stable` | Banderas de caché del reproductor. Desconocido -> `balanced`. |
+| `diagnostics_enabled` | `true` / `false` | Si se puede pedir comprobar la conexión del canal (eso **sale** a la red; el informe sin conexión siempre está). |
+
 ---
 
 ## Tests
 
 ```bash
-# Suite completa (1600 tests, ~2 min)
+# Suite completa (1827 tests, ~2,5 min)
 python -m unittest -v
 
 # Solo tests de una parte
@@ -707,9 +808,11 @@ parser XMLTV (incluye `.gz`), persistencia JSON de playlists, arranque
 multiplataforma (detección del SO + preflight de curses) y dominio
 catch-up (los 8 tests obligatorios del §19, la invariante de capacidad y
 el test AST de "no sondear endpoints"). El resto cubre UI, Listas
-Especiales X, reproductores, layout, tema, recorridos UX completos y
+Especiales X, reproductores, layout, tema, recorridos UX completos,
 selección de pistas (modelo, parsers HLS/DASH, sondeo, política de
-selección, preferencias, argv, IPC y proxy de calidad).
+selección, preferencias, argv, IPC y proxy de calidad) y el multi-stream
+(transporte, detector, router, errores, cámara IP, supervisor, diagnóstico,
+preferencias e integración).
 
 ```bash
 python -m unittest tests.test_catchup -v      # dominio catch-up
@@ -717,7 +820,7 @@ python -m unittest tests.test_catchup_ui -v   # guía, marcadores y modales
 python -m unittest tests.test_tracks_manager -v   # política de selección
 python -m unittest tests.test_streams_hls -v       # parser HLS
 python -m unittest tests.test_player_track_args -v # argv por reproductor
-python -m thetvview.security.check            # 13 controles de seguridad
+python -m thetvview.security.check            # 14 controles de seguridad
 ```
 
 ---
@@ -741,7 +844,9 @@ thetvview/
 ├── groups.py           # agrupación por group-title
 ├── channel_health.py   # salud del stream en vivo (hilo no bloqueante)
 ├── streams/            # descubrimiento del contenido de un canal
-│   ├── detector.py     # protocolo: cuerpo + Content-Type + extensión (§6)
+│   ├── transport.py    # el ESQUEMA (http/rtmp/rtsp/udp/…) — no el contenido
+│   ├── detector.py     # protocolo: esquema + cuerpo + MIME + extensión
+│   ├── diagnose.py     # informe de un canal (sin URL, texto redactado)
 │   ├── hls.py          # master/media playlist → capacidades (lista blanca)
 │   ├── dash.py         # MPD → capacidades (xml_safe, sin DTD/entidades)
 │   ├── probe.py        # descarga del manifest por safe_http + caché TTL
@@ -758,11 +863,17 @@ thetvview/
 ├── player/             # backend: qué sabe hacer cada reproductor
 │   ├── __init__.py     # reexporta la API pública (from thetvview.player import launch)
 │   ├── core.py         # lanzamiento de mpv/mplayer/vlc (sin shell)
-│   ├── capabilities.py # tabla verificada de capacidades
+│   ├── capabilities.py # tabla verificada de PISTAS (audio/subtítulos/calidad)
+│   ├── protocols.py    # tabla verificada de TRANSPORTES (hls/rtmp/rtsp/udp)
+│   ├── router.py       # qué reproductor abrir por capacidad (el §8 del SDD-M)
+│   ├── errors.py       # PlayerError y errores de reproducción normalizados
+│   ├── supervisor.py   # reconexión limitada (1/2/5/10 s, máx. 5) y perfiles
 │   ├── track_args.py   # PlaybackSelection → argv (lista blanca)
 │   └── mpv_ipc.py      # cliente del IPC local de mpv (1,5 s por comando)
 ├── stream_ref.py       # referencias opacas xtream:// y xtream-ts://
 │                       #   (directo y archivo, sin credenciales)
+├── cam_ref.py          # referencia opaca ipcam:// (cámaras RTSP, sin
+│                       #   credenciales ni dirección del dispositivo)
 ├── catchup.py          # dominio catch-up: capacidad declarada, ventana,
 │                       #   estados, adaptadores y plantilla catchup-source
 ├── security/           # política de URL, SSRF, TLS, redacción, límites,
@@ -829,6 +940,10 @@ degradando en silencio.
 | *El canal se ve pero no oigo* | Pasó al elegir calidad: revisa si el proxy quedó levantado con un master sin su grupo de audio. `i` desde `Reproduciendo` vuelve a analizar el manifiesto. |
 | *Los subtítulos no aparecen con MPV* | Es una limitación del demuxer HLS de ffmpeg, no de la app: los declarados como pista aparte (`EXT-X-MEDIA TYPE=SUBTITLES`) no los expone. Con VLC funcionan. |
 | *La app tarda un poco al abrir un canal* | Son los 2,5 s de espera acotada del sondeo de manifiesto (4 s en Windows), y sólo en canales cuya URL puede ser un manifiesto: un `.ts` no espera. Es una espera con su pantalla explicando qué pasa, y durante ella la interfaz sigue viva. |
+| *Un canal RTSP/RTMP/UDP no abre* | `d` desde `Reproduciendo` (o el diagnóstico de la lista) dice por qué. Lo más común: que el transporte no lo abra ningún reproductor instalado, que la red no deje pasar el destino, o que sea una cámara sin contraseña registrada. |
+| *La cámara no reproduce* | Vuelve a cargar la lista: es al cargarla cuando la contraseña se registra. Y comprueba que la lista tiene permitido el acceso a red privada. |
+| *El canal se corta y vuelve solo* | Reconexión automática, hasta 5 veces con esperas de 1, 2, 5 y 10 s. Si se corta más, el aviso final dice cuántas veces pasó. |
+| *Un HLS no se abre con MPlayer* | Si la URL no acaba en `.m3u8`, su libavformat no detecta el manifiesto. Es una limitación medida de ese binario, no de la app. |
 | *¿De dónde salen los datos?* | Borra `data/` para reiniciar de cero. |
 
 ---
@@ -839,16 +954,16 @@ Todo lo que llega de una lista (URL, XMLTV, nombres, `EXTVLCOPT`) se trata
 como **dato no confiable**. Compruébalo tú mismo:
 
 ```bash
-python -m thetvview.security.check        # 13 controles; exit != 0 si falla
+python -m thetvview.security.check        # 14 controles; exit != 0 si falla
 python -m thetvview.security.check -v     # detalle de cada control
 python -m thetvview.security.check --json # para CI
 ```
 
-Los 13 controles: redacción de secretos, verificación TLS, política SSRF,
+Los 14 controles: redacción de secretos, verificación TLS, política SSRF,
 redirects, límites de respuesta, XML seguro, saneado de secretos para IA,
-invocación sin shell, almacenamiento de credenciales, ausencia de contraseñas
-en logs, cero dependencias pip, puerta de capacidad catch-up y aislamiento
-del descubrimiento de pistas.
+invocación sin shell, referencias opacas sin credenciales, almacenamiento de
+credenciales, ausencia de contraseñas en logs, cero dependencias pip, puerta de
+capacidad catch-up y aislamiento del descubrimiento de pistas.
 
 Dentro de la app, la tecla **`!`** ejecuta lo mismo y el resultado sale
 **siempre en un modal** (lo mismo ocurre con todos los errores y avisos).
@@ -856,16 +971,21 @@ Dentro de la app, la tecla **`!`** ejecuta lo mismo y el resultado sale
 - **Un solo camino de red** (`security/safe_http.py`): timeout total, tope de
   bytes, hasta 3 redirects **revalidados uno a uno**, bloqueo del downgrade
   `https → http` y TLS estricto (CA del sistema, hostname, ≥ 1.2).
-- **Política de URL + SSRF**: sólo `http(s)`; loopback, redes privadas,
-  enlaces locales, metadatos de la nube y direcciones ambiguas
+- **Política de URL + SSRF**: `http(s)` para descargar, y además
+  `rtmp`/`rtmps`/`rtsp`/`udp` **sólo para reproducir**; loopback, redes
+  privadas, enlaces locales, metadatos de la nube y direcciones ambiguas
   (`0177.0.0.1`, `2130706433`) se rechazan. La excepción de red privada es
   **por lista** y pide confirmación al añadirla; una URL `http://` sin cifrar
-  genera un aviso, pero no se bloquea.
+  genera un aviso, pero no se bloquea. Una URL con `usuario:clave@` se rechaza
+  en todos los esquemas: las credenciales van aparte, también las de cámara.
 - **Sin credenciales en las URLs**: los streams de Listas Especiales X se
   guardan como `xtream://fuente/tipo/id.ts` y se resuelven en el momento de
   reproducir. La referencia de archivo es el mismo patrón con otro prefijo
-  (`xtream-ts://fuente/id.ts?start=…&dur=…`). Favoritos y recientes se redactan
-  y reescriben si traían una URL vieja.
+  (`xtream-ts://fuente/id.ts?start=…&dur=…`). Las cámaras RTSP usan un tercer
+  prefijo, `ipcam://fuente/id`, que **no contiene ni la contraseña ni la
+  dirección del dispositivo**: sólo un identificador, y el secreto va al
+  keyring. Favoritos y recientes se redactan y reescriben si traían una URL
+  vieja.
 - **Contraseñas en el keyring del SO**: `security/secrets.py` habla con
   libsecret, keychain o DPAPI según el SO; sin keyring la contraseña queda
   sólo en memoria. Nunca se escribe en claro en `data/playlists.json`.

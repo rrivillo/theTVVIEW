@@ -48,13 +48,19 @@ class TestLosChecksPasan(unittest.TestCase):
             "XML safe parsing",
             "AI secret sanitizer",
             "Shell-safe player invocation",
+            # Noveno y décimo del SDD-M: con RTMP/RTSP/UDP abiertos, la
+            # referencia opaca de cámara (`ipcam://`) es el segundo mecanismo
+            # por el que una credencial podría llegar a `data/`, y comprueba
+            # las dos mitades —que no lleve nada y que no se pueda construir
+            # un argv con userinfo— junto a lo que ya hacía Xtream.
+            "Opaque refs carry no credentials",
             "Credential storage",
             "No plaintext password logs",
         ]
-        self.assertEqual(labels[:10], esperados)
-        self.assertIn("Zero pip dependencies", labels[10:])
-        self.assertIn("Catch-up capability gate", labels[11:])
-        self.assertIn("Track discovery sandbox", labels[12:])
+        self.assertEqual(labels[:11], esperados)
+        self.assertIn("Zero pip dependencies", labels[11:])
+        self.assertIn("Catch-up capability gate", labels[12:])
+        self.assertIn("Track discovery sandbox", labels[13:])
         self.assertEqual(len(set(c[0] for c in sec_check.CHECKS)), len(sec_check.CHECKS))
 
 

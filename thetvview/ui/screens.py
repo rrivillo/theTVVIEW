@@ -24,6 +24,7 @@ from thetvview.groups import groups_of
 from thetvview.models import Channel, Playlist
 from thetvview.playlist_manager import PlaylistEntry, PlaylistError, PlaylistManager
 from thetvview.recents import RecentsManager
+from thetvview.cam_ref import MissingCamCredentialsError
 from thetvview.stream_ref import MissingCredentialsError, resolve_channel_url
 from thetvview.tracks.labels import audio_label, subtitle_label, video_label
 from thetvview.tracks.manager import QUICK_AUTO, SelectTrackError
@@ -2009,6 +2010,9 @@ class NowPlayingScreen(Screen):
         catchup_program=None,  # noqa: ANN001 - Program | None
         track_session=None,  # noqa: ANN001 - TrackSession | None
         pin_proxy=None,  # noqa: ANN001 - PinProxy | None
+        failures=None,  # noqa: ANN001 - set[str] | None
+        relanzar=None,  # noqa: ANN001 - Callable[[], Popen] | None
+        intentos_maximos: int = 5,
     ) -> None:
         super().__init__(app)
         self.channel = channel
@@ -2043,6 +2047,27 @@ class NowPlayingScreen(Screen):
         # un .ts o un canal sin manifiesto se reproduce igual que antes.
         self.tracks = track_session
         self.pin_proxy = pin_proxy
+        # Supervisor de reconexión (SDD-M §17). **No** reproduce: observa el
+        # proceso, publica un estado y llama a `relanzar` cuando toca. La
+        # pantalla sólo pinta ese estado (igual que hace con la salud del
+        # canal), nunca decide cuándo reconectar: si lo hiciera, el
+        # comportamiento dependería de si hay alguien mirando la pantalla.
+        self._failures: set[str] = set(failures or ())
+        self.supervisor = None
+        if relanzar is not None:
+            try:
+                from thetvview.player.supervisor import (
+                    ReconnectPolicy,
+                    ReconnectSupervisor,
+                )
+
+                self.supervisor = ReconnectSupervisor(
+                    relanzar=relanzar,
+                    policy=ReconnectPolicy(max_attempts=intentos_maximos),
+                )
+                self.supervisor.start(proc)
+            except Exception:
+                self.supervisor = None  # sin supervisor, el resto igual
         # Salud del canal en tiempo real (hilo daemon no bloqueante)
         if health_monitor is not None:
             self.health = health_monitor
@@ -2059,13 +2084,33 @@ class NowPlayingScreen(Screen):
         # el canal abierto no se pueden cambiar (una pista fija se aplica al
         # lanzar). La toolbar queda con lo que sí tiene sentido aquí.
         extra = " · i Info" if self.tracks else ""
-        return f"q Detener{extra} · ? Ayuda"
+        # `d` diagnóstico siempre: es lo que contesta «¿por qué no abre?» sin
+        # tener que adivinar (SDD-M §21), y es la única ayuda cuando un canal
+        # muere al instante.
+        return f"q Detener · d Diagnóstico{extra} · ? Ayuda"
 
     def is_alive(self) -> bool:
+        # El proceso vivo es el del supervisor si lo hay: tras un corte, el
+        # `proc` original sigue muerto y la pantalla se cerraría en el primer
+        # tick mientras el canal ya se está reabriendo.
+        proceso = self.proc
+        supervisor = getattr(self, "supervisor", None)
+        if supervisor is not None and getattr(supervisor, "proceso", None) is not None:
+            proceso = supervisor.proceso
         try:
-            return self.proc.poll() is None
+            return proceso.poll() is None
         except Exception:
             return False
+
+    def playback_state(self) -> object:  # noqa: ANN001 - PlaybackState | None
+        """Estado de reproducción para pintarlo (§17).
+
+        Devuelve ``None`` si no hay supervisor: la pantalla entonces se
+        comporta exactamente como antes, que es lo que el §32 del SDD de pistas
+        garantiza para un stream sin extras.
+        """
+        supervisor = getattr(self, "supervisor", None)
+        return getattr(supervisor, "estado", None) if supervisor else None
 
     def exit_summary(self) -> str:
         """Mensaje de cierre según cómo murió el reproductor.
@@ -2073,7 +2118,18 @@ class NowPlayingScreen(Screen):
         Si murió al instante con código != 0, explica la causa probable
         (stream que no abrió: proveedor/URL) en vez del "finalizado"
         genérico que ocultaba el problema.
+
+        Y si hubo reconexiones, dice cuántas: un canal que se cortó tres veces
+        y acabó-engregando no es un canal que «se ha terminado», y el usuario
+        necesita esa diferencia para decidir si insistir.
         """
+        intentos = int(getattr(getattr(self, "supervisor", None), "intentos", 0) or 0)
+        if intentos:
+            plural = "vez" if intentos == 1 else "veces"
+            return (
+                f"'{self.channel.name}' se cortó y se reconectó {intentos} "
+                f"{plural} sin llegar a reproducirse del todo."
+            )
         try:
             returncode = self.proc.poll()
         except Exception:
@@ -2098,6 +2154,10 @@ class NowPlayingScreen(Screen):
     def handle_key(self, key: int) -> dict | None:
         if key in (ord("q"), ord("Q"), 27, curses.KEY_LEFT, curses.KEY_BACKSPACE):
             return {"action": "stop_playback"}
+        if key in (ord("d"), ord("D")):
+            # Diagnóstico **sin** conexión: es puro y no espera. La conexión de
+            # verdad va en el modal, con su propia tecla, porque abre red.
+            return {"action": "diagnose_channel", "channel": self.channel}
         if self.tracks is None:
             return None
         # Sólo queda `i`. Las pistas (audio, subtítulos y calidad) **no**
@@ -2116,6 +2176,13 @@ class NowPlayingScreen(Screen):
         Se llama al parar la reproducción, al saltar hacia atrás y al salir
         de la app. Es idempotente y nunca lanza.
         """
+        supervisor = getattr(self, "supervisor", None)
+        if supervisor is not None:
+            try:
+                supervisor.stop()
+            except Exception:
+                pass
+            self.supervisor = None
         sesion = getattr(self, "tracks", None)
         if sesion is not None:
             try:
@@ -2234,6 +2301,18 @@ class NowPlayingScreen(Screen):
         return "[" + inner + "]"
 
     def _meter_state_text(self, alive: bool) -> str:
+        """Texto del medidor, con el estado del supervisor si lo hay (§17).
+
+        Sin supervisor, exactamente lo de siempre: «Reproduciendo» o
+        «Detenido». Con supervisor, el estado real —«Reconectando», «Cargando»—
+        que es la información que hace falta cuando algo va mal, y que sólo él
+        sabe. La pantalla **no decide** nada aquí: lee.
+        """
+        supervisor = getattr(self, "supervisor", None)
+        if supervisor is not None:
+            estado = getattr(supervisor, "estado", None)
+            if estado is not None and alive:
+                return str(getattr(estado, "texto", "Reproduciendo"))
         return "Reproduciendo" if alive else "Detenido"
 
     # --- Pistas: sólo lo que el manifiesto declaró de verdad -----------------
@@ -2703,6 +2782,7 @@ def open_playlist(app, entry: PlaylistEntry) -> None:
     if not playlist.channels:
         app.status.show(f"'{entry.name}' no contiene canales.", error=True)
         return
+    _explicar_camaras(app, playlist)
     auto_epg = getattr(app, "auto_load_playlist_epg", None)
     if callable(auto_epg):
         # La lista puede traer su EPG en la cabecera: se carga en segundo
@@ -2713,6 +2793,51 @@ def open_playlist(app, entry: PlaylistEntry) -> None:
         except Exception:
             pass
     app.push(ChannelsScreen(app, playlist))
+
+
+def _explicar_camaras(app, playlist) -> None:  # noqa: ANN001
+    """Explica, una vez por sesión, el flujo de credenciales de las cámaras (H11).
+
+    Es el sitio donde el usuario se entera de que su M3U traía líneas
+    ``rtsp://`` con usuario y contraseña, y de que a partir de ahora esa
+    contraseña **no está en la lista**: está en el almacén del sistema y el
+    canal lleva una referencia. Sin este aviso, el primer favorito de una
+    cámara parece un canal normal, y cuando alguien mira el M3U ve una URL
+    distinta a la que escribió y no sabe por qué.
+
+    Una vez por sesión y por fuente: un aviso que aparece cada vez que se abre
+    la lista deja de leerse, y uno que no se lee no informa de nada. Cambiar de
+    lista vuelve a explicar, porque es otra situación.
+
+    Nunca lanza: si la UI no está (tests) o el modal no se puede pintar, se
+    degrada en silencio. Explicar es informativo; romper la apertura, no.
+    """
+    from thetvview.cam_ref import camera_names, explain_camera_flow
+
+    try:
+        nombres = camera_names(getattr(playlist, "channels", None) or ())
+    except Exception:  # noqa: BLE001 - un aviso nunca impide abrir la lista
+        return
+    if not nombres:
+        return
+    vistos = getattr(app, "_camaras_explicadas", None)
+    if vistos is None:
+        vistos = set()
+        try:
+            app._camaras_explicadas = vistos
+        except Exception:  # noqa: BLE001 - app de pruebas sin atributos
+            return
+    fuente = str(getattr(playlist, "name", "") or "")
+    if fuente in vistos:
+        return
+    vistos.add(fuente)
+    aviso = getattr(app, "_show_notice", None)
+    if not callable(aviso):
+        return
+    try:
+        aviso("Cámaras IP en la lista", explain_camera_flow(len(nombres)))
+    except Exception:  # noqa: BLE001 - igual que arriba
+        return
 
 
 def _open_xtream_playlist(app, entry: PlaylistEntry) -> None:
@@ -2823,6 +2948,74 @@ def _open_xtream_playlist(app, entry: PlaylistEntry) -> None:
     app.push(ChannelsScreen(app, playlist))
 
 
+class _ResolutorCredenciales:
+    """Une el catálogo de playlists y el almacén del SO para resolver ``url``.
+
+    Hay dos mecanismos de referencia opaca y cada uno vive en su sitio:
+
+    - ``xtream://`` → :class:`~thetvview.playlist_manager.PlaylistManager`, que
+      expone ``get_credentials(fuente)``;
+    - ``ipcam://`` → :mod:`thetvview.security.secrets`, que expone
+      ``get_password(clave)``.
+
+    :func:`resolve_channel_url` habla con un único objeto, así que se le pasa
+    uno que reúna las dos interfaces. Se hace aquí y no dentro de
+    ``resolve_channel_url`` para que el parser M3U siga siendo una función pura
+    que no toca disco, y para que los tests puedan pasar un catálogo falso.
+    """
+
+    __slots__ = ("_catalogo", "_store")
+
+    def __init__(self, catalogo: object, store: object) -> None:
+        self._catalogo = catalogo
+        self._store = store
+
+    def get_credentials(self, name: str):  # type: ignore[no-untyped-def]
+        getter = getattr(self._catalogo, "get_credentials", None)
+        return getter(name) if callable(getter) else None
+
+    def get_password(self, key: str) -> str | None:
+        getter = getattr(self._store, "get_password", None)
+        return getter(key) if callable(getter) else None
+
+
+def _nada():  # noqa: ANN201 - context manager vacío, para el `with` condicional
+    """Context manager que no hace nada.
+
+    Existe para poder escribir ``with A if cond else _nada():`` sin duplicar la
+    llamada. Un `nullcontext` del stdlib haría lo mismo, pero esto no obliga a
+    a importar contextlib para un solo uso en una línea.
+    """
+    return _NADA
+
+
+class _Nada:  # noqa: N801 - es un context manager privado
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *_exc: object) -> None:
+        # `None` y no `False`: los dos significan «no capturo la excepción», pero
+        # sólo `None` es un tipo honesto para «no hago nada». Anotar `bool`
+        # aquí es lo que hace que un context manager pueda tragarse
+        # excepciones sin querer.
+        return None
+
+
+_NADA = _Nada()
+
+
+def _almacen_de(app) -> object:  # noqa: ANN001
+    """Resolutor de credenciales para referencias opacas.
+
+    Las referencias ``ipcam://…`` se resuelven contra el almacén del SO, que
+    es donde la contraseña existe en claro y el SO la cifra; las de Xtream,
+    contra el catálogo de playlists, como hasta ahora.
+    """
+    from thetvview.security.secrets import get_store
+
+    return _ResolutorCredenciales(getattr(app, "playlists", None), get_store())
+
+
 def play_channel(  # noqa: ANN001
     app,
     channel,
@@ -2850,6 +3043,13 @@ def play_channel(  # noqa: ANN001
     El proxy vive **mientras dure la reproducción**: se lo pasa a
     :class:`NowPlayingScreen`, que lo apaga al cerrar (plan F5c: apagado
     siempre, en el ``finally``).
+
+    Y con el multi-stream (SDD-M §8/§17/§26) el reproductor lo elige
+    :mod:`thetvview.player.router` por **capacidad**, no por ser el primero que
+    se encuentre; si el elegido muere al instante se prueban los siguientes
+    (como mucho dos, §26) y, una vez en marcha, un
+    :mod:`thetvview.player.supervisor` vigila el proceso y reconecta **el
+    mismo** motor si se corta.
     """
     # Las URLs Xtream son opacas en el dominio: aquí (y sólo aquí) se
     # recuperan las credenciales. El objeto original no se toca, para que
@@ -2859,16 +3059,35 @@ def play_channel(  # noqa: ANN001
     # resuelve por el mismo camino: el reproductor no distingue los dos
     # modos y el motor multimedia es el mismo (SDD Catch-up §14).
     try:
-        resolved = resolve_channel_url(channel.url, getattr(app, "playlists", None))
-    except MissingCredentialsError as exc:
+        resolved = resolve_channel_url(channel.url, _almacen_de(app))
+    except (MissingCredentialsError, MissingCamCredentialsError) as exc:
         _error(app, str(exc))
         return
-    if resolved != channel.url:
+    es_camara = resolved != channel.url
+    if es_camara:
         channel = replace(channel, url=resolved)
 
     proxy = None
     proxy_url: str | None = None
     avisos: list[str] = []
+
+    # Preferencias de multi-stream (§33). Se leen aquí, una vez, y se pasan
+    # explícitas: `play_channel` no debe ir a buscar el fichero de preferencias
+    # por su cuenta, porque los tests lo llaman con una app que no tiene `prefs`
+    # de disco.
+    preferred_backend = ""
+    reconnect_max_attempts = 5
+    gestor = getattr(app, "prefs", None)
+    if gestor is not None:
+        try:
+            ajustes = gestor.load()
+            preferred_backend = ajustes.preferred_backend or ""
+            reconnect_max_attempts = ajustes.reconnect_max_attempts
+        except Exception:
+            # Una preferencia corrupta no impide reproducir: se reproduce con
+            # los valores conocidos, que es el comportamiento de siempre.
+            preferred_backend = ""
+            reconnect_max_attempts = 5
     if selection is not None and capabilities is not None:
         proxy, avisos = _start_pin(capabilities, selection, player_name)
         if proxy is not None:
@@ -2903,25 +3122,31 @@ def play_channel(  # noqa: ANN001
         extra["proxy_url"] = proxy_url
     if ipc_path:
         extra["ipc_path"] = ipc_path
+    if preferred_backend:
+        # Criterio 1 del §27: el reproductor que el usuario eligió por
+        # preferencia. No es lo mismo que `last_player` (el último usado), y por
+        # eso viaja en `prefs.preferred_backend` y no aquí.
+        extra["preferred"] = preferred_backend
+    fallos: set[str] = set()
     try:
-        proc = player.launch(channel, player_name=player_name, **extra)
+        # Si el canal venía como referencia opaca de cámara, `resolved` lleva
+        # la credencial que se reconstruyó desde el keyring. Se marca como
+        # «reconstruida por la app» sólo durante la construcción del argv:
+        # `validate_url` rechaza el userinfo en todos los esquemas, y esa regla
+        # protege las URLs que vienen de una lista, así que la única excepción
+        # posible es aquí y se declara, no se deduce.
+        with player.url_de_camara_resuelta(resolved) if es_camara else _nada():
+            proc, effective_name = _lanzar_con_router(
+                channel, player_name, preferred_backend, fallos, extra
+            )
     except player.PlayerError as exc:
         if proxy is not None:
             proxy.stop()
+        # Un `NoCompatibleBackend` no es «falló la reproducción» sino «este
+        # canal no se puede abrir aquí»; el mensaje ya lo dice y el §14 pide
+        # no confundirlos, así que no se le añade nada encima.
         _error(app, str(exc))
         return
-    # Push de pantalla informativa; auto-pop cuando el proceso termina (ver App.run).
-    # Si player_name venía None (no debería desde PlayerScreen), inferirlo del binario.
-    effective_name = player_name or "mpv"
-    try:
-        # Intentar deducir nombre real si launch eligió el primero disponible
-        if player_name is None:
-            for cand in config.SUPPORTED_PLAYERS:
-                if config.find_player(cand):
-                    effective_name = cand
-                    break
-    except Exception:
-        pass
     if track_session is not None:
         track_session.ipc_path = ipc_path
     app.push(NowPlayingScreen(
@@ -2930,6 +3155,15 @@ def play_channel(  # noqa: ANN001
         catchup_program=catchup_program,
         track_session=track_session,
         pin_proxy=proxy,
+        failures=fallos,
+        relanzar=(
+            (lambda: _relanzar_mismo_motor(
+                channel, effective_name, extra, app
+            ))
+            if player_name is None
+            else None
+        ),
+        intentos_maximos=reconnect_max_attempts,
     ))
     app.prefs.set_last_player(effective_name)
     for aviso in _avisos_sin_repetir(app, channel, effective_name, avisos):
@@ -2942,7 +3176,63 @@ def play_channel(  # noqa: ANN001
             f"{effective_name.upper()} (pid {proc.pid})."
         )
         return
-    app.status.show(f"Reproduciendo '{channel.name}' con {effective_name.upper()} (pid {proc.pid}).")
+    app.status.show(f"Reproduzco '{channel.name}' con {effective_name.upper()} (pid {proc.pid}).")
+
+
+def _lanzar_con_router(channel, player_name, preferred, fallos, extra):  # noqa: ANN001
+    """Lanza el reproductor y devuelve ``(proceso, nombre)``.
+
+    Con ``player_name`` explícito es un ``launch`` de toda la vida. Sin él, el
+    router decide por capacidad y, si el que eligió falla **inmediatamente**,
+    se prueban los siguientes hasta el tope del §26 — lo que también evita el
+    ciclo mpv→vlc→mpv→vlc porque ``fallos`` recuerda lo ya probado.
+    """
+    from thetvview.player.router import MAX_BACKEND_ATTEMPTS, NoCompatibleBackend
+
+    if player_name:
+        return player.launch(channel, player_name=player_name, **extra), player_name
+
+    from thetvview.player.router import attempts
+
+    candidatos = attempts(
+        channel.url, preferred=preferred, failures=fallos
+    )
+    if not candidatos:
+        # Sin candidatos viables no se lanza nada: se delega el motivo al
+        # router, que distingue «no instalado» de «no lo abre nadie».
+        return player.launch(
+            channel, player_name=None, preferred=preferred, **extra
+        )
+    ultimo: Exception | None = None
+    for indice, cand in enumerate(candidatos[:MAX_BACKEND_ATTEMPTS]):
+        try:
+            proc = player.launch(channel, player_name=cand.name, **extra)
+        except player.PlayerError as exc:
+            fallos.add(cand.name)
+            ultimo = exc
+            continue
+        return proc, cand.name
+    if ultimo is not None:
+        raise ultimo
+    raise NoCompatibleBackend(  # pragma: no cover - `candidatos` no está vacío
+        "No se pudo abrir el canal con ningún reproductor instalado."
+    )
+
+
+def _relanzar_mismo_motor(channel, player_name, extra, app):  # noqa: ANN001
+    """Relanza el mismo reproductor (lo usa el supervisor tras una caída).
+
+    Se relanza **el mismo** y no otro: el §26 trata el cambio de reproductor
+    como una decisión distinta, con su propio tope, y mezclarla aquí haría que
+    un corte de red acabara abriendo el canal con otro motor sin que nadie lo
+    pidiera.
+    """
+    try:
+        proc = player.launch(channel, player_name=player_name, **extra)
+    except player.PlayerError:
+        return None
+    _warn(app, "El canal se cortó; reintentando con el mismo reproductor.")
+    return proc
 
 
 def _avisos_sin_repetir(app, channel, player_name, avisos):  # noqa: ANN001

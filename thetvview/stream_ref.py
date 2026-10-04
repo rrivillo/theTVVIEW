@@ -35,6 +35,8 @@ __all__ = [
     "StreamRef",
     "is_opaque_ref",
     "resolve_channel_url",
+    "resolve_cam_ref",
+    "is_cam_ref",
 ]
 
 #: Prefijo de la referencia opaca. No es un esquema jugable en la red.
@@ -143,13 +145,21 @@ class StreamRef:
 
 
 def is_opaque_ref(url: str) -> bool:
-    """True si `url` es una referencia opaca (directo o archivo).
+    """True si `url` es una referencia opaca (directo, archivo o cámara).
 
     Las referencias opacas no llevan credenciales, así que quien las
     persiste (favoritos, recientes) debe dejarlas intactas: no hay nada
     que redactar ni que migrar.
+
+    La de cámara (``ipcam://``) entra por aquí —y no en un predicado aparte—
+    porque para quien guarda en disco la pregunta es la misma: *¿esto lleva
+    secretos?* Y la respuesta es no en los tres casos.
     """
-    return isinstance(url, str) and url.startswith(OPAQUE_PREFIXES)
+    if not isinstance(url, str):
+        return False
+    from .cam_ref import PREFIX as CAM_PREFIX
+
+    return url.startswith(tuple(OPAQUE_PREFIXES) + (CAM_PREFIX,))
 
 
 def resolve_channel_url(url: str, manager: object) -> str:
@@ -160,11 +170,33 @@ def resolve_channel_url(url: str, manager: object) -> str:
     - Si es ``xtream://``, se resuelve con `StreamRef` (directo).
     - Si es ``xtream-ts://``, se resuelve con `CatchupRef` (archivo):
       el mismo `MissingCredentialsError`, el mismo "en caliente".
+    - Si es ``ipcam://``, se resuelve con `CamRef` (cámara RTSP). Va **aquí**
+      y no en un segundo sitio porque el criterio es único: una sola función
+      donde una URL opaca se convierte en algo que el reproductor entienda.
     - Si lleva un prefijo pero está corrupta, también se niega: jamás se
-      manda ``xtream://…`` ni ``xtream-ts://…`` al reproductor.
+      manda ``xtream://…`` ni ``xtream-ts://…`` ni ``ipcam://…`` al
+      reproductor.
+
+    La cámara se resuelve contra el **almacén de secretos del SO**, no contra
+    el catálogo de playlists: es lo que se le pase como `manager` (lo normal es
+    :func:`thetvview.security.secrets.get_store`), y basta con que tenga
+    ``get_password``.
     """
     if not isinstance(url, str):
         return url
+    from .cam_ref import (
+        PREFIX as CAM_PREFIX,
+        CamRef,
+        MissingCamCredentialsError,
+    )
+
+    if url.startswith(CAM_PREFIX):
+        cam = CamRef.parse(url)
+        if cam is None:
+            raise MissingCamCredentialsError(
+                "Referencia de cámara ilegible; vuelve a abrir la lista de origen."
+            )
+        return resolve_cam_ref(cam, manager)
     if url.startswith(TS_PREFIX):
         from .catchup import CatchupRef  # import perezoso: evita el ciclo
 
@@ -182,6 +214,25 @@ def resolve_channel_url(url: str, manager: object) -> str:
             "Referencia de stream ilegible; vuelve a abrir la lista de origen."
         )
     return ref.resolve(manager)
+
+
+def resolve_cam_ref(ref: object, store: object) -> str:
+    """Atajo a :func:`thetvview.cam_ref.resolve_cam_ref`.
+
+    Existe para que quien importa desde aquí no tenga que saber que las cámaras
+    viven en otro módulo: la pregunta es «¿qué URL va al reproductor?», y la
+    respuesta está en esta función.
+    """
+    from .cam_ref import resolve_cam_ref as _resolve
+
+    return _resolve(ref, store)  # type: ignore[arg-type]
+
+
+def is_cam_ref(url: str) -> bool:
+    """True si `url` es una referencia opaca de cámara ``ipcam://…``."""
+    from .cam_ref import is_cam_ref as _is
+
+    return _is(url)
 
 
 def has_credentials(url: str) -> bool:

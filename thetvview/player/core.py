@@ -28,18 +28,26 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from contextlib import contextmanager
 from typing import Any
 
 from .. import config
 from ..models import Channel
 from ..security.errors import InvalidUrlError
 from ..security.safe_http import DEFAULT_USER_AGENT
-from ..security.url_policy import PURPOSE_STREAM, validate_url
+from ..security.url_policy import (
+    PURPOSE_STREAM,
+    authorize_camara_url,
+    validate_url,
+)
+from .errors import PlayerError, StreamError, explain
+from .router import NoCompatibleBackend, select_backend
 from .track_args import track_args
 
 
-class PlayerError(Exception):
-    """Error amigable al lanzar un reproductor."""
+#: ``PlayerError`` vive en :mod:`thetvview.player.errors` (para que el router
+#: pueda heredar de él sin ciclo de imports) y aquí se reexporta sin más: para
+#: todo el código que usa ``player.PlayerError`` sigue siendo la misma clase.
 
 
 # Segundos bajo los cuales una muerte del reproductor se considera
@@ -52,9 +60,14 @@ def explain_early_exit(returncode: int | None, elapsed_seconds: float) -> str | 
 
     - returncode None: sigue vivo (no hay nada que explicar).
     - returncode 0 o duración normal: fin normal, sin mensaje extra.
-    - Otro código en <EARLY_EXIT_SECONDS: el stream no abrió. En la
-      práctica casi siempre es el proveedor (401/línea caducada o
-      bloqueada, URL caída), no el comando local.
+    - Otro código en <EARLY_EXIT_SECONDS: el stream no abrió.
+
+    El texto **no** ha cambiado, y a propósito: ya decía lo importante
+    («suele ser el proveedor») y cambiarlo haría que los tests y los usuarios
+    que loconocendiedieran dos veces lo mismo. Lo que ha cambiado es que ahora
+    existe :func:`thetvview.player.errors.explain`, que además **clasifica**
+    el código y dice qué revisar; :func:`diagnose_early_exit` da esa versión
+    cuando hay salida del reproductor que mirar.
     """
     if returncode is None:
         return None
@@ -70,6 +83,28 @@ def explain_early_exit(returncode: int | None, elapsed_seconds: float) -> str | 
         "URL caída). Prueba otro canal; si fallan todos, pide al proveedor "
         "que revise la línea."
     )
+
+
+def diagnose_early_exit(
+    returncode: int | None,
+    elapsed_seconds: float,
+    detalle: str = "",
+) -> StreamError | None:
+    """Como :func:`explain_early_exit`, pero **clasificado** (SDD-M §20).
+
+    Devuelve None en los mismos casos que devuelve None aquélla (sigue vivo,
+    o terminó con normalidad), para que llamarla siempre sea seguro.
+
+    Args:
+        detalle: lo que escribió el reproductor. **Pasa por
+            :func:`~thetvview.security.redaction.redact_text` antes** si
+            puede contener una URL con token: el §22 del SDD-M no se
+            implementa con un módulo de logging (decisión D5), sino con
+            redacción en el punto donde nace el texto.
+    """
+    if explain_early_exit(returncode, elapsed_seconds) is None:
+        return None
+    return explain(returncode, detalle)
 
 
 # Claves EXTVLCOPT que traducimos, por reproductor (claves canónicas).
@@ -250,6 +285,44 @@ def _option_args(
     return args, warnings
 
 
+def _es_url_de_camara_resuelta(url: str) -> bool:
+    """True si `url` es una URL de cámara que la app acaba de reconstruir.
+
+    Se distingue por la **referencia opaca que se resolvió justo antes**, no
+    por su forma: un `rtsp://user:pass@…` que venga de un M3U se convierte en
+    `ipcam://…` antes de llegar aquí (`thetvview.ui.screens.play_channel`), así
+    que cualquier `rtsp://` con userinfo que llega a este punto la construyó la
+    app. Lo que se mira es que quede marcado como tal.
+    """
+    return _RESUELTAS_DE_CAMARA.get(url, False)
+
+
+#: URLs de cámara que `play_channel` acaba de reconstruir con su credencial.
+#:
+#: Es un registro con vida de una reproducción, no un permiso permanente: lo
+#: rellena y vacía `play_channel` alrededor de la llamada. Existe porque el
+#: criterio «¿esta URL con userinfo es de la app?» no puede decidirse mirando
+#: sólo la cadena —cualquier `rtsp://` podría haberla escrito cualquiera— y
+#: prefiero que la excepción sea **explícita y efímera** a que se deduzca.
+_RESUELTAS_DE_CAMARA: dict[str, bool] = {}
+
+
+@contextmanager
+def url_de_camara_resuelta(url: str):  # noqa: ANN201 - CM sin tipo de retorno
+    """Marca `url` como reconstruida por la app durante el bloque.
+
+    Uso (único): ``play_channel``, entre resolver la referencia opaca y
+    construir el argv. Es un ``try/finally`` para que la marca no sobreviva a
+    la reproducción: si se quedara, una URL con credenciales que llegara más
+    tarde por otro camino pasaría el filtro sin haber pasado por aquí.
+    """
+    _RESUELTAS_DE_CAMARA[url] = True
+    try:
+        yield
+    finally:
+        _RESUELTAS_DE_CAMARA.pop(url, None)
+
+
 def command_for(
     channel: Channel,
     player_name: str,
@@ -306,7 +379,16 @@ def command_for(
             raise PlayerError(str(exc)) from exc
         target_url = proxy_url
     try:
-        validate_url(target_url, PURPOSE_STREAM)
+        # Una URL de cámara llega aquí **reconstruida** por la app a partir del
+        # keyring, con su userinfo puesto: `validate_url` la rechaza a
+        # propósito, porque protege las URLs que vienen de una lista. La
+        # excepción es `authorize_camara_url`, que acepta sólo `rtsp://` y sólo
+        # si la app pudo construirla. Ver su docstring para por qué el hueco
+        # existe y por qué no se abre nada más.
+        if _es_url_de_camara_resuelta(target_url):
+            authorize_camara_url(target_url)
+        else:
+            validate_url(target_url, PURPOSE_STREAM)
     except InvalidUrlError as exc:
         raise PlayerError(str(exc)) from exc
 
@@ -413,24 +495,52 @@ def launch(
     capabilities: Any = None,
     proxy_url: str | None = None,
     ipc_path: str | None = None,
+    failures: set[str] | None = None,
+    preferred: str | None = None,
 ) -> subprocess.Popen[bytes]:
     """Lanza el reproductor para `channel` y devuelve el proceso.
 
-    Si no se indica `player_name`, usa el primero detectado en orden de
-    preferencia (config.SUPPORTED_PLAYERS). Bloquea solo lo que tarda el
-    fork/exec; la TUI queda libre mientras el reproductor esté abierto.
+    Si no se indica `player_name`, la elección la hace
+    :func:`thetvview.player.router.select_backend`, que decide por
+    **capacidad** (qué transporte abre cada binario, medido en
+    :mod:`thetvview.player.protocols`) y no por «el primero que encuentre»
+    (SDD-M §8). Antes de esta fase era un bucle sobre
+    ``config.SUPPORTED_PLAYERS``; para HLS el resultado es el mismo, y para
+    ``rtsp://`` deja de abrir un reproductor que se quedaría esperando.
 
-    Los argumentos ``selection``/``capabilities``/``proxy_url``/``ipc_path``
-    son opcionales y su valor por defecto es exactamente el comportamiento
-    anterior a la selección de pistas.
+    Con ``player_name`` explícito no se consulta el router: el usuario ya
+    eligió, y su elección manda aunque la tabla diga que ese binario no abre el
+    transporte (puede saber algo que la tabla no; el diagnóstico se lo explica).
+
+    Los argumentos ``selection``/``capabilities``/``proxy_url``/``ipc_path`` y
+    los nuevos ``failures``/``preferred`` son opcionales, y su valor por
+    defecto es exactamente el comportamiento anterior: sin ellos el comando
+    construido es byte a byte el de siempre (§32 del SDD de pistas).
 
     Args:
         headless: si True, construye el comando con drivers nulos/dummy
             (ver _headless_args) para tests/CI sin display.
+        failures: nombres de reproductores que ya fallaron con **este**
+            canal. Evita el ciclo mpv→vlc→mpv→vlc del §26.
+        preferred: reproductor preferido por el usuario; va primero si puede.
+
+    Raises:
+        PlayerError: no hay reproductor disponible o la URL no pasa la
+            política. El mensaje está redactado y es apto para un modal.
+        NoCompatibleBackend: el transporte no lo abre ningún reproductor
+            instalado. Se propaga **sin** envolver para que la UI distinga
+            «no se puede» de «falló» (SDD-M §14).
     """
-    candidates = (
-        (player_name,) if player_name else config.SUPPORTED_PLAYERS
-    )
+    if player_name:
+        candidates = (player_name,)
+    else:
+        elegido = select_backend(
+            _routing_url(channel, proxy_url),
+            preferred=preferred,
+            failures=failures or (),
+        )
+        candidates = (elegido.name,)
+
     last_error: PlayerError | None = None
     for name in candidates:
         path = config.find_player(name)
@@ -456,3 +566,14 @@ def launch(
             + ", ".join(config.SUPPORTED_PLAYERS)
         )
     raise last_error or PlayerError("No hay reproductor disponible.")
+
+
+def _routing_url(channel: Channel, proxy_url: str | None) -> str:
+    """URL con la que se decide el reproductor.
+
+    Con el proxy de fijado de calidad lo que se reproduce es su master (loopback
+    http), no la URL del canal: decidir por la del canal elegiría un
+    reproductor capaz de abrir el RTSP original cuando lo que se va a abrir es
+    un HTTP en local. Es lo que ya hace ``command_for`` con ``target_url``.
+    """
+    return proxy_url or channel.url

@@ -30,18 +30,35 @@ class TestAllowlist(unittest.TestCase):
         self.assertTrue(is_allowed_scheme("https", PURPOSE_METADATA))
         self.assertFalse(is_allowed_scheme("ffmpeg", PURPOSE_METADATA))
 
-    def test_stream_admite_ffmpeg(self) -> None:
+    def test_stream_admite_ffmpeg_y_los_transportes_medidos(self) -> None:
+        # SDD-M Fases 4-6: RTMP/RTMPS/RTSP/UDP entran para **reproducir**,
+        # después de medir en esta máquina qué reproductor los abre (Fase 0).
         self.assertEqual(
-            ALLOWED_SCHEMES[PURPOSE_STREAM], frozenset({"http", "https", "ffmpeg"})
+            ALLOWED_SCHEMES[PURPOSE_STREAM],
+            frozenset({"http", "https", "ffmpeg", "rtmp", "rtmps", "rtsp", "udp"}),
         )
         self.assertTrue(is_allowed_scheme("ffmpeg", PURPOSE_STREAM))
+        for scheme in ("rtmp", "rtmps", "rtsp", "udp"):
+            with self.subTest(scheme=scheme):
+                self.assertTrue(is_allowed_scheme(scheme, PURPOSE_STREAM))
+                # Y **no** para descargar datos: aquí no hay reproductor, sólo
+                # un cliente HTTP acotado que no habla estos protocolos.
+                self.assertFalse(is_allowed_scheme(scheme, PURPOSE_METADATA))
+
+    def test_rtsps_y_multicast_no_entran_nunca(self) -> None:
+        # rtsps: no verificable aquí (Fase 0) → no se ofrece.
+        # multicast: no es un protocolo, es udp:// con dirección de grupo.
+        for scheme in ("rtsps", "multicast", "rtp", "rtmpt"):
+            with self.subTest(scheme=scheme):
+                self.assertFalse(is_allowed_scheme(scheme, PURPOSE_STREAM))
+                self.assertFalse(is_allowed_scheme(scheme, PURPOSE_METADATA))
 
     def test_proposito_desconocido_cae_a_metadata(self) -> None:
         self.assertEqual(validate_url("http://h/x", "otro").scheme, "http")
 
     def test_esquemas_rechazados_explicitos(self) -> None:
         for scheme in ("file", "smb", "ftp", "gopher", "data", "javascript",
-                       "rtsp", "udp", "ws"):
+                       "rtsps", "multicast", "ws"):
             with self.subTest(scheme=scheme):
                 self.assertIn(scheme, REJECTED_SCHEMES)
 
@@ -55,8 +72,8 @@ class TestRejectedSchemes(unittest.TestCase):
             "gopher://server/",
             "data:text/html,<script>",
             "javascript:alert(1)",
-            "rtsp://cam/stream",
-            "udp://@239.0.0.1:1234",
+            "rtsps://cam/live",
+            "multicast://239.0.0.1:1234",
             "ws://h/socket",
         ):
             with self.subTest(url=url):
@@ -69,12 +86,41 @@ class TestRejectedSchemes(unittest.TestCase):
                 with self.assertRaises(InvalidUrlError):
                     validate_url(url, PURPOSE_METADATA)
 
-    def test_rtsp_udp_no_entran_en_stream(self) -> None:
-        # SDD §36: rtsp/udp se evalúan antes de añadirlos; hoy no entran.
-        with self.assertRaises(InvalidUrlError):
-            validate_url("rtsp://192.168.1.5/stream", PURPOSE_STREAM)
-        with self.assertRaises(InvalidUrlError):
-            validate_url("udp://@239.0.0.1:1234", PURPOSE_STREAM)
+    def test_transportes_de_stream_no_entran_para_descargar(self) -> None:
+        # SDD-M Fase 4-6: se abren para reproducir, no para bajar datos.
+        for url in ("rtmp://x/live", "rtmps://x/live", "rtsp://x/live",
+                    "udp://239.0.0.1:1234"):
+            with self.subTest(url=url):
+                with self.assertRaises(InvalidUrlError):
+                    validate_url(url, PURPOSE_METADATA)
+
+    def test_rtsp_udp_si_entran_para_reproducir(self) -> None:
+        partes = validate_url("rtmp://servidor.test:1935/live/a", PURPOSE_STREAM)
+        self.assertEqual(partes.scheme, "rtmp")
+        self.assertEqual(partes.port, 1935)
+        # El puerto por defecto no se repite al normalizar (netloc).
+        self.assertEqual(
+            validate_url("rtsp://cam.local/live", PURPOSE_STREAM).netloc, "cam.local"
+        )
+
+    def test_rtsp_con_credenciales_embebidas_se_rechaza(self) -> None:
+        # Decisión D2: `_finish()` no se toca. Una cámara llega como `ipcam://`
+        # y su contraseña se recupera en caliente (ver cam_ref.py).
+        for url in ("rtsp://admin:P4ssw0rd@cam.local/live",
+                    "rtsp://admin@cam.local/live"):
+            with self.subTest(url=url):
+                with self.assertRaises(InvalidUrlError) as ctx:
+                    validate_url(url, PURPOSE_STREAM)
+                self.assertNotIn("P4ssw0rd", str(ctx.exception))
+                self.assertNotIn("cam.local", str(ctx.exception))
+
+    def test_mensajes_de_rtsps_y_multicast_dicen_por_que(self) -> None:
+        with self.assertRaises(InvalidUrlError) as ctx:
+            validate_url("rtsps://cam/live", PURPOSE_STREAM)
+        self.assertIn("rtsps", str(ctx.exception))
+        with self.assertRaises(InvalidUrlError) as ctx:
+            validate_url("multicast://239.0.0.1:1234", PURPOSE_STREAM)
+        self.assertIn("udp://", str(ctx.exception))
 
     def test_mensaje_dice_el_esquema(self) -> None:
         with self.assertRaises(InvalidUrlError) as ctx:

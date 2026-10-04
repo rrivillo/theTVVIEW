@@ -521,6 +521,165 @@ def check_shell_safe_player() -> str:
 
 
 # ---------------------------------------------------------------------------
+# 9-bis. Ampliación de SEC-001: credenciales en los transportes nuevos
+# ---------------------------------------------------------------------------
+
+
+def check_opaque_refs_no_leak_credentials() -> str:
+    """SEC-001 ampliado (SDD-M Fases 5-6): con RTMP/RTSP/UDP abiertos, la
+    superficie donde una credencial puede colarse ha crecido.
+
+    Antes bastaba comprobar Xtream. Ahora hay un segundo mecanismo de
+    referencia opaca (``ipcam://`` para cámaras RTSP) y cuatro transportes
+    nuevos. Lo que se comprueba es lo mismo en todos:
+
+    - una URL con **userinfo** nunca llega a ``data/``;
+    - una URL con **password/token** nunca llega a un ``argv`` visible ni a un
+      ``Modal``;
+    - y la referencia opaca que queda en el canal **no** contiene ni la
+      credencial ni la dirección del dispositivo.
+
+    El último punto es el que no es obvio: si ``ipcam://`` llevara el host, un
+    ``str(channel)`` bastaría para filtrar la red interna del usuario, y eso no
+    es un secreto de la lista sino información que no debe salir de ella.
+    """
+    import tempfile
+
+    from thetvview.cam_ref import PREFIX as CAM_PREFIX, build_cam_ref
+    from thetvview.favorites import FavoritesManager
+    from thetvview.m3u_parser import parse_text
+    from thetvview.models import Channel
+    from thetvview.player import command_for
+    from thetvview.recents import RecentsManager
+    from thetvview.security.errors import InvalidUrlError
+    from thetvview.security.secrets import MemorySecretStore
+    from thetvview.security.url_policy import PURPOSE_STREAM, validate_url
+    from thetvview.stream_ref import is_opaque_ref, resolve_channel_url
+
+    store = MemorySecretStore()
+    camara = "rtsp://alice:P4ssw0rd@192.168.1.9:554/stream1"
+    preparado = build_cam_ref("Camaras", camara)
+    _require(preparado is not None, "una cámara con credenciales no se reconoce")
+    if preparado is None:  # pragma: no cover - la línea de arriba ya lo dice
+        raise CheckFailure("build_cam_ref devolvió None para una URL con credenciales")
+    referencia, credenciales = preparado
+    # El parser usa el almacén activo del proceso, así que es ahí donde hay que
+    # registrar; el `store` de arriba sólo sirve para la resolución directa.
+    from thetvview.cam_ref import registrar_camara
+
+    _require(registrar_camara("Camaras", camara, store) == referencia,
+             "registrar_camara no devuelve la referencia esperada")
+
+    # 1) La referencia no lleva ni la clave ni el host.
+    _require(is_opaque_ref(referencia), "la referencia de cámara no es opaca")
+    _require(not is_opaque_ref(camara),
+             "una URL cruda con credenciales no debe parecer opaca")
+    for secreto in ("P4ssw0rd", "alice", "192.168.1.9", "stream1"):
+        _require(secreto not in referencia,
+                 f"la referencia opaca filtra {secreto!r}")
+    _require(referencia.startswith(CAM_PREFIX), "prefijo de cámara inesperado")
+
+    # 2) Resolverla sí devuelve la URL con credenciales (es su trabajo), y esa
+    #    URL no pasa la política: es exactamente lo que impide que acabe en
+    #    disco o en un argv por accidente.
+    resuelta = resolve_channel_url(referencia, store)
+    _require(resuelta == camara, "resolver la cámara no devuelve la URL original")
+    try:
+        validate_url(resuelta, PURPOSE_STREAM)
+    except InvalidUrlError:
+        pass
+    else:
+        raise CheckFailure("una URL de cámara con userinfo pasa la política de stream")
+
+    # 3) El parser convierte la línea y la lista no queda con credenciales.
+    texto = f'#EXTM3U\n#EXTINF:-1,Porton\n{camara}\n'
+    lista = parse_text(texto, source="http://p/l.m3u", name="Camaras")
+    _require(len(lista.channels) == 1, "la lista de cámaras no se parseó")
+    canal = lista.channels[0]
+    _require(canal.url == referencia, "el canal no lleva la referencia opaca")
+    _require("P4ssw0rd" not in str(canal), "el Channel conserva la contraseña")
+
+    # 4) Favoritos y recientes: el fichero escrito no puede contenerla.
+    with tempfile.TemporaryDirectory() as tmp:
+        from pathlib import Path
+
+        fav = FavoritesManager(Path(tmp) / "favorites.json")
+        fav.toggle(canal)
+        texto_fav = (Path(tmp) / "favorites.json").read_text(encoding="utf-8")
+        rec = RecentsManager(Path(tmp) / "recents.json")
+        rec.push(canal, "mpv")
+        texto_rec = (Path(tmp) / "recents.json").read_text(encoding="utf-8")
+        for nombre, contenido in (("favorites.json", texto_fav),
+                                  ("recents.json", texto_rec)):
+            for secreto in ("P4ssw0rd", "192.168.1.9"):
+                _require(secreto not in contenido,
+                         f"{nombre} contiene {secreto!r}")
+
+    # 5) Los transportes nuevos: un `argv` con credenciales embebidas tiene que
+    #    salir con `PlayerError`, no construirse.
+    from thetvview.player import PlayerError
+
+    for url in (camara, "rtmp://u:P4ssw0rd@x/live/a",
+                "udp://u:P4ssw0rd@239.0.0.1:5000"):
+        try:
+            command_for(Channel(name="x", url=url), "mpv", player_path="/usr/bin/true")
+        except (PlayerError, InvalidUrlError):
+            continue
+        raise CheckFailure(f"una URL con credenciales llegó al argv: {url}")
+
+    # 6) Y una URL **sin** credenciales sí se construye, detrás del `--`: la
+    #    puerta está abierta para lo que se midió, no cerrada por principio.
+    for url in ("rtmp://servidor.test/live/a", "rtsp://cam.local:554/stream",
+                "udp://239.0.0.1:5000"):
+        cmd = command_for(Channel(name="x", url=url), "mpv",
+                          player_path="/usr/bin/true")
+        _require(cmd[-2:] == ["--", url], f"argv sin -- para {url}")
+
+    # 7) El texto que ve el usuario: la URL de cámara, redactada, no filtra.
+    from thetvview.security.redaction import redact_text
+
+    _require("P4ssw0rd" not in redact_text(resuelta),
+             "redact_text no limpia la URL de cámara")
+    _require(credenciales.password == "P4ssw0rd",
+             "las credenciales de la cámara se han alterado")
+
+    # 8) La excepción que sí deja pasar esa URL (`authorize_camara_url`) tiene
+    #    que seguir siendo **estrecha**. Este es el único punto de todo el
+    #    código por el que un userinfo llega a un argv, así que su perímetro
+    #    se comprueba aquí y no sólo en los tests: si alguien la ensancha, el
+    #    check se para.
+    from thetvview.security.url_policy import authorize_camara_url
+
+    partes = authorize_camara_url(camara)
+    _require(partes.scheme == "rtsp" and partes.port == 554,
+             "authorize_camara_url no reconstruye la URL de la cámara")
+    # Puera única: `rtsp://` reconstruido por la app. Nada más.
+    for url in ("http://alice:P4ssw0rd@proveedor.test/a.m3u8",
+                "rtmp://alice:P4ssw0rd@x/live/a",
+                "udp://alice:P4ssw0rd@239.0.0.1:5000"):
+        try:
+            authorize_camara_url(url)
+        except InvalidUrlError:
+            continue
+        raise CheckFailure(f"authorize_camara_url acepta {url}")
+    # Y no es una puerta trasera para saltarse el resto de la política:
+    # espacios, controles, longitud, fragmento, puerto y «-» siguen rechazados
+    # aunque la URL lleve credenciales.
+    for url in ("rtsp://alice:P4ssw0rd@cam.local:99999/s",
+                "rtsp://alice:pa ss@cam.local/s",
+                "rtsp://alice:P4ss%00ss@cam.local/s",
+                "rtsp://alice:P4ssw0rd@cam.local/s#frag",
+                "--script=/tmp/evil.lua"):
+        try:
+            authorize_camara_url(url)
+        except InvalidUrlError:
+            continue
+        raise CheckFailure(f"authorize_camara_url se salta la política con {url}")
+    return (f"referencia {CAM_PREFIX} sin host ni clave; Xtream y cámara "
+            f"verificadas en favorites/recents/argv")
+
+
+# ---------------------------------------------------------------------------
 # 9. Credential storage
 # ---------------------------------------------------------------------------
 
@@ -1051,6 +1210,8 @@ CHECKS: tuple[tuple[str, str, Callable[[], str]], ...] = (
     ("xml_safe_parsing", "XML safe parsing", check_xml_safe),
     ("ai_secret_sanitizer", "AI secret sanitizer", check_ai_sanitizer),
     ("shell_safe_player", "Shell-safe player invocation", check_shell_safe_player),
+    ("opaque_refs_credentials", "Opaque refs carry no credentials",
+     check_opaque_refs_no_leak_credentials),
     ("credential_storage", "Credential storage", check_credential_storage),
     ("no_password_logs", "No plaintext password logs", check_no_password_logs),
     ("stdlib_dependencies", "Zero pip dependencies", check_stdlib_dependencies),

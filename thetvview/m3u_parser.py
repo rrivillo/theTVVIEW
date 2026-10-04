@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 from . import config
+from .cam_ref import registrar_camara
 from .epg_parser import SOURCE_ATTRS, resolve_source, split_sources
 from .models import Channel, Playlist
 from .security.errors import IPTVError, ParseError
@@ -205,7 +206,7 @@ def parse_text(text: str, source: str | None = None, name: str | None = None) ->
                 channels.append(
                     Channel(
                         name=ch_name or line,
-                        url=line,
+                        url=registrar_camara(playlist.name, line),
                         tvg_id=tvg_id_val,
                         tvg_name=tvg_name_val,
                         tvg_logo=tvg_logo_val,
@@ -269,7 +270,13 @@ def parse_text(text: str, source: str | None = None, name: str | None = None) ->
         playlist.channels.append(
             Channel(
                 name=playlist.name,
-                url=single_url or (source or playlist.name),
+                # Una fuente .ts suelta también puede ser una cámara: el mismo
+                # camino de credenciales que las entradas con EXTINF.
+                url=(
+                    registrar_camara(playlist.name, single_url)
+                    if single_url
+                    else (source or playlist.name)
+                ),
             )
         )
     return playlist

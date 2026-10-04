@@ -385,8 +385,12 @@ class TrackSession:
         try:
             from ..stream_ref import resolve_channel_url
 
+            # Import perezoso: `screens` importa a este módulo, así que
+            # trazerlo arriba cerraría un ciclo de imports.
+            from .screens import _almacen_de
+
             return strip_ffmpeg(
-                resolve_channel_url(self.channel.url, getattr(self.app, "playlists", None))
+                resolve_channel_url(self.channel.url, _almacen_de(self.app))
             )
         except Exception:
             return None

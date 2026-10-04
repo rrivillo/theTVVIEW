@@ -484,10 +484,32 @@ class TestB1PoliticaDeEsquema(unittest.TestCase):
         msg = self._reject("--script=/tmp/evil.lua")
         self.assertNotIn("/tmp/evil.lua", msg)
 
-    def test_rtsp_udp_rechazados_hoy(self) -> None:
-        # SDD §36: se evalúan antes de añadirlos; hoy no entran.
-        self._reject("rtsp://192.168.1.5/stream")
-        self._reject("udp://@239.0.0.1:1234")
+    def test_rtsp_udp_ya_no_se_rechazan_por_esquema(self) -> None:
+        # SDD-M Fases 5 y 6: la evaluación que este test esperaba ya está
+        # hecha y el resultado es que RTMP/RTSP/UDP entran para reproducir.
+        # Lo que **no** entra son las credenciales embebidas (decisión D2):
+        # una cámara se registra con una referencia opaca `ipcam://`, y la
+        # contraseña vive en el almacén del SO (ver thetvview/cam_ref.py).
+        for url in ("rtsp://192.168.1.5/stream", "udp://239.0.0.1:1234",
+                    "rtmp://servidor.test/live/canal"):
+            with self.subTest(url=url):
+                cmd = command_for(
+                    Channel(name="X", url=url), "mpv", player_path="/usr/bin/mpv"
+                )
+                self.assertEqual(cmd[-1], url)
+
+    def test_rtsp_con_credenciales_embebidas_sigue_rechazado(self) -> None:
+        # D2: `_finish()` no se tocó. El rechazo es el de toda la app.
+        msg = self._reject("rtsp://admin:P4ssw0rd@192.168.1.9:554/stream1")
+        self.assertNotIn("P4ssw0rd", msg)
+        self.assertNotIn("192.168.1.9", msg)
+
+    def test_rtsps_y_multicast_siguen_rechazados(self) -> None:
+        # rtsps: no verificable en esta máquina (Fase 0) → no se ofrece.
+        # multicast: no es un protocolo, es `udp://` con dirección de grupo.
+        for url in ("rtsps://cam.local:322/live", "multicast://239.0.0.1:1234"):
+            with self.subTest(url=url):
+                self._reject(url)
 
     def test_url_valida_lleva_separador_doble_guion(self) -> None:
         cmd = command_for(_channel(), "mpv", player_path="/usr/bin/mpv")
