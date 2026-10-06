@@ -150,6 +150,99 @@ class TestResolutionScreenPills(unittest.TestCase):
         screen.render(stdscr)
 
 
+class _StdscrQueGuarda:
+    """Doble de ventana que anota lo pintado, para leer la fila de las pills."""
+
+    def __init__(self, h=24, w=80):
+        self.h, self.w = h, w
+        self.calls: list[tuple[int, int, str]] = []
+
+    def getmaxyx(self):
+        return (self.h, self.w)
+
+    def addstr(self, y, x, text, attr=0):
+        room = self.w - 1 if x == 0 else self.w - x
+        if room > 0 and len(text) > room:
+            text = text[:room]
+        self.calls.append((y, x, text))
+
+    def fila(self, y: int) -> str:
+        partes = sorted((x, t) for cy, x, t in self.calls if cy == y)
+        return "".join(t for _x, t in partes)
+
+    @property
+    def desbordado(self) -> bool:
+        return any(x + len(t) > self.w - 1 for _y, x, t in self.calls)
+
+
+class TestResolutionScreenNoConfunde(unittest.TestCase):
+    """El selector de calidad no puede ofrecer dos botones iguales.
+
+    Caso real de una lista publicada por el usuario: el mismo canal aparece
+    tres veces (HD, SD y SD alterno) y las dos SD se pintaban idénticas. Aquí se
+    fija que (a) las etiquetas se distinguen y (b) el cursor abre sobre la
+    variante que el usuario eligió, no sobre la primera de la lista.
+    """
+
+    NOMBRES = [
+        "[Chile] La Red HD (Nacional)[Geo-Blocked]",
+        "[Chile] La Red SD (Nacional)[Opc.2]",
+        "[Chile] La Red SD (Nacional)[Opc.3]",
+    ]
+
+    def setUp(self):
+        self.app = _StubApp()
+        self.variantes = [ch(n) for n in self.NOMBRES]
+
+    def pintar(self, elegida, w=80):
+        screen = ResolutionScreen(self.app, elegida, self.variantes)
+        stdscr = _StdscrQueGuarda(24, w)
+        with mock.patch.object(colors, "pair", return_value=0):
+            screen.render(stdscr)
+        return screen, stdscr
+
+    def test_las_pills_no_se_repeten(self):
+        _screen, stdscr = self.pintar(self.variantes[0])
+        fila = stdscr.fila(10)
+        for marca in ("[Opc.2]", "[Opc.3]"):
+            self.assertIn(marca, fila, "las dos SD tienen que decir cuál es cuál")
+
+    def test_el_nombre_de_abajo_coincide_con_el_boton_resaltado(self):
+        """El texto grande es la verdad: si dice HD, el resaltado es el HD."""
+        for elegida in self.variantes:
+            with self.subTest(canal=elegida.name):
+                screen, stdscr = self.pintar(elegida)
+                resaltado = stdscr.fila(10)
+                # El botón resaltado se pinta con un relleno de espacios.
+                self.assertIn(elegida.name, stdscr.fila(12))
+                self.assertEqual(screen.selected, self.variantes.index(elegida))
+
+    def test_enter_reproduce_la_variante_elegida(self):
+        """Enter sobre la variante elegida tiene que dar esa misma variante."""
+        for elegida in self.variantes:
+            with self.subTest(canal=elegida.name):
+                screen = ResolutionScreen(self.app, elegida, self.variantes)
+                accion = screen.handle_key(curses.KEY_ENTER)
+                self.assertEqual(accion["channel"].name, elegida.name)
+
+    def test_enter_tras_no_mover_no_cambia_de_canal(self):
+        """El caso que sí dolía: abrir y pulsar Enter salía con otra calidad."""
+        elegida = self.variantes[2]  # el HD, el último de la lista
+        screen = ResolutionScreen(self.app, elegida, self.variantes)
+        self.assertEqual(screen.handle_key(curses.KEY_ENTER)["channel"], elegida)
+
+    def test_un_canal_fuera_de_las_variantes_abre_en_la_primera(self):
+        otro = ch("La Red HD")
+        screen = ResolutionScreen(self.app, otro, self.variantes)
+        self.assertEqual(screen.selected, 0)
+
+    def test_terminal_estrecha_no_desborda(self):
+        for w in (80, 40, 30, 24, 20, 12):
+            with self.subTest(ancho=w):
+                _screen, stdscr = self.pintar(self.variantes[0], w)
+                self.assertFalse(stdscr.desbordado, f"desbordó con {w} columnas")
+
+
 class TestPlayerScreenSubtitle(unittest.TestCase):
     def test_render_muestra_nombre_reproductor(self):
         calls = []

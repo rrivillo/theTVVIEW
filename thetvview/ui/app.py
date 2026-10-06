@@ -528,6 +528,10 @@ class App:
         self.footer = FooterBar()
         # Guarda anti-recursión: un modal nunca abre otro modal.
         self._in_modal = False
+        # 'q' confirmó salir: `_tecla_global` lo deja marcado y `run()` corta
+        # el bucle. Existe para que el reparto de teclas globales sea un
+        # método testeable en vez de un bloque en medio del bucle de eventos.
+        self._salir_pendiente = False
         # Todo error mostrado con status.show(..., error=True) sube a modal.
         self.status.on_error = self._show_notice
         self.playlists = PlaylistManager(config.PLAYLISTS_JSON)
@@ -1145,9 +1149,11 @@ class App:
         self._confirm_remove_playlist(name, source=entry.source)
 
     def _confirm_remove_playlist(self, name: str, source: str | None = None) -> None:
-        from .widgets import Modal
+        from .actions import V
+        from .widgets import Modal, modal_actions
 
-        modal = Modal("Confirmar", f"¿Eliminar playlist '{name}'?", ["Cancelar", "Eliminar"])
+        modal = Modal("Confirmar", f"¿Eliminar playlist '{name}'?", ["Cancelar", "Eliminar"],
+                      actions=modal_actions(confirmar=V.ELIMINAR))
         modal.selected_button = 0
         stdscr = self.stdscr
         # Render loop del modal
@@ -1446,9 +1452,10 @@ class App:
 
     def _confirm(self, title: str, message: str) -> bool:
         """Modal de confirmación. False sin UI o si el usuario cancela."""
-        from .widgets import Modal
+        from .widgets import Modal, modal_actions
 
-        res = self._run_modal(Modal(title, message, ["Cancelar", "Aceptar"]))
+        res = self._run_modal(Modal(title, message, ["Cancelar", "Aceptar"],
+                                   actions=modal_actions()))
         return res == "aceptar"
 
     def show_diagnose(self, channel: Channel, *, con_conexion: bool = False) -> None:
@@ -2330,72 +2337,113 @@ class App:
                     pass
                 continue
 
-            # Respetar modo búsqueda: 't'/'?'/'q' no son globales mientras se escribe
-            is_searching = bool(getattr(self.screen, "searching", False))
-            if not is_searching:
-                if key in (ord("q"), ord("Q")):
-                    if isinstance(self.screen, NowPlayingScreen):
-                        action = self.screen.handle_key(key)
-                        if action:
-                            self.handle_action(action)
-                        continue
-                    # 'q' = salir de la app con confirmación (Esc = volver).
-                    if self.confirm_quit():
-                        return
-                    continue
-                if key == ord("t"):
-                    self.toggle_theme()
-                    continue
-                if key == ord("?"):
-                    self._show_help()
-                    continue
-                if key == ord("r"):
-                    # 'r' en la guía recarga el EPG (ver EpgScreen);
-                    # en el resto abre Recientes. 'R'/F5 recarga la lista.
-                    if isinstance(self.screen, EpgScreen):
-                        pass  # deja que EpgScreen.handle_key lo gestione
-                    else:
-                        self.push(RecentsScreen(self))
-                        continue
-                if key == ord("p"):
-                    ch = None
-                    scr = self.screen
-                    if hasattr(scr, "current_channel"):
-                        ch = scr.current_channel()
-                    if ch is not None:
-                        self.handle_action({"action": "force_select_player", "channel": ch})
-                    else:
-                        self.footer.show("Selecciona un canal para elegir reproductor.")
-                    continue
-                if key == ord("u"):
-                    if self._undo_stack:
-                        last = self._undo_stack.pop()
-                        self.handle_action(last)
-                    else:
-                        self.footer.show("Nada que deshacer.")
-                    continue
-                if key == ord("!"):
-                    self.run_security_check()
-                    continue
-                if key in (27, curses.KEY_BACKSPACE):
-                    if isinstance(self.screen, NowPlayingScreen):
-                        action = self.screen.handle_key(key)
-                        if action:
-                            self.handle_action(action)
-                        continue
-                    if not self.pop():
-                        self.footer.show("Ya estás en la raíz. 'q' para salir.")
-                    else:
-                        self.footer.show("")
-                    continue
-            else:
-                # En búsqueda, 'q'/'t'/'?' deben ir al campo de texto (si es imprimible)
-                # Esc sí debe salir de búsqueda (manejado por screen.handle_key)
-                pass
+            # Respetar modo búsqueda: 't'/'?'/'q' no son globales mientras se
+            # escribe. El reparto global/local vive en `_despachar_tecla`.
+            if self._despachar_tecla(key):
+                return
 
-            action = self.screen.handle_key(key)
-            if action:
-                self.handle_action(action)
+    def _despachar_tecla(self, key: int) -> bool:
+        """Qué pasa cuando el usuario pulsa `key`. Devuelve True si hay que salir.
+
+        Es **el** camino de una pulsación: globales primero, pantalla después.
+        Existía sólo dentro de `run()`, y por eso nadie lo podía probar: los
+        tests probaban `handle_key` de cada pantalla —que estaba bien— sin
+        comprobar quién lo llamaba. Ahí se escondía `r Limpiar` en Recientes,
+        que la App interceptaba antes de que nadie preguntara.
+        """
+        if self._tecla_global(key):
+            return self._salir_pendiente
+        action = self.screen.handle_key(key)
+        if action:
+            self.handle_action(action)
+        return False
+
+    def _tecla_es_de_la_pantalla(self, key_label: str) -> bool:
+        """¿La pantalla actual reclama esta tecla en su catálogo de acciones?
+
+        Es el criterio que reparte teclas globales y locales: **una global cede
+        si la pantalla la declara**, porque `actions()` es donde una pantalla
+        dice qué hace (SDD §10). Antes esto era un `isinstance(EpgScreen)`
+        escrito a mano, y por eso Recientes se quedó sin su `r Limpiar`: la App
+        interceptaba la tecla antes de que nadie preguntara a la pantalla.
+
+        Con el reparto por catálogo desaparece también la excepción suelta: la
+        guía declara `r Recargar` y lo reclama igual que cualquier otra.
+        """
+        return any(a.key == key_label for a in self._screen_actions())
+
+    def _tecla_global(self, key: int) -> bool:
+        """¿La app atiende esta tecla antes que la pantalla? (SDD §10)
+
+        Devuelve ``True`` si la tecla se consumió aquí —el bucle hace
+        ``continue``— y deja en `_salir_pendiente` el caso de que el usuario
+        haya confirmado salir de la app.
+
+        Sacar esto fuera de `run()` no es cosmetía: es lo que permite **probar
+        el despacho de verdad**, que es donde se escondía el bug anterior
+        (todos los tests probaban `handle_key`; nadie probaba quién lo llama).
+        """
+        self._salir_pendiente = False
+        # Mientras se escribe, las globales van al campo de texto; `Esc` sí
+        # sale de búsqueda, y lo lleva `Screen.handle_key`.
+        if getattr(self.screen, "searching", False):
+            return False
+
+        if key in (ord("q"), ord("Q")):
+            if isinstance(self.screen, NowPlayingScreen):
+                action = self.screen.handle_key(key)
+                if action:
+                    self.handle_action(action)
+                return True
+            # 'q' = salir de la app con confirmación (Esc = volver).
+            self._salir_pendiente = self.confirm_quit()
+            return True
+        if key == ord("t"):
+            self.toggle_theme()
+            return True
+        if key == ord("?"):
+            self._show_help()
+            return True
+        if key == ord("r"):
+            # 'r' es global (Recientes) salvo que la pantalla lo reclame: la
+            # guía recarga el EPG y Recientes limpia su historial. 'R'/F5
+            # recarga la lista, y esa tecla nunca es global.
+            if self._tecla_es_de_la_pantalla("r"):
+                return False
+            self.push(RecentsScreen(self))
+            return True
+        if key == ord("p"):
+            ch = None
+            scr = self.screen
+            if hasattr(scr, "current_channel"):
+                ch = scr.current_channel()
+            if ch is not None:
+                self.handle_action({"action": "force_select_player", "channel": ch})
+            else:
+                self.footer.show("Selecciona un canal para elegir reproductor.")
+            return True
+        if key == ord("u"):
+            if self._undo_stack:
+                last = self._undo_stack.pop()
+                self.handle_action(last)
+            else:
+                self.footer.show("Nada que deshacer.")
+            return True
+        if key == ord("!"):
+            self.run_security_check()
+            return True
+        if key in (27, curses.KEY_BACKSPACE):
+            if isinstance(self.screen, NowPlayingScreen):
+                action = self.screen.handle_key(key)
+                if action:
+                    self.handle_action(action)
+                return True
+            if not self.pop():
+                self.footer.show("Ya estás en la raíz. 'q' para salir.")
+            else:
+                self.footer.show("")
+            return True
+        return False
 
     def _parse_shortcuts_to_chips(self, shortcuts: str) -> list[tuple[str, str]]:
         """Convierte string de atajos 'a Añadir · Enter ▶' a chips [(key, label)]."""
@@ -2412,13 +2460,42 @@ class App:
         return chips
 
     def _render_footer(self, stdscr: curses.window) -> None:
-        """Renderiza footer moderno con chips + toast stack."""
-        raw = self.screen.shortcuts()
-        self.footer.chips = self._parse_shortcuts_to_chips(raw)
+        """Renderiza footer moderno con chips + toast stack.
+
+        **Define once, render everywhere** (SDD §10): si la pantalla declara
+        `actions()`, ese catálogo es la fuente; `shortcuts()` queda como
+        respaldo para las pantallas que aún no lo tienen y para los dobles de
+        test. Con la reserva, una pantalla sin migrar no rompe la app (F4).
+        """
+        catalogo = self._screen_actions()
+        set_actions = getattr(self.footer, "set_actions", None)
+        if catalogo and callable(set_actions):
+            set_actions(catalogo)
+        else:
+            # Pantalla sin catálogo (o doble de test con el pie de siempre):
+            # manda `shortcuts()`, que es lo que se ha pintado siempre.
+            self.footer.chips = self._parse_shortcuts_to_chips(self.screen.shortcuts())
         msg = self.status._current_message()
         if msg:
             self.footer.show(msg, error=self.status.is_error)
         self.footer.render(stdscr)
+
+    def _screen_actions(self) -> list:
+        """`screen.actions()` con reserva total.
+
+        Un catálogo no puede romper la app porque sí: una pantalla con un
+        `actions()` defectuoso, un doble de test sin el método o una excepción
+        inesperada degradan a `[]` —y entonces manda `shortcuts()`—, nunca a un
+        footer vacío ni a un traceback en pleno bucle de render.
+        """
+        getter = getattr(self.screen, "actions", None)
+        if not callable(getter):
+            return []
+        try:
+            actions = getter()
+        except Exception:
+            return []
+        return list(actions) if isinstance(actions, list) else []
 
     def run_security_check(self) -> None:
         """Tecla ``!``: ejecuta el security-check y abre el modal con el informe.

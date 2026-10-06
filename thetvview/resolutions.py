@@ -163,6 +163,49 @@ def base_name(channel: Channel) -> str:
     return base
 
 
+# Último marcador pegado al final del nombre: "[Opc.2]", "(Nacional)".
+_TRAILING_MARKER_RE = re.compile(r"(\[[^\]]*\]|\([^)]*\))\s*$")
+
+
+def trailing_marker(channel: Channel) -> str | None:
+    """El marcador final del nombre, que es lo que distingue una entrada de otra.
+
+    Una lista puede publicar varias URLs del mismo canal como
+    «Canal (Nacional) 720p», «Canal (Nacional) 720p [Opc.2]» y
+    «Canal (Nacional) 720p [Opc.3]»: las tres son 720p y sólo el marcador las
+    distingue. Devolverlo es lo que permite pintar botones que no se confunden
+    entre sí.
+    """
+    m = _TRAILING_MARKER_RE.search(channel.name or "")
+    return m.group(1).strip() if m else None
+
+
+def variant_labels(variants: list[Channel]) -> list[str]:
+    """Etiquetas de los botones de calidad: **únicas aunque dos coincidan**.
+
+    Dos entradas con la misma resolución no son la misma opción, así que la
+    etiqueta tiene que decir cuál es cuál. Sólo cuando la resolución se repite
+    se añade el marcador del nombre («HD [Opc.2]») y, si con ése tampoco se
+    distinguen, un ordinal. Sin repeticiones se queda con la resolución a
+    secas: lo de más no hace falta si no hay ambigüedad.
+    """
+    labels = [detect(v) or "Auto" for v in variants]
+    grupos: dict[str, list[int]] = {}
+    for i, label in enumerate(labels):
+        grupos.setdefault(label, []).append(i)
+    for label, indices in grupos.items():
+        if len(indices) < 2:
+            continue
+        markers = [trailing_marker(variants[i]) for i in indices]
+        if all(markers) and len(set(markers)) == len(markers):
+            for i, marker in zip(indices, markers):
+                labels[i] = f"{label} {marker}"
+        else:
+            for n, i in enumerate(indices, start=1):
+                labels[i] = f"{label} #{n}"
+    return labels
+
+
 def name_has_resolution(channel: Channel) -> bool:
     """True si el nombre del canal declara una resolución (sufijo visible)."""
     return split_name(channel.name)[1] is not None

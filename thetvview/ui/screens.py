@@ -35,6 +35,8 @@ from .tracks import SECTION_LABELS
 
 from . import colors
 from . import icons
+from .actions import Action, P, V
+from .textwidth import cell_width, clip_cells
 from .widgets import ScrollableList, render_empty_message, render_separator
 
 
@@ -50,6 +52,31 @@ _KEY_TAB: int = 9
 _KEY_F5: int = getattr(curses, "KEY_F5", 269)
 
 
+def _favorite_label(fav_urls: set[str], channel: Channel | None) -> str:
+    """Etiqueta dinámica de `f`: `Favorito` o `Quitar` según el estado (§9, R-04).
+
+    Hoy la barra dice siempre «Favorito» sobre una tecla que a veces quita. Con
+    `enabled` y etiqueta derivada del estado, la definición nunca desaparece:
+    sólo cambia lo que dice. Un solo lugar donde equivocarse, y el test lo ve.
+    """
+    if channel is None:
+        return V.FAVORITO
+    return V.QUITAR if channel.url in fav_urls else V.FAVORITO
+
+
+def _is_favorite(app, channel: Channel | None) -> bool:  # noqa: ANN001
+    """¿Es favorito `channel`? Degrada a False si el doble no lo soporta."""
+    if channel is None:
+        return False
+    fn = getattr(getattr(app, "favorites", None), "is_favorite", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn(channel))
+    except Exception:
+        return False
+
+
 class Screen:
     """Base de pantalla: título y manejo mínimo de teclas."""
 
@@ -60,6 +87,28 @@ class Screen:
 
     def shortcuts(self) -> str:
         return "↑/↓ mover · Enter seleccionar · Esc volver · q salir"
+
+    def actions(self) -> list[Action]:
+        """Catálogo de acciones contextuales de esta pantalla (§10, §63).
+
+        Definición **única**: de esta lista salen la barra inferior y —a
+        futuro— el manejo de teclas. La barra no declara nada que la pantalla
+        no haga: toda ``key`` de aquí debe existir también en ``shortcuts()``
+        y en ``handle_key()`` (invariante comprobada en la suite).
+
+        La base devuelve lista vacía a propósito: ``App._render_footer`` cae a
+        ``shortcuts()`` cuando no hay catálogo, así que una pantalla sin
+        migrar no rompe la app.
+
+        Dos formas de "no disponible", y la diferencia importa:
+
+        - **no se declara** la acción cuando su tecla ni siquiera aparece en
+          ``shortcuts()`` en ese estado (p. ej. `i Info` sin pistas);
+        - se declara con ``enabled=False`` cuando la tecla se anuncia pero
+          ahora mismo no hay nada sobre lo que actuar (p. ej. `f Favorito` sin
+          canales).
+        """
+        return []
 
     def handle_key(self, key: int) -> dict | None:
         return None
@@ -178,6 +227,30 @@ class PlaylistsScreen(Screen):
         if self.can_change_password():
             base += " · C Contraseña Xtream"
         return base + " · R Actualizar · r Recientes · f ★ · t Tema · ? Ayuda · q Salir"
+
+    def actions(self) -> list[Action]:
+        """Catálogo del catálogo de listas (§3, Catálogo).
+
+        Catálogo vacío: `shortcuts()` anuncia otras teclas, y la barra sólo
+        puede declarar lo que la pantalla anuncia (§10). Por eso aquí sólo hay
+        «a Añadir» y «? Ayuda».
+        """
+        if not self.entries:
+            return [
+                Action("a", V.ANADIR, P.FRECUENTE),
+                Action("?", V.AYUDA, P.AYUDA, essential=True),
+            ]
+        acciones = [
+            Action("Enter", V.ABRIR, P.PRIMARIA),
+            Action("a", V.ANADIR, P.FRECUENTE),
+            Action("d", V.BORRAR, P.ORGANIZACION),
+        ]
+        # `C` sólo existe para las Listas X: `shortcuts()` tampoco la anuncia
+        # en el resto, y la barra no puede anunciar más que la pantalla (§10).
+        if self.can_change_password():
+            acciones.append(Action("C", V.CONTRASENA_X, P.ORGANIZACION))
+        acciones.append(Action("?", V.AYUDA, P.AYUDA, essential=True))
+        return acciones
 
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
         if not self.entries:
@@ -560,6 +633,31 @@ class ChannelsScreen(Screen):
             "↑/↓ · Enter ▶ · / Buscar · g Grupos · "
             "f ★ · e EPG · R Actualizar · r Recientes · p Reproductor · ? Ayuda · t Tema · Esc ←"
         )
+
+    def actions(self) -> list[Action]:
+        """Catálogo de la lista de canales (Canales).
+
+        En búsqueda el juego de teclas es otro (§34): sólo confirmar, vaciar y
+        cancelar. Fuera de búsqueda, `f` dice Favorito o Quitar según el canal
+        de verdad bajo el cursor (§9, R-04).
+        """
+        if self.searching:
+            return [
+                Action("Enter", V.CONFIRMAR, P.PRIMARIA),
+                Action("Ctrl-U", V.VACIAR, P.FRECUENTE),
+                Action("Esc", V.CANCELAR, P.NAVEGACION),
+            ]
+        channel = self.current_channel()
+        hay = channel is not None
+        return [
+            Action("Enter", V.VER, P.PRIMARIA, enabled=hay),
+            Action("/", V.BUSCAR, P.FRECUENTE),
+            Action("f", _favorite_label(self._fav_urls, channel), P.CONTEXTUAL, enabled=hay),
+            Action("g", V.GRUPO, P.ORGANIZACION),
+            Action("e", V.EPG, P.SECUNDARIA, enabled=hay),
+            Action("Esc", V.VOLVER, P.NAVEGACION),
+            Action("?", V.AYUDA, P.AYUDA, essential=True),
+        ]
 
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
         # Solo en modo lista (sidebar). Calcular si click está en lista
@@ -964,6 +1062,21 @@ class FavoritesScreen(Screen):
     def shortcuts(self) -> str:
         return "↑/↓ · Enter ▶ · f ★ · p Reproductor · ? Ayuda · t Tema · Esc ←"
 
+    def actions(self) -> list[Action]:
+        """Catálogo de Favoritos.
+
+        Todo lo que hay aquí es favorito por definición, así que `f` siempre
+        dice «Quitar»: anunciar «Favorito» sobre una tecla que quita sería
+        mentir (§9, R-04).
+        """
+        hay = self.current_channel() is not None
+        return [
+            Action("Enter", V.VER, P.PRIMARIA, enabled=hay),
+            Action("f", V.QUITAR, P.CONTEXTUAL, enabled=hay),
+            Action("Esc", V.VOLVER, P.NAVEGACION),
+            Action("?", V.AYUDA, P.AYUDA, essential=True),
+        ]
+
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
         max_y, max_x = self.app.stdscr.getmaxyx()
         body_h = self.app.body_height()
@@ -1039,6 +1152,23 @@ class RecentsScreen(Screen):
 
     def shortcuts(self) -> str:
         return "↑/↓ · Enter ▶ · f ★ · r Limpiar · ? Ayuda · t Tema · Esc ←"
+
+    def actions(self) -> list[Action]:
+        """Catálogo de Recientes.
+
+        `f` alterna, así que su etiqueta sigue al estado real del reciente
+        (§9, R-04) — igual que en Canales, porque es la misma tecla.
+        """
+        channel = self.current_channel()
+        hay = channel is not None
+        etiqueta = V.QUITAR if _is_favorite(self.app, channel) else V.FAVORITO
+        return [
+            Action("Enter", V.VER, P.PRIMARIA, enabled=hay),
+            Action("f", etiqueta, P.CONTEXTUAL, enabled=hay),
+            Action("r", V.LIMPIAR, P.ORGANIZACION, enabled=bool(self.items)),
+            Action("Esc", V.VOLVER, P.NAVEGACION),
+            Action("?", V.AYUDA, P.AYUDA, essential=True),
+        ]
 
     def handle_key(self, key: int) -> dict | None:
         rows = self.app.body_height()
@@ -1160,6 +1290,26 @@ class GroupsScreen(Screen):
         if self.searching:
             return "Escribir filtra · Enter confirmar · Ctrl-U limpiar · Esc salir"
         return "↑/↓/←/→ · Enter abrir · / Buscar · R Actualizar · r Recientes · ? Ayuda · t Tema · Esc ←"
+
+    def actions(self) -> list[Action]:
+        """Catálogo de Grupos.
+
+        En búsqueda, el juego de teclas es el de Canales (§34): confirmar,
+        vaciar, cancelar.
+        """
+        if self.searching:
+            return [
+                Action("Enter", V.CONFIRMAR, P.PRIMARIA),
+                Action("Ctrl-U", V.VACIAR, P.FRECUENTE),
+                Action("Esc", V.CANCELAR, P.NAVEGACION),
+            ]
+        return [
+            Action("Enter", V.ABRIR, P.PRIMARIA, enabled=self.current_group() is not None),
+            Action("/", V.BUSCAR, P.FRECUENTE),
+            Action("R", V.ACTUALIZAR, P.ORGANIZACION),
+            Action("Esc", V.VOLVER, P.NAVEGACION),
+            Action("?", V.AYUDA, P.AYUDA, essential=True),
+        ]
 
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
         if not self.visible_keys:
@@ -1396,10 +1546,26 @@ class ResolutionScreen(Screen):
         self.channel = channel
         self.variants = variants
         self.title = f"Resolución · {resolutions.base_name(channel)}"
-        self.selected: int = 0
+        # Abrir **sobre la variante elegida**: las variantes llegan ordenadas de
+        # peor a mejor, así que empezar en 0 hacía que pulsar Enter aquí
+        # reprodujera otra calidad sin que se notara — en la lista real, 2 de
+        # cada 3 aperturas. Si el canal no está en la lista, la primera.
+        self.selected = next(
+            (i for i, v in enumerate(variants) if v is channel), 0
+        )
 
     def shortcuts(self) -> str:
         return "←/→ · Enter ▶ · ? Ayuda · t Tema · Esc ←"
+
+    def actions(self) -> list[Action]:
+        """Catálogo del selector de calidad (Calidad)."""
+        hay = bool(self.variants)
+        return [
+            Action("Enter", V.CONTINUAR, P.PRIMARIA, enabled=hay),
+            Action("←→", V.ELEGIR, P.FRECUENTE, enabled=hay),
+            Action("Esc", V.VOLVER, P.NAVEGACION),
+            Action("?", V.AYUDA, P.AYUDA, essential=True),
+        ]
 
     def handle_key(self, key: int) -> dict | None:
         if key == curses.KEY_LEFT:
@@ -1422,14 +1588,15 @@ class ResolutionScreen(Screen):
         except curses.error:
             pass
 
-        # Pills de resolución con borde redondeado
+        # Pills de resolución con borde redondeado. La etiqueta sale de
+        # `variant_labels`, no de `detect`: dos entradas pueden ser las dos SD
+        # (o las dos HD) y dos botones iguales no son un botón.
         pills: list[str] = []
         pill_widths: list[int] = []
-        for i, v in enumerate(self.variants):
-            res = resolutions.detect(v) or "Auto"
-            pill = f" {res} "
+        for etiqueta in resolutions.variant_labels(self.variants):
+            pill = f" {etiqueta} "
             pills.append(pill)
-            pill_widths.append(len(pill))
+            pill_widths.append(cell_width(pill))
 
         total_w = sum(pill_widths) + 2 * (len(pills) - 1)
         pill_x = max(0, (max_x - total_w) // 2)
@@ -1438,23 +1605,31 @@ class ResolutionScreen(Screen):
         try:
             x = pill_x
             for i, pill in enumerate(pills):
-                pw = pill_widths[i]
+                # Una etiqueta larga puede no caber en una terminal estrecha:
+                # se recorta por celdas y se deja de pintar el resto, en vez
+                # de desbordar la fila (§39, §43).
+                room = max(0, max_x - 1 - x)
+                visible = clip_cells(pill, room)
+                if not visible:
+                    break
                 if i == self.selected:
                     # Selected: fondo sólido + BOLD + REVERSE sutil
-                    fill = " " * pw
+                    fill = " " * cell_width(visible)
                     stdscr.addstr(pill_y, x, fill, colors.pair(colors.PAIR_SELECTED))
-                    stdscr.addstr(pill_y, x, pill, colors.pair(colors.PAIR_SELECTED) | curses.A_BOLD | curses.A_REVERSE)
+                    stdscr.addstr(pill_y, x, visible,
+                                  colors.pair(colors.PAIR_SELECTED) | curses.A_BOLD | curses.A_REVERSE)
                 else:
-                    stdscr.addstr(pill_y, x, pill, colors.pair(colors.PAIR_DIM))
-                x += pw + 2
+                    stdscr.addstr(pill_y, x, visible, colors.pair(colors.PAIR_DIM))
+                x += cell_width(visible) + 2
         except curses.error:
             pass
 
         sel = self.variants[self.selected]
         name = sel.name
         try:
-            nx = max(0, (max_x - len(name)) // 2)
-            stdscr.addstr(pill_y + 2, nx, name[:max(0, max_x - 1)], colors.pair(colors.PAIR_NORMAL))
+            nx = max(0, (max_x - cell_width(name)) // 2)
+            stdscr.addstr(pill_y + 2, nx, clip_cells(name, max(0, max_x - 1)),
+                          colors.pair(colors.PAIR_NORMAL))
         except curses.error:
             pass
 
@@ -1718,6 +1893,30 @@ class TrackOptionsScreen(Screen):
         return ("↑/↓ elegir · Tab sección · Espacio marcar * · 0 Automático · "
                 f"{confirmar} · m Recordar · ? Ayuda · Esc ←")
 
+    def actions(self) -> list[Action]:
+        """Catálogo del selector de pistas (Pistas).
+
+        `Enter` cambia de significado según el estado: si el reproductor ya
+        estaba elegido, `Enter` reproduce con él; si no, `Enter` lleva al
+        selector de reproductor (§36). Anunciar siempre una de las dos sería
+        exactamente el bug que `enabled` + etiqueta dinámica evitan (R-04).
+
+        La sección se salta con `Tab` —que es lo que anuncia `shortcuts()`— y
+        también con ←/→, que no se anuncian: se declara la tecla que la
+        pantalla dice, no la que quedaría más bonita. Con una sola sección no
+        hay a dónde saltar, y `Tab` se marca como no disponible.
+        """
+        secciones = len(self.kinds)
+        hay = secciones > 0
+        return [
+            Action("Enter", V.VER if self.player_name else V.REPRODUCTOR, P.PRIMARIA),
+            Action("↑↓", V.ELEGIR, P.FRECUENTE, enabled=hay),
+            Action("Tab", V.SECCION, P.CONTEXTUAL, enabled=secciones > 1),
+            Action("Espacio", V.MARCAR, P.CONTEXTUAL, enabled=hay),
+            Action("Esc", V.VOLVER, P.NAVEGACION),
+            Action("?", V.AYUDA, P.AYUDA, essential=True),
+        ]
+
     def handle_key(self, key: int) -> dict | None:
         kind = self._section_of(self.selected)
         if key in (curses.KEY_UP, ord("k")):
@@ -1907,6 +2106,16 @@ class PlayerScreen(Screen):
     def shortcuts(self) -> str:
         return "↑/↓ · Enter ▶ · ? Ayuda · t Tema · Esc ←"
 
+    def actions(self) -> list[Action]:
+        """Catálogo del selector de reproductor (Reproductor)."""
+        hay = bool(self.players)
+        return [
+            Action("Enter", V.ABRIR, P.PRIMARIA, enabled=hay),
+            Action("↑↓", V.ELEGIR, P.FRECUENTE, enabled=hay),
+            Action("Esc", V.VOLVER, P.NAVEGACION),
+            Action("?", V.AYUDA, P.AYUDA, essential=True),
+        ]
+
     def handle_key(self, key: int) -> dict | None:
         if not self.players:
             return None
@@ -2088,6 +2297,22 @@ class NowPlayingScreen(Screen):
         # tener que adivinar (SDD-M §21), y es la única ayuda cuando un canal
         # muere al instante.
         return f"q Detener · d Diagnóstico{extra} · ? Ayuda"
+
+    def actions(self) -> list[Action]:
+        """Catálogo de Reproduciendo.
+
+        `i Info` sólo se declara cuando hay sesión de pistas viva, porque es
+        justo cuando `shortcuts()` lo anuncia: la barra no puede decir más que
+        la pantalla (§10, R-09).
+        """
+        acciones = [
+            Action("q", V.DETENER, P.PRIMARIA),
+            Action("d", V.DIAGNOSTICO, P.CONTEXTUAL),
+        ]
+        if self.tracks:
+            acciones.append(Action("i", V.INFO, P.SECUNDARIA))
+        acciones.append(Action("?", V.AYUDA, P.AYUDA, essential=True))
+        return acciones
 
     def is_alive(self) -> bool:
         # El proceso vivo es el del supervisor si lo hay: tras un corte, el
@@ -2609,6 +2834,27 @@ class EpgScreen(Screen):
             return ("↑/↓ · Enter ▶ Archivo · Enter ● Directo · r Recargar · "
                     "? Ayuda · t Tema · Esc ←")
         return "↑/↓ · Enter ● Directo · r Recargar · ? Ayuda · t Tema · Esc ←"
+
+    def actions(self) -> list[Action]:
+        """Catálogo de la parrilla EPG.
+
+        `Enter` anuncia «Archivo» **sólo** si el proveedor declaró catch-up
+        utilizable: sin esa declaración la acción no existe y anunciarla sería
+        una promesa falsa (§20.1, R-04). La tecla es `r` y no `R`: es la que
+        el `handle_key` de esta pantalla atiende.
+
+        El plan (F3) preveía además `←→ Horario`, pero `EpgScreen.handle_key`
+        **no** atiende `KEY_LEFT`/`KEY_RIGHT` y `shortcuts()` tampoco los
+        anuncia. Declararla aquí sería el bug R-09 exacto que este sistema
+        existe para cerrar, así que queda fuera hasta que la pantalla la
+        implemente (fuera de alcance: no se toca `handle_key`).
+        """
+        return [
+            Action("Enter", V.ARCHIVO if self.has_catchup else V.VER, P.PRIMARIA),
+            Action("r", V.RECARGAR, P.ORGANIZACION),
+            Action("Esc", V.VOLVER, P.NAVEGACION),
+            Action("?", V.AYUDA, P.AYUDA, essential=True),
+        ]
 
     def _state_of(self, prog, now: datetime) -> catchup.CatchupState:  # noqa: ANN001
         """Estado catch-up de un programa (delegado al dominio, §7)."""

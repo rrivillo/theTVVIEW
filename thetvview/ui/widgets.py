@@ -12,6 +12,8 @@ from typing import Any
 
 from . import colors
 from . import icons
+from .actions import LEADING, P, SEPARATOR, Action, V, fit_actions
+from .textwidth import cell_width, clip_cells
 
 
 class ScrollableList:
@@ -344,7 +346,17 @@ class HeaderBar:
 
 
 class FooterBar:
-    """Barra inferior moderna con chips de atajos contextuales."""
+    """Barra inferior moderna con chips de atajos contextuales.
+
+    **Fuente única**: el catálogo de `Action` de la pantalla entra por
+    `set_actions` y el ajuste por prioridad/anchoraje lo decide
+    `actions.fit_actions`. Este widget sólo traduce a texto y pinta; no decide
+    qué se muestra (§67: nada de lógica de presentación en el componente).
+
+    `chips` sigue siendo la lista `(key, label)` que leen los lectores
+    actuales, y se recalcula en cada `render` a partir de las acciones que
+    caben de verdad en el ancho disponible.
+    """
 
     def __init__(self) -> None:
         self.chips: list[tuple[str, str]] = []  # (key, label)
@@ -352,9 +364,23 @@ class FooterBar:
         self.is_error: bool = False
         self._flash_until: float = 0.0
         self._flash_duration: float = 4.0
+        #: Catálogo declarado por la pantalla (SDD §10). Vacío = usar `chips`.
+        self.actions: list[Action] = []
+        #: Acciones habilitadas que no cupieron: se marca con "…" (§45).
+        self.overflow: bool = False
 
     def set_chips(self, *chips: tuple[str, str]) -> None:
         self.chips = list(chips)
+        self.actions = []
+
+    def set_actions(self, actions: list[Action]) -> None:
+        """Declara el catálogo de la pantalla (§63).
+
+        No ajusta aquí: el ancho real sólo se conoce en `render`. A partir de
+        este momento `chips` refleja lo que *de verdad* cabe, porque se
+        recalcula en cada frame.
+        """
+        self.actions = list(actions)
 
     def show(self, message: str, error: bool = False, duration: float = 4.0) -> None:
         self.message = message
@@ -367,6 +393,77 @@ class FooterBar:
             self.is_error = False
         return self.message
 
+    # -- pieces of the line ------------------------------------------------
+    # Todo se mide con `cell_width` (§43): `len()` no es una medida, y esta
+    # línea lleva `★ ▶ ← →` que son *Ambiguous*.
+
+    def _fit_actions_for(self, avail: int) -> list[Action]:
+        """Qué acciones caben en ``avail`` celdas, y deja `chips` al día."""
+        if not self.actions:
+            return []
+        habilitadas = [a for a in self.actions if a.enabled]
+        ajustadas = fit_actions(self.actions, avail)
+        self.chips = [(a.key, a.label) for a in ajustadas]
+        self.overflow = len(ajustadas) < len(habilitadas)
+        return ajustadas
+
+    def _fit_legacy_chips(self, avail: int) -> list[str]:
+        """Chips heredados (``chips`` a pelo), medidos con `cell_width`.
+
+        Se mantiene el camino viejo para las pantallas que aún no tienen
+        catálogo y para los dobles de test. Igual que antes, primer-que-llega
+        y sin partir etiquetas: si el primer chip no cabe, no se dibuja ninguno
+        (§46).
+        """
+        partes: list[str] = []
+        usado = LEADING
+        overflow = False
+        for key, label in self.chips:
+            chunk = f" {key} {label} "
+            need = cell_width(chunk) + (cell_width(SEPARATOR) if partes else 0)
+            if usado + need <= avail:
+                partes.append(chunk)
+                usado += need
+            else:
+                overflow = True
+                break
+        self.overflow = overflow and bool(partes)
+        return partes
+
+    def _segments(self, fitted: list[Action], avail: int) -> list[tuple[str, int]]:
+        """Segmentos `(texto, attr)` de la línea, sin el mensaje.
+
+        Clave en `PAIR_PRIMARY|A_BOLD` y etiqueta en `PAIR_MUTED` (§24): el
+        contraste entre la tecla y su etiqueta es lo que hace legible la barra
+        sin gastar un solo par de color nuevo (R-06).
+        """
+        attr_key = colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD
+        attr_label = colors.pair(colors.PAIR_MUTED)
+        attr_sep = colors.pair(colors.PAIR_MUTED)
+        attr_filler = colors.pair(colors.PAIR_STATUS)
+
+        segs: list[tuple[str, int]] = [(" ", attr_filler)]
+        usado = LEADING
+        for i, action in enumerate(fitted):
+            if i:
+                segs.append((SEPARATOR, attr_sep))
+                usado += cell_width(SEPARATOR)
+            segs.append((f" {action.key}", attr_key))
+            usado += cell_width(f" {action.key}")
+            segs.append((f" {action.label} ", attr_label))
+            usado += cell_width(f" {action.label} ")
+        # "…" marca que quedan acciones fuera (§45): nunca una etiqueta partida.
+        self._cierre(segs, usado, avail)
+        return segs
+
+    def _cierre(self, segs: list[tuple[str, int]], usado: int, avail: int) -> None:
+        """Cierra la línea: "…" si sobran acciones y relleno hasta el ancho."""
+        if self.overflow and usado + 1 <= avail:
+            segs.append(("…", colors.pair(colors.PAIR_MUTED)))
+            usado += 1
+        if usado < avail:
+            segs.append((" " * (avail - usado), colors.pair(colors.PAIR_STATUS)))
+
     def render(self, stdscr: curses.window) -> None:
         max_y, max_x = stdscr.getmaxyx()
         if max_y < 2:
@@ -377,7 +474,7 @@ class FooterBar:
         if width <= 0:
             return
 
-        # Separador
+        # Separador superior
         try:
             stdscr.addstr(sep_y, 0, "─" * width, colors.pair(colors.PAIR_BORDER))
         except curses.error:
@@ -385,49 +482,43 @@ class FooterBar:
 
         msg = self._current_message()
         msg_str = f" {msg} " if msg else ""
-        # Reservar espacio para mensaje (prioridad absoluta)
-        msg_len = len(msg_str)
-        left_w = max(0, width - msg_len)
+        # El toast conserva su prioridad absoluta: se reserva su ancho real.
+        msg_cells = cell_width(msg_str)
+        avail = max(0, width - msg_cells)
 
-        # Construir chips con truncado inteligente por chip, no por carácter
-        chip_visible = ""
-        if left_w > 2 and self.chips:
-            # Construir incrementalmente hasta llenar left_w
-            parts: list[str] = []
-            cur_len = 1  # espacio inicial
-            for key, label in self.chips:
-                chunk = f" {key} {label} "
-                sep = "│" if parts else ""
-                need = len(sep) + len(chunk)
-                if cur_len + need <= left_w:
-                    parts.append(f"{sep}{chunk}" if sep else chunk)
-                    cur_len += need
-                else:
-                    if not parts and left_w >= 6:
-                        trunc = chunk[: left_w - 1]
-                        parts.append(trunc)
-                    break
-            chip_visible = "".join(parts)
-            if len(parts) < len(self.chips) and left_w - cur_len >= 2:
-                chip_visible = chip_visible.rstrip() + "…"
-        elif left_w <= 2 and msg:
-            chip_visible = ""
-
-        line = f" {chip_visible}".ljust(left_w)[:left_w] + msg_str
-        line = line[:width].ljust(width)[:width]
-
-        if msg and self.is_error:
-            attr = colors.pair(colors.PAIR_DANGER)
-        elif msg:
-            attr = colors.pair(colors.PAIR_SUCCESS)
+        if self.actions:
+            segs = self._segments(self._fit_actions_for(avail), avail)
+        elif self.chips:
+            attr_chip = colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD
+            partes = self._fit_legacy_chips(avail)
+            segs = [(" ", colors.pair(colors.PAIR_STATUS))]
+            segs += [(parte, attr_chip) for parte in partes]
+            self._cierre(segs, LEADING + sum(cell_width(p) for p in partes), avail)
         else:
-            # Chips con PRIMARY|BOLD para vistosidad, fallback STATUS
-            attr = (colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD) if chip_visible else colors.pair(colors.PAIR_STATUS)
+            segs = [(" " * avail, colors.pair(colors.PAIR_STATUS))]
 
-        try:
-            stdscr.addstr(row, 0, line[:width], attr)
-        except curses.error:
-            pass
+        attr_msg = (
+            colors.pair(colors.PAIR_DANGER)
+            if (msg and self.is_error)
+            else colors.pair(colors.PAIR_SUCCESS)
+        )
+        x = 0
+        for texto, attr in segs:
+            if x >= width:
+                break
+            troceado = clip_cells(texto, width - x)
+            if not troceado:
+                break  # no queda hueco: nada que escribir (§39)
+            try:
+                stdscr.addstr(row, x, troceado, attr)
+            except curses.error:
+                return
+            x += cell_width(troceado)
+        if msg_str and x < width:
+            try:
+                stdscr.addstr(row, x, clip_cells(msg_str, width - x), attr_msg)
+            except curses.error:
+                pass
 
 
 class ToastStack:
@@ -522,11 +613,35 @@ class SearchModal:
     Todo addstr está protegido contra curses.error y terminales pequeñas.
     """
 
+    #: Texto de la pista cuando se pasa `hint` a mano. Antes era también el
+    #: valor por defecto; ahora lo es `actions()`, para no tener dos caminos.
     DEFAULT_HINT = "Enter confirmar · Esc limpiar · Ctrl-U borrar"
 
     def __init__(self, title: str = "Buscar", hint: str | None = None) -> None:
         self.title = title
-        self.hint = hint if hint is not None else self.DEFAULT_HINT
+        #: `hint` explícito del caller. Si no, la pista sale de `actions()`.
+        self.hint = hint
+        #: Mismo `Action` que el pie de `Modal` (§35): un solo camino, no dos.
+        self.actions: list[Action] = [
+            Action("Enter", V.CONFIRMAR, P.PRIMARIA, essential=True),
+            Action("Ctrl-U", V.VACIAR, P.FRECUENTE),
+            Action("Esc", V.LIMPIAR, P.NAVEGACION, essential=True),
+        ]
+
+    def hint_line(self, avail: int = 10_000) -> str:
+        """La pista de teclas: el `hint` del caller, o la derivada de `actions()`.
+
+        Antes era una constante de texto; ahora sale del mismo catálogo que el
+        pie de `Modal` —misma tecla, mismo vocabulario cerrado, mismo ajuste por
+        anchura— porque mantener las dos versiones es exactamente la deriva que
+        el modelo de acciones viene a cerrar.
+        """
+        if self.hint is not None:
+            return self.hint
+        ajustadas = fit_actions(self.actions, avail)
+        if not ajustadas:
+            return ""
+        return " · ".join(a.chip() for a in ajustadas)
 
     @staticmethod
     def visible_query(query: str, avail: int) -> str:
@@ -629,11 +744,13 @@ class SearchModal:
             except curses.error:
                 pass
 
-        # Pista de teclas (tenue). En terminal compacta se omite si no cabe.
+        # Pista de teclas (tenue). Viene de `actions()`, medido con cell_width;
+        # en terminal compacta se omite si no cabe (§46: nunca se parte).
         hrow = y + 4
         if hrow < y + h - 1:
+            pista = self.hint_line()
             try:
-                stdscr.addstr(hrow, x + 2, self.hint[:max(0, w - 4)],
+                stdscr.addstr(hrow, x + 2, clip_cells(pista, max(0, w - 4)),
                               colors.pair(colors.PAIR_DIM) | curses.A_DIM)
             except curses.error:
                 pass
@@ -651,21 +768,72 @@ class SearchModal:
         hint: str | None = None,
     ) -> tuple[int, int] | None:
         """Atajo funcional sin instanciar (para pantallas y tests)."""
-        modal = SearchModal(title=title, hint=hint or SearchModal.DEFAULT_HINT)
+        modal = SearchModal(title=title, hint=hint)
         return modal.render(stdscr, query=query, matched=matched, total=total)
 
 
-class Modal:
-    """Diálogo modal centrado con borde doble, sombra y botones."""
+def modal_actions(
+    *,
+    confirmar: str = V.CONFIRMAR,
+    cancelar: str = V.CANCELAR,
+) -> list[Action]:
+    """`Enter <confirmar> · Esc <cancelar>`: el pie por defecto de un modal (§35).
 
-    def __init__(self, title: str, message: str, buttons: list[str] | None = None) -> None:
+    Vive fuera de `Modal` a propósito —y no como método estático— porque quien
+    lo usa tiene el `Modal` delante (o un doble de test que no tiene por qué
+    saber de esta API). El verbo se pasa porque «Enter Guardar» y «Enter
+    Eliminar» no son la misma acción, pero la tecla y la forma del pie sí.
+    """
+    return [
+        Action("Enter", confirmar, P.PRIMARIA, essential=True),
+        Action("Esc", cancelar, P.NAVEGACION, essential=True),
+    ]
+
+
+class Modal:
+    """Diálogo modal centrado con borde doble, sombra, botones y pie de acciones.
+
+    El **pie de acciones** (`actions`) pinta `Enter Confirmar · Esc Cancelar` en
+    el borde inferior (SDD §35): mientras hay un modal abierto la barra de la
+    pantalla padre queda tapada y el usuario necesita saber qué teclas valen
+    *aquí dentro*, no en la pantalla de detrás. Es además el sitio donde vive
+    la configuración de la app, que son ajustes y modales, no una pantalla.
+
+    El catálogo es el mismo `Action` que usa el pie (`ui.actions`), así que no
+    hay un segundo camino: la etiqueta sale del vocabulario cerrado y el ancho
+    se mide con `cell_width`.
+
+    Sin campos de texto: para escribir algo está `FormModal`, que es lo que se
+    usa de verdad. Aquí una caja de input sería una segunda forma de lo mismo,
+    y una que además nadie ha activado nunca.
+    """
+
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        buttons: list[str] | None = None,
+        actions: list[Action] | None = None,
+    ) -> None:
         self.title = title
         self.message = message
         self.buttons = buttons or ["Aceptar"]
         self.selected_button: int = 0
-        self.input_value: str = ""
-        self.input_mode: bool = False
-        self.input_cursor: int = 0
+        #: Pie de acciones (§35). Vacío = sin pie (comportamiento anterior).
+        self.actions: list[Action] = list(actions or [])
+
+    def _actions_line(self, avail: int) -> str:
+        """Texto del pie de acciones, ajustado al ancho real (`cell_width`).
+
+        Nunca parte una etiqueta: si no cabe, se cae la menos prioritaria y, si
+        aun así no cabe ninguna entera, no se pinta nada (§46).
+        """
+        if not self.actions or avail <= 0:
+            return ""
+        ajustadas = fit_actions(self.actions, avail)
+        if not ajustadas:
+            return ""
+        return SEPARATOR.join(a.chip() for a in ajustadas)
 
     def _calc_rect(self, max_y: int, max_x: int) -> tuple[int, int, int, int]:
         """Calcula (y, x, h, w) del modal centrado."""
@@ -674,9 +842,18 @@ class Modal:
             f"{'>' if i == self.selected_button else ' '} {b} "
             for i, b in enumerate(self.buttons)
         )
-        inner_w = max(len(self.title) + 4, max(len(l) for l in lines) + 4, len(btn_line) + 4, 30)
+        inner_w = max(cell_width(self.title) + 4,
+                      max((cell_width(l) for l in lines), default=0) + 4,
+                      cell_width(btn_line) + 4, 30)
+        # El pie de acciones es contenido: el modal crece para que quepa entero
+        # en vez de recortar «Enter Confirmar · Esc Cancelar» a media etiqueta
+        # (§46). Si la terminal es más estrecha, ya lo ajustará `_actions_line`.
+        if self.actions:
+            pie_ancho = sum(a.chip_cells() + 1 for a in self.actions)
+            inner_w = max(inner_w, pie_ancho + 4)
         inner_w = min(inner_w, max_x - 4)
-        inner_h = len(lines) + 3 + (1 if self.input_mode else 0)  # title + lines + buttons + input
+        # +1 fila si hay pie de acciones: es una fila más que dibujar.
+        inner_h = len(lines) + 3 + (1 if self.actions else 0)
         total_h = inner_h + 2  # borders
         total_w = inner_w + 2
         y = max(1, (max_y - total_h) // 2)
@@ -685,18 +862,6 @@ class Modal:
 
     def handle_key(self, key: int) -> str | None:
         """Devuelve el nombre del botón presionado o None."""
-        if self.input_mode:
-            if key in (curses.KEY_ENTER, 10, 13):
-                self.input_mode = False
-                return "accept"
-            if key in (27,):  # Esc
-                self.input_mode = False
-                return "cancel"
-            if key in (curses.KEY_BACKSPACE, 127, 8):
-                self.input_value = self.input_value[:-1]
-            elif 32 <= key < 127 or key > 160:
-                self.input_value += chr(key)
-            return None
         # Navegación de botones
         if key in (curses.KEY_LEFT, ord("\t")):
             self.selected_button = (self.selected_button - 1) % len(self.buttons)
@@ -710,6 +875,12 @@ class Modal:
 
     def render(self, stdscr: curses.window) -> None:
         max_y, max_x = stdscr.getmaxyx()
+        # Ventana demasiado pequeña para un diálogo con borde: no se dibuja
+        # nada. Pisar el borde con el título o los botones se ve peor que un
+        # modal ausente, y además el `addstr` de la esquina lanzaría
+        # `curses.error` (§39).
+        if max_y < 7 or max_x < 20:
+            return
         y, x, h, w = self._calc_rect(max_y, max_x)
 
         # Sombra (1 fila/col offset, dim)
@@ -740,48 +911,60 @@ class Modal:
         except curses.error:
             pass
 
+        # Filas reservadas abajo: borde, botones y —si hay— pie de acciones.
+        # El pie va justo debajo de los botones, y sólo se pinta si cabe entero
+        # antes del borde inferior (§35, §39: terminal diminuta).
+        fila_botones = min(y + h - 3 if self.actions else y + h - 2, max_y - 2)
+        hay_fila_pie = self.actions and (y + h - 2) < max_y - 1
+        limite = fila_botones
+
         # Mensaje
         lines = self.message.split("\n")
         for i, line in enumerate(lines):
             row = y + 1 + i
-            if row >= y + h - 2:
+            if row >= limite:
                 break
             lx = x + 2
             try:
-                stdscr.addstr(row, lx, line[:max(0, w - 4)], colors.pair(colors.PAIR_NORMAL))
+                stdscr.addstr(row, lx, clip_cells(line, max(0, w - 4)),
+                              colors.pair(colors.PAIR_NORMAL))
             except curses.error:
                 pass
-
-        # Input si está activo
-        if self.input_mode:
-            row = y + 1 + len(lines)
-            if row < y + h - 2:
-                cursor = "▌" if self.active else ""
-                input_str = f" {self.input_value}{cursor} "
-                try:
-                    stdscr.addstr(row, x + 2, input_str[:max(0, w - 4)], colors.pair(colors.PAIR_SEARCH))
-                except curses.error:
-                    pass
 
         # Botones — selected con BOLD|REVERSE, resto PRIMARY|BOLD
         btn_line = "  ".join(
             f"[{b}]" for b in self.buttons
         )
-        bx = x + max(0, (w - len(btn_line)) // 2)
-        by = y + h - 2
+        bx = x + max(0, (w - cell_width(btn_line)) // 2)
+        by = fila_botones
         try:
             offset = bx
             for i, b in enumerate(self.buttons):
+                if offset >= max_x:
+                    break  # ventana diminuta: no se escribe fuera (§39)
                 txt = f"[{b}]"
                 sep = "  " if i < len(self.buttons) - 1 else ""
                 if i == self.selected_button:
                     attr = colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD | curses.A_REVERSE
                 else:
                     attr = colors.pair(colors.PAIR_PRIMARY)
-                stdscr.addstr(by, offset, (txt + sep)[:max(0, w - (offset - x))], attr)
-                offset += len(txt) + len(sep)
+                stdscr.addstr(by, offset, clip_cells(txt + sep, max(0, w - (offset - x))), attr)
+                offset += cell_width(txt) + cell_width(sep)
         except curses.error:
             pass
+
+        # Pie de acciones (§35): qué teclas valen *aquí dentro*.
+        if hay_fila_pie:
+            pie = self._actions_line(max(0, w - 4))
+            if pie:
+                px = x + max(2, (w - cell_width(pie)) // 2)
+                if px < max_x:
+                    try:
+                        stdscr.addstr(y + h - 2, px,
+                                      clip_cells(pie, max(0, min(w - 4, max_x - 1 - px))),
+                                      colors.pair(colors.PAIR_MUTED))
+                    except curses.error:
+                        pass
 
 
 class FormModal:

@@ -160,6 +160,10 @@ elegido: nunca te hacen elegirlo dos veces.
 | `Enter` | Abrir lo seleccionado. |
 | `Esc` / `Retroceso` | Volver a la pantalla anterior. |
 
+La barra inferior de cada pantalla muestra las acciones más relevantes de esa
+pantalla, en una sola línea y con ajuste al ancho disponible; `?` para la ayuda
+completa, que además es la referencia definitiva.
+
 Un aviso sobre `g`: en **Canales** `g` no es "ir al principio" sino abrir los
 **grupos**, así que para el principio está `Inicio`. En el resto de pantallas de
 lista (`g` = primero, `G` = último) sí se cumple.
@@ -224,6 +228,12 @@ caracteres de ancho; el catálogo añade una tercera columna a partir de 150.
   corchetes ignorados al agrupar y sufijo de `tvg-id` estilo iptv-org
   (`id.es@HD`). Se reconocen `SD`, `HD`, `FHD`, `QHD`, `UHD`, `4K` y `8K`.
   Navega con `←`/`→` y confirma con `Enter`.
+  El selector **abre sobre la variante que acabas de elegir**, así que
+  `Enter` seguido de `Enter` reproduce lo mismo que elegiste.
+  Si una lista publica varias entradas del mismo canal con la misma calidad
+  (habitual con `[Opc.2]`, `[Opc.3]`), los botones dicen cuál es cuál usando
+  ese marcador en vez de repetir `HD` o `SD` dos veces: dos botones iguales no
+  son un botón.
   Este selector y el de pistas son cosas distintas: éste elige entre
   **canales** de tu lista, el otro entre **variantes del manifiesto** del
   canal que ya has elegido. Si la lista trae variantes, gana éste y el otro
@@ -791,7 +801,7 @@ convertir la app en algo que no responde. Editables a mano:
 ## Tests
 
 ```bash
-# Suite completa (1827 tests, ~2,5 min)
+# Suite completa (1956 tests, ~2,5 min)
 python -m unittest -v
 
 # Solo tests de una parte
@@ -813,6 +823,11 @@ selección de pistas (modelo, parsers HLS/DASH, sondeo, política de
 selección, preferencias, argv, IPC y proxy de calidad) y el multi-stream
 (transporte, detector, router, errores, cámara IP, supervisor, diagnóstico,
 preferencias e integración).
+
+Las acciones contextuales tienen su propia suite, y una invariante que la
+sostiene: **todo lo que la barra inferior anuncia, la pantalla ya lo hace**
+(`keys(actions()) ⊆ shortcuts() ∧ ⊆ handle_key`). La convención está en
+[`docs/actions.md`](docs/actions.md).
 
 ```bash
 python -m unittest tests.test_catchup -v      # dominio catch-up
@@ -896,11 +911,14 @@ thetvview/
     ├── screens.py      # todas las pantallas
     ├── tracks.py       # sesión de pistas del canal abierto (estado)
     ├── widgets.py      # listas, modales, formularios, toast, loading
+    ├── actions.py      # Action, prioridades, vocabulario y ajuste del pie
+    ├── textwidth.py    # ancho en celdas (cell_width/clip_cells)
     ├── layout.py       # rectángulos (header/main/footer)
     ├── theme.py        # paletas dual light/dark (256/8 colores, NO_COLOR)
     ├── colors.py       # IDs de pares de color
     └── icons.py        # iconos y cajas Unicode
 tests/                  # unittest + fixtures (m3u, xmltv, .gz)
+docs/actions.md         # la convención de acciones contextuales
 data/                   # datos locales (no versionados)
 ```
 

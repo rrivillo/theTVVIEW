@@ -10,6 +10,8 @@ from thetvview.resolutions import (
     quality_rank,
     split_name,
     swappable_variants,
+    trailing_marker,
+    variant_labels,
     variants_of,
 )
 
@@ -210,6 +212,96 @@ class TestSwappableVariants(unittest.TestCase):
         got = swappable_variants(canales, canales[0])
         bases = [base_name(c) for c in got]
         self.assertTrue(all(b == "La 1" for b in bases))
+
+
+class TestMarcadorFinal(unittest.TestCase):
+    """`trailing_marker`: lo único que distingue dos entradas iguales."""
+
+    def test_corchete(self):
+        self.assertEqual(trailing_marker(ch("Canal HD [Opc.2]")), "[Opc.2]")
+
+    def test_parentesis(self):
+        self.assertEqual(trailing_marker(ch("Canal HD (Nacional)")), "(Nacional)")
+
+    def test_gana_el_ultimo_marcador(self):
+        self.assertEqual(
+            trailing_marker(ch("Canal HD [No 24/7][Opc.2]")), "[Opc.2]"
+        )
+
+    def test_sin_marcador(self):
+        self.assertIsNone(trailing_marker(ch("Canal HD")))
+
+
+class TestEtiquetasDeVariantes(unittest.TestCase):
+    """`variant_labels`: botones que no se confunden entre sí.
+
+    Una lista puede publicar tres entradas del mismo canal que son las tres
+    HD. Dos botones idénticos no son un botón, así que la etiqueta tiene que
+    decir cuál es cuál — y sólo cuando hay ambigüedad.
+    """
+
+    def test_sin_repeticiones_queda_la_resolucion(self):
+        canales = [ch("Canal 720p"), ch("Canal 1080p")]
+        self.assertEqual(variant_labels(canales), ["720p", "1080p"])
+
+    def test_con_repeticiones_usa_el_marcador_del_nombre(self):
+        canales = [
+            ch("Canal SD"),
+            ch("Canal HD [Opc.2]"),
+            ch("Canal HD [Opc.3]"),
+        ]
+        self.assertEqual(
+            variant_labels(canales), ["SD", "HD [Opc.2]", "HD [Opc.3]"]
+        )
+
+    def test_si_el_marcador_tampoco_distingue_sale_un_ordinal(self):
+        """Dos entradas idénticas hasta el final: sólo el orden las separa."""
+        canales = [ch("Canal (Nacional) HD"), ch("Canal (Nacional) HD [Opc.2]")]
+        etiquetas = variant_labels(canales)
+        self.assertEqual(etiquetas, ["HD #1", "HD #2"])
+        self.assertEqual(len(set(etiquetas)), 2, "sigue siendo único")
+
+    def test_etiquetas_siempre_unicas(self):
+        canales = [
+            ch("Canal SD"), ch("Canal SD [Opc.2]"), ch("Canal SD [Opc.3]"),
+            ch("Canal HD"), ch("Canal HD [Opc.2]"),
+        ]
+        etiquetas = variant_labels(canales)
+        self.assertEqual(len(set(etiquetas)), len(etiquetas))
+
+    def test_vacio(self):
+        self.assertEqual(variant_labels([]), [])
+
+
+class TestCasosDeLaListaReal(unittest.TestCase):
+    """El caso que originó la pregunta: entradas con opciones numeradas.
+
+    Nombres tomados de la lista real del usuario: el mismo canal publicado
+    tres veces, con `[Opc.2]`/`[Opc.3]` distinguiendo la alternativa.
+    """
+
+    LA_RED = [
+        "[Chile] La Red HD (Nacional)[Geo-Blocked]",
+        "[Chile] La Red SD (Nacional)[Opc.2]",
+        "[Chile] La Red SD (Nacional)[Opc.3]",
+    ]
+
+    def canales(self):
+        return [ch(n) for n in self.LA_RED]
+
+    def test_se_detectan_las_tres_como_variantes(self):
+        cs = self.canales()
+        v = swappable_variants(cs, cs[0])
+        self.assertEqual(len(v), 3)
+
+    def test_las_dos_sd_dejan_de_ser_el_mismo_boton(self):
+        """Ésta es la confusión: dos «SD» indistinguibles."""
+        cs = self.canales()
+        v = swappable_variants(cs, cs[0])
+        etiquetas = variant_labels(v)
+        self.assertEqual(len(set(etiquetas)), len(etiquetas))
+        self.assertIn("SD [Opc.2]", etiquetas)
+        self.assertIn("SD [Opc.3]", etiquetas)
 
 
 if __name__ == "__main__":
