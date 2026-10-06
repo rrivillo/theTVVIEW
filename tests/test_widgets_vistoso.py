@@ -83,7 +83,8 @@ class TestEmptyState(unittest.TestCase):
     def test_render_mantiene_arte_7_lineas(self):
         stdscr = _FakeStdscr(24, 80)
         with mock.patch.object(colors, "pair", return_value=0):
-            EmptyState.render(stdscr, 12, 80, "Sin datos", "pulsa 'a'")
+            EmptyState.render(stdscr, 12, 80, icons.ICON_STAR_OFF,
+                              "Sin datos", "pulsa 'a'")
         all_text = " ".join(c[2] for c in stdscr.calls)
         self.assertIn("┌──────────┐", all_text)
         self.assertIn("◉", all_text)
@@ -91,9 +92,20 @@ class TestEmptyState(unittest.TestCase):
     def test_cta_usa_selected(self):
         stdscr = _FakeStdscr(24, 80)
         with mock.patch.object(colors, "pair", return_value=0):
-            EmptyState.render(stdscr, 12, 80, "Msg", "CTA")
+            EmptyState.render(stdscr, 12, 80, icons.ICON_EPG, "Msg", "", "CTA")
         cta_calls = [c for c in stdscr.calls if "CTA" in c[2]]
         self.assertGreater(len(cta_calls), 0)
+
+    def test_arte_desaparece_en_terminal_estrecha(self):
+        """El arte es decoración: a 40 columnas estorba y se omite (§8.3)."""
+        estrecho = _FakeStdscr(24, 40)
+        with mock.patch.object(colors, "pair", return_value=0):
+            EmptyState.render(estrecho, 12, 40, icons.ICON_STAR_OFF, "Sin datos")
+        all_text = " ".join(c[2] for c in estrecho.calls)
+        self.assertNotIn("┌──────────┐", all_text)
+        # El icono sí: pasa a ser el elemento visual principal.
+        self.assertIn(icons.ICON_STAR_OFF, all_text)
+        self.assertIn("Sin datos", all_text)
 
 
 class TestScrollableListScrollbar(unittest.TestCase):

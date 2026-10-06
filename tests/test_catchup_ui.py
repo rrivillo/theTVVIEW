@@ -188,7 +188,13 @@ class TestMarcadoresEpg(unittest.TestCase):
 
     def test_sin_parrilla_sigue_ofreciendo_el_directo(self) -> None:
         _, screen = _epg_screen(xtream_channel(1, 7), [])
-        self.assertEqual(screen._rows(), ["(sin datos de EPG para este canal)"])
+        # Sin programas la lista está **realmente** vacía: "no hay nada" lo
+        # dice el `EmptyState` de la pantalla. Una fila de texto aquí
+        # contaría como si fuera un programa, y rompería el contador y el
+        # cursor de la parrilla.
+        self.assertEqual(screen._rows(), [])
+        # Y eso no debe quitarle al usuario el directo: sigue siendo la acción
+        # disponible cuando no hay parrilla.
         accion = screen.handle_key(curses.KEY_ENTER)
         self.assertEqual(accion["action"], "open_channel")
 

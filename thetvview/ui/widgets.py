@@ -147,16 +147,6 @@ def render_separator(stdscr: curses.window, y: int, width: int) -> None:
         pass
 
 
-def render_empty_message(stdscr: curses.window, y: int, width: int, message: str) -> None:
-    """Renderiza un mensaje centrado cuando la lista está vacía."""
-    try:
-        text = message[: width - 1]
-        x = max(0, (width - len(text)) // 2)
-        stdscr.addstr(y, x, text, colors.pair(colors.PAIR_EMPTY))
-    except curses.error:
-        pass
-
-
 def render_title_bar(stdscr: curses.window, title: str, stack_depth: int = 1) -> None:
     """Renderiza la barra de título con borde superior e indicador de profundidad."""
     max_y, max_x = stdscr.getmaxyx()
@@ -1252,54 +1242,189 @@ class FormModal:
             pass
 
 
+def wrap_block(text: str, width: int) -> list[str]:
+    """Parte `text` en líneas de como mucho `width` celdas, por palabras.
+
+    Utilidad **pura** (sin curses): la comparten los widgets que necesitan
+    envolver texto largo al ancho disponible en vez de truncarlo
+    (`EmptyState`, modales). Reglas:
+
+    * respeta los espacios existentes: nunca parte una palabra salvo que esa
+      palabra, sola, sea más ancha que la línea, y en ese caso se recorta a
+      `width` sin partir ningún glifo (§46);
+    * `\n` fuerza salto de línea (párrafos);
+    * una línea vacía se conserva: es respiración, no ruido.
+
+    Mide con `cell_width` (§43), nunca con `len()`: `◈ ─ ━` ocupan 1 celda en
+    una terminal moderna pero `len()` no lo sabe, y centrar con `len()`
+    descentra el bloque justo cuando aparece un símbolo.
+    """
+    if width <= 0:
+        return []
+    out: list[str] = []
+    for para in (text or "").split("\n"):
+        palabras = para.split()
+        if not palabras:
+            out.append("")
+            continue
+        actual = palabras[0]
+        for palabra in palabras[1:]:
+            if cell_width(actual) + 1 + cell_width(palabra) <= width:
+                actual = f"{actual} {palabra}"
+            else:
+                out.append(actual)
+                actual = palabra
+        out.append(actual)
+    return [clip_cells(linea, width) for linea in out]
+
+
+#: Orden en que `EmptyState` renuncia elementos cuando la ventana es demasiado
+#: baja (SDD §8.3). Es el inverso de la jerarquía visual: primero se cae lo
+#: decorativo, y el **título no se renuncia nunca**.
+_DEGRADACION = ("arte", "icono", "cta", "mensaje")
+
+
+def _degradar(secciones: list[tuple[str, list[tuple[str, int]]]]) -> bool:
+    """Sacrifica un elemento de `secciones` según §8.3. True si renunció algo.
+
+    Trabaja sobre una lista de ``(clave, lineas)`` para poder quitar la sección
+    entera sin importar cuál sea su posición: el arte está arriba y el CTA
+    abajo, pero lo que manda no es *dónde* está sino *cuánto pesa*.
+    """
+    # Primero se recorta el mensaje línea a línea; sólo cuando queda una sola
+    # se renuncia el bloque entero.
+    for _clave, lineas in secciones:
+        if _clave == "mensaje" and len(lineas) > 1:
+            del lineas[-1]
+            return True
+    for clave_huerfano in _DEGRADACION:
+        for i, (clave, _lineas) in enumerate(secciones):
+            if clave == clave_huerfano:
+                del secciones[i]
+                return True
+    return False
+
+
 class EmptyState:
-    """Estado vacío con ícono ASCII y CTA."""
+    """Estado vacío **estandarizado**: icono + título + mensaje + CTA opcional.
+
+    Un único camino para todo "aquí no hay nada" de la TUI (SDD estados vacíos
+    §6, §8). Antes cada pantalla se inventaba su propio `addstr` y sus propias
+    comillas; ahora todas comparten bloque, centrado y jerarquía visual.
+
+    Jerarquía (SDD §19) — y por tanto **orden de recorte** si no cabe
+    (§8.3: título > mensaje > CTA > icono > decoración):
+
+    ===============  ==================  =======================================
+    Elemento         Par de colores      Papel
+    ===============  ==================  =======================================
+    arte ASCII       ``PAIR_DIM``        decoración, se omite si no cabe
+    icono            ``PAIR_ACCENT``    acento de la categoría
+    título           ``PAIR_EMPTY``     qué ocurre
+    mensaje          ``PAIR_DIM``       por qué / cómo llegar
+    CTA              ``PAIR_SELECTED``  qué hacer ahora (``A_BOLD``)
+    ===============  ==================  =======================================
+
+    **Responsabilidad (SDD §7).** Este widget sólo hace layout, centrado,
+    wrapping, estilos y dibujo. No captura teclas, no ejecuta acciones, no
+    conoce ninguna pantalla, no llama a ``App`` y no guarda estado. La CTA la
+    compone quien llama, y sólo si la tecla existe de verdad: *toda CTA
+    dibujada debe tener una tecla real detrás* (§4 R-4, §23).
+
+    **Taxonomía (SDD §17).** Distingue *contenido vacío* de *búsqueda sin
+    resultados* y de *loading* por el texto que recibe, no por su estado
+    interno. Los *errores* no llegan aquí: van por `_warn`/`_error`.
+
+    Nunca lanza: cada `addstr` va protegido, para que ni el 40×10 mínimo ni
+    un resize a media escritura taquen de `curses.error`.
+    """
+
+    #: Antena de TV. 7 líneas de 16 celdas como mucho; decoración pura, y lo
+    #: primero que se sacrifica cuando la ventana es estrecha.
+    ART: tuple[str, ...] = (
+        "    ┌──────────┐",
+        "    │  ◉  ◉    │",
+        "    │    ▬     │",
+        "    │  ────    │",
+        "    └────┬─────┘",
+        "         │",
+        "    ═════╧═════",
+    )
+
+    #: Por debajo de este ancho el arte estorba: se dibuja el bloque sin él y
+    #: el icono pasa a ser el elemento visual principal.
+    MIN_ART_WIDTH = 46
 
     @staticmethod
-    def render(stdscr: curses.window, y: int, width: int, message: str, cta: str = "") -> None:
+    def render(
+        stdscr: curses.window,
+        y: int,
+        width: int,
+        icon: str,
+        title: str,
+        message: str = "",
+        cta: str = "",
+    ) -> None:
+        """Dibuja el bloque centrado verticalmente sobre `y`.
+
+        `width` es la anchura **disponible** (no la de la ventana): quien lo
+        llama en una columna estrecha —el sidebar de Canales con panel de
+        detalle— pasa el ancho de su columna, y el bloque no invade a la
+        vecina.
+        """
         max_y = stdscr.getmaxyx()[0]
-        if y >= max_y - 2:
+        if width <= 0 or max_y <= 0:
             return
-        # Bloqueador de TV ASCII art
-        art = [
-            "    ┌──────────┐",
-            "    │  ◉  ◉    │",
-            "    │    ▬     │",
-            "    │  ────    │",
-            "    └────┬─────┘",
-            "         │",
-            "    ═════╧═════",
-        ]
-        art_h = len(art)
-        art_start = max(1, y - art_h // 2)
-        for i, line in enumerate(art):
-            row = art_start + i
-            if row >= max_y - 2:
-                break
-            lx = max(0, (width - len(line)) // 2)
-            try:
-                stdscr.addstr(row, lx, line, colors.pair(colors.PAIR_DIM))
-            except curses.error:
-                pass
 
-        # Mensaje
-        msg_y = art_start + art_h + 1
-        if msg_y < max_y - 2:
-            mx = max(0, (width - len(message)) // 2)
-            try:
-                stdscr.addstr(msg_y, mx, message[:max(0, width - 1)], colors.pair(colors.PAIR_EMPTY))
-            except curses.error:
-                pass
-
-        # CTA — sólido con SELECTED para que destaque
+        # Secciones del bloque, en orden de lectura, cada una ya medida y con su
+        # attr. El arte es decoración pura: sólo entra si el ancho lo permite.
+        secciones: list[tuple[str, list[tuple[str, int]]]] = []
+        if width >= EmptyState.MIN_ART_WIDTH:
+            attr_arte = colors.pair(colors.PAIR_DIM)
+            secciones.append(("arte", [(linea, attr_arte) for linea in EmptyState.ART]))
+        if icon:
+            secciones.append(("icono", [(icon, colors.pair(colors.PAIR_ACCENT))]))
+        secciones.append(("titulo", [(title, colors.pair(colors.PAIR_EMPTY))]))
+        lineas_mensaje = wrap_block(message, max(1, width - 2))
+        if lineas_mensaje:
+            attr_msg = colors.pair(colors.PAIR_DIM)
+            secciones.append(("mensaje", [(linea, attr_msg) for linea in lineas_mensaje]))
         if cta:
-            cta_y = msg_y + 1
-            if cta_y < max_y - 2:
-                cta_x = max(0, (width - len(cta) - 2) // 2)
+            attr_cta = colors.pair(colors.PAIR_SELECTED) | curses.A_BOLD
+            secciones.append(("cta", [(f" {cta} ", attr_cta)]))
+
+        # Degradación por altura (§8.3) y centrado vertical en `y`.
+        # `limite` = cuántas filas puede ocupar el bloque: se dejan intactas
+        # las dos de abajo (status y footer), y la 0 arriba es la barra de
+        # título, así que el bloque prefiere empezar en la 1.
+        limite = max_y - 2
+        while True:
+            # Cada sección cuenta sus líneas, no una: un mensaje de tres
+            # líneas ocupa tres filas, y centrar sin contarlas descentraba el
+            # bloque y empujaba la CTA fuera de pantalla.
+            alto = (sum(len(lineas) for _clave, lineas in secciones)
+                    + max(0, len(secciones) - 1))
+            inicio = max(1, min(y - alto // 2, max(0, limite - alto)))
+            if inicio + alto <= limite:
+                break
+            if not _degradar(secciones):
+                # Sólo queda el título y aun así no cabe (terminal de 1-3
+                # filas): se dibuja lo que se pueda y se sale.
+                break
+
+        fila = inicio
+        for i, (_clave, lineas) in enumerate(secciones):
+            if i:
+                fila += 1  # separador en blanco
+            for texto, attr in lineas:
+                if fila >= limite:
+                    break
+                x = max(0, (width - cell_width(texto)) // 2)
                 try:
-                    stdscr.addstr(cta_y, cta_x, f" {cta} ", colors.pair(colors.PAIR_SELECTED) | curses.A_BOLD)
+                    stdscr.addstr(fila, x, clip_cells(texto, max(0, width - 1)), attr)
                 except curses.error:
                     pass
+                fila += 1
 
 
 class Timeline:

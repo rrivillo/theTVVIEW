@@ -37,7 +37,7 @@ from . import colors
 from . import icons
 from .actions import Action, P, V
 from .textwidth import cell_width, clip_cells
-from .widgets import ScrollableList, render_empty_message, render_separator
+from .widgets import EmptyState, ScrollableList, render_separator
 
 
 # Centinela: ChannelsScreen sin filtro de grupo (vs. filtro "sin grupo").
@@ -155,6 +155,27 @@ def format_channel_name(ch: Channel, *, favorite: bool = False) -> str:
     radio = "♪ " if ch.radio else ""
     base = f"[{ch.group}] {ch.name}" if ch.group else ch.name
     return f"{fav}{radio}{base}"
+
+
+def _render_no_results(stdscr: curses.window, y: int, width: int,  # noqa: ANN001
+                       query: str, kind: str = "canales") -> None:
+    """Estado vacío de **búsqueda**, categoría propia y distinta (§17).
+
+    "He obtenido los datos, pero el filtro no encuentra nada" no es lo mismo
+    que "aquí no hay nada": mezclarlos hacía que una lista llena pareciera
+    vacía. Por eso tiene su propio camino, con la consulta a la vista para
+    que el usuario vea *qué* está buscando sin tener que adivinarlo.
+
+    La CTA es real: `Esc` limpia la consulta y sale de búsqueda
+    (`ChannelsScreen._feed_search` / `GroupsScreen._feed_search`), y `Ctrl-U`
+    la vacía sin cerrar el modal. No se anuncia ninguna tecla que no exista.
+    """
+    EmptyState.render(
+        stdscr, y, width, icons.ICON_SEARCH,
+        f"No se encontraron {kind}",
+        f'No hay coincidencias para "{query}".',
+        "[Esc] Limpiar búsqueda",
+    )
 
 
 class PlaylistsScreen(Screen):
@@ -401,10 +422,15 @@ class PlaylistsScreen(Screen):
     def render(self, stdscr: curses.window) -> None:
         max_y, max_x = stdscr.getmaxyx()
         if not self.entries:
-            from .widgets import EmptyState
-            EmptyState.render(stdscr, max_y // 2, max_x,
-                              "No hay playlists registradas.",
-                              "pulsa 'a' para añadir")
+            # Sin crear nada aquí: la CTA anuncia `a`, que ya existe y ya crea
+            # la lista por su propio modal (no se duplica esa lógica, §12).
+            EmptyState.render(
+                stdscr, max_y // 2, max_x,
+                icons.ICON_LIST,
+                "No hay playlists",
+                "Añade una lista M3U o Xtream para empezar a ver canales.",
+                "[A] Añadir lista",
+            )
             return
 
         cols = self._cols(max_x)
@@ -993,17 +1019,23 @@ class ChannelsScreen(Screen):
             body_h = max(1, max_y - list_start_y - 2)
             sidebar_w = max_x
 
-        # Lista de canales (izquierda)
+        # Lista de canales (izquierda). Las dos ramas vacías son
+        # **mutuamente excluyentes** y de categoría distinta (§17):
+        # `not visible_idx and not query` → no hay contenido; `and query` → la
+        # búsqueda no encuentra nada. No se fusionan, porque un usuario con
+        # 400 canales filtrados no debe leer "no hay canales".
         if not self.visible_idx and not self.query:
-            if show_detail:
-                render_empty_message(stdscr, list_start_y + body_h // 2, sidebar_w, "La playlist no tiene canales.")
-            else:
-                render_empty_message(stdscr, list_start_y + body_h // 2, max_x, "La playlist no tiene canales.")
+            ancho = sidebar_w if show_detail else max_x
+            EmptyState.render(
+                stdscr, list_start_y + body_h // 2, ancho,
+                icons.ICON_TV,
+                "La playlist no tiene canales.",
+                "Vuelve a la lista de playlists para abrir otra.",
+            )
         elif not self.visible_idx and self.query:
-            if show_detail:
-                render_empty_message(stdscr, list_start_y + body_h // 2, sidebar_w, f"Sin resultados para '{self.query}'")
-            else:
-                render_empty_message(stdscr, list_start_y + body_h // 2, max_x, f"Sin resultados para '{self.query}'")
+            ancho = sidebar_w if show_detail else max_x
+            _render_no_results(stdscr, list_start_y + body_h // 2, ancho,
+                               self.query, "canales")
         else:
             self.list.render(stdscr, list_start_y, 0, body_h, sidebar_w)
             # Contador flotante de posición cuando hay muchos
@@ -1125,7 +1157,17 @@ class FavoritesScreen(Screen):
     def render(self, stdscr: curses.window) -> None:
         max_y, max_x = stdscr.getmaxyx()
         if not self.channels:
-            render_empty_message(stdscr, max_y // 2, max_x, "Sin favoritos. Marca canales con 'f'.")
+            # **Sin CTA, a propósito.** En esta pantalla `f` *quita* el
+            # favorito, no lo añade (`actions()` lo dice: todo lo que hay aquí
+            # es favorito por definición). Anunciar "[F] Favorito" sería una
+            # promesa falsa: una tecla dibujada sin acción detrás (R-04). El
+            # mensaje explica cómo llegar, que es lo que faltaba.
+            EmptyState.render(
+                stdscr, max_y // 2, max_x,
+                icons.ICON_STAR_OFF,
+                "No tienes favoritos",
+                "Pulsa F sobre un canal para añadirlo aquí.",
+            )
         else:
             self.list.render(stdscr, 1, 0, self.app.body_height(), max_x)
 
@@ -1197,7 +1239,15 @@ class RecentsScreen(Screen):
     def render(self, stdscr: curses.window) -> None:
         max_y, max_x = stdscr.getmaxyx()
         if not self.items:
-            render_empty_message(stdscr, max_y // 2, max_x, "Sin recientes. reproduce algo primero.")
+            # Sin CTA: "Reproducir canal" sería una acción que esta pantalla
+            # no tiene con la lista vacía (aquí `Enter` abre *un* reciente, y
+            # no hay ninguno). Se dice de dónde saldrán, no se promete.
+            EmptyState.render(
+                stdscr, max_y // 2, max_x,
+                icons.ICON_TIME,
+                "No hay canales recientes",
+                "Los canales que reproduzcas aparecerán aquí.",
+            )
         else:
             self.list.render(stdscr, 1, 0, self.app.body_height(), max_x)
 
@@ -1470,19 +1520,16 @@ class GroupsScreen(Screen):
     def render(self, stdscr: curses.window) -> None:
         max_y, max_x = stdscr.getmaxyx()
         if not self.keys:
-            from .widgets import EmptyState
             EmptyState.render(stdscr, max_y // 2, max_x,
+                              icons.ICON_GROUP,
                               "No hay grupos en esta playlist.", "")
             return
 
         if not self.visible_keys and self.query:
-            msg = f"Sin resultados para '{self.query}'"
-            mx = max(0, (max_x - len(msg)) // 2)
-            try:
-                stdscr.addstr(max_y // 2, mx, msg[:max(0, max_x - 1)],
-                              colors.pair(colors.PAIR_EMPTY))
-            except curses.error:
-                pass
+            # Búsqueda sin resultados: categoría propia (§17), no "no hay
+            # grupos". Antes esto era un `addstr` a mano, distinto del de
+            # Canales; ahora los dos comparten el mismo bloque.
+            _render_no_results(stdscr, max_y // 2, max_x, self.query, "grupos")
             if self.searching:
                 from .widgets import SearchModal
                 SearchModal.render_modal(
@@ -1969,14 +2016,15 @@ class TrackOptionsScreen(Screen):
                 pass
 
         if not self.kinds:
-            from .widgets import EmptyState
-
             if pendientes:
                 # Sin esto se diría "no hay nada que elegir" mientras el
                 # manifiesto sigue en camino: es exactamente la confusión que
-                # hace que un canal lento parezca un canal sin pistas.
+                # hace que un canal lento parezca un canal sin pistas. Loading
+                # y vacío son categorías distintas (§17) y por eso son dos
+                # ramas del mismo bloque, no dos widgets.
                 EmptyState.render(
                     stdscr, max_y // 2, max_x,
+                    icons.ICON_TIME,
                     "Analizando las pistas del canal…",
                     "En cuanto el proveedor conteste verás aquí el audio, los "
                     "subtítulos y la calidad que publica",
@@ -1984,6 +2032,7 @@ class TrackOptionsScreen(Screen):
                 return
             EmptyState.render(
                 stdscr, max_y // 2, max_x,
+                icon,
                 "Este canal no ofrece pistas que elegir.",
                 "Se reproduce con el audio y la calidad por defecto del proveedor",
             )
@@ -2131,8 +2180,8 @@ class PlayerScreen(Screen):
     def render(self, stdscr: curses.window) -> None:
         max_y, max_x = stdscr.getmaxyx()
         if not self.players:
-            from .widgets import EmptyState
             EmptyState.render(stdscr, max_y // 2, max_x,
+                              icons.ICON_PLAY,
                               "No hay reproductor disponible.",
                               "Instala: mpv, mplayer o vlc")
             return
@@ -2867,7 +2916,10 @@ class EpgScreen(Screen):
 
     def _rows(self) -> list[str]:
         if not self.programs:
-            return ["(sin datos de EPG para este canal)"]
+            # Sin fila fantasma: "aquí no hay nada" lo dice el `EmptyState`,
+            # y una fila de texto dentro de la lista se contaría como programa
+            # (rompería el contador y el cursor). Lista vacía de verdad.
+            return []
         now = datetime.now().astimezone()
         rows: list[str] = []
         for prog in self.programs:
@@ -2886,7 +2938,7 @@ class EpgScreen(Screen):
         return rows
 
     def _selected_program(self):  # type: ignore[no-untyped-def]
-        """Programa bajo el cursor, o None si la lista es el aviso de vacío."""
+        """Programa bajo el cursor, o None si no hay parrilla."""
         idx = self._list.selected
         if 0 <= idx < len(self.programs):
             return self.programs[idx]
@@ -2937,10 +2989,41 @@ class EpgScreen(Screen):
             return True
         return False
 
+    def _epg_is_loading(self) -> bool:
+        """¿Sigue el hilo de EPG de la App descargando la guía?
+
+        Loading y vacío son categorías distintas (§17) y aquí **no** hay carga
+        propia que anunciar: `refresh_programs()` es síncrono y se llama en
+        `__init__`. Lo único que puede estar en curso es el hilo de fondo que
+        la App ya lanza al abrir la playlist, así que se **deriva de él** en
+        lugar de inventar un flag que nunca se vería en pantalla (estado
+        muerto).
+
+        Se lee con `getattr` defensivo: los tests usan dobles de `App` que no
+        tienen ese atributo, y un `AttributeError` en `render` sería una
+        pantalla rota por un detalle de implementación. Si algún día `App`
+        expone el estado como propiedad pública, esto cambia en una línea.
+        """
+        return getattr(self.app, "_epg_load_thread", None) is not None
+
     def render(self, stdscr: curses.window) -> None:
         max_y, max_x = stdscr.getmaxyx()
         if not self.programs:
-            render_empty_message(stdscr, max_y // 2, max_x, "Sin datos de EPG para este canal.")
+            if self._epg_is_loading():
+                # Loading real: se está obteniendo la guía. Decir "no hay
+                # programación" aquí mentiría (§11) y haría que recargar con
+                # `r` no arreglara nada.
+                EmptyState.render(stdscr, max_y // 2, max_x, icons.ICON_TIME,
+                                  "Cargando programación…",
+                                  "Espera un momento.")
+            else:
+                # Vacío real. La CTA apunta a `r`, que esta pantalla ya atiende
+                # (`handle_key`) y ya anuncia en `actions()`/`shortcuts()`: no
+                # es una acción nueva, es una tecla que ya existía.
+                EmptyState.render(stdscr, max_y // 2, max_x, icons.ICON_EPG,
+                                  "No hay programación disponible",
+                                  "La guía no contiene programas para este canal.",
+                                  "[R] Actualizar guía")
         else:
             rows = max(1, self.app.body_height())
             self._list.clamp(rows)

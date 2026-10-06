@@ -269,7 +269,13 @@ class TestEpgScreenCurrent(unittest.TestCase):
         app.epg = None
         app.ensure_epg = mock.Mock(return_value=[])
         screen = EpgScreen(app, ch())
-        screen.render(stdscr)
+        # `colors.pair` necesita `initscr()`; sin terminal hay que neutralizarlo
+        # (como en el resto de tests de este archivo). El `EmptyState` calcula
+        # sus atributos **antes** de dibujar, así que aquí no lo traga ningún
+        # `except curses.error` — y no debe: tragarse un fallo de color sería
+        # dibujar en el par equivocado sin que nadie se entere.
+        with mock.patch.object(colors, "pair", return_value=0):
+            screen.render(stdscr)
 
 
 class TestFormatChannelName(unittest.TestCase):

@@ -22,6 +22,12 @@ ICON_STAR_OFF = "☆"
 # --- Grupos ----------------------------------------------------------------
 ICON_GROUP = "▣"
 
+# --- Playlists -------------------------------------------------------------
+#: Catálogo de listas. Reutiliza el bloque del grupo (`▣` es *lista de cosas*,
+#: `▤` es *lista de listas*); ambos son box/símbolo de anchura 1, así que
+#: `cell_width()` coincide con `len()` y centrar no se descentra.
+ICON_LIST = "▤"
+
 # --- EPG / timeline --------------------------------------------------------
 ICON_EPG = "◈"
 ICON_TIME = "◷"
