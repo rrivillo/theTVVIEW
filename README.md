@@ -106,6 +106,9 @@ ahí mismo; es el mejor punto de partida si dudas.
 - **Todo error y todo aviso sale en un modal**, con una explicación corta y
   accionable. La barra de estado es el refuerzo, nunca el único sitio donde
   se entera el usuario.
+- **El modal de error sólo anuncia las teclas que funcionan**: si `R`
+  (reintentar) o `D` (diagnóstico) no tienen nada que reparar, no aparecen en
+  el pie. Un atajo decorativo es peor que ningún atajo.
 - **Ningún fallo se muestra como traceback**: los problemas del entorno
   (sin TTY, sin `curses`, terminal diminuta) se traducen a un mensaje con la
   solución.
@@ -912,6 +915,7 @@ thetvview/
     ├── tracks.py       # sesión de pistas del canal abierto (estado)
     ├── widgets.py      # listas, modales, formularios, toast, loading
     ├── actions.py      # Action, prioridades, vocabulario y ajuste del pie
+    ├── errormsg.py     # clasificación de errores → mensaje para el usuario
     ├── textwidth.py    # ancho en celdas (cell_width/clip_cells)
     ├── layout.py       # rectángulos (header/main/footer)
     ├── theme.py        # paletas dual light/dark (256/8 colores, NO_COLOR)

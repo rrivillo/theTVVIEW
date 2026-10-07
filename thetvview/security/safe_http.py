@@ -66,6 +66,7 @@ from .errors import (
     ConnectionLimitError,
     InvalidSourceError,
     NetworkError,
+    ProviderError,
     RateLimitError,
     ResponseTooLargeError,
     TLSValidationError,
@@ -176,32 +177,63 @@ def _close(fp: Any) -> None:
         pass
 
 
+def _con_reason(exc: NetworkError, reason: str | None) -> NetworkError:
+    """Fija ``.reason`` (F1-bis) y devuelve el error, para encadenar la construcción.
+
+    El texto **no** cambia: el motivo de red va en un atributo aparte para que la
+    UI clasifique sin leer prosa (§8.5–§8.7), pero todos los mensajes de red
+    siguen byte a byte los de siempre y los tests de seguridad no se enteran.
+    """
+    exc.reason = reason
+    return exc
+
+
 def _map_network_error(exc: BaseException, timeout: float) -> NetworkError:
-    """Convierte un error de urllib/ssl/socket en un error de dominio amable."""
+    """Convierte un error de urllib/ssl/socket en un error de dominio amable.
+
+    Clasifica por **tipo** del motivo y fija ``.reason`` con el vocabulario
+    cerrado de :class:`~thetvview.security.errors.NetworkError`. Es lo que
+    permite que la presentación del error distinga «no resuelve el nombre» de
+    «no hay ruta» sin hacer *string matching* sobre la frase.
+    """
     reason: Any = getattr(exc, "reason", None)
     if reason is None:
         reason = exc
 
     if isinstance(reason, ssl.SSLCertVerificationError):
-        return TLSValidationError(
-            "La conexión no es segura: el certificado del servidor no es de "
-            "confianza o no corresponde al dominio. Revisa la URL o el sistema."
+        return _con_reason(
+            TLSValidationError(
+                "La conexión no es segura: el certificado del servidor no es de "
+                "confianza o no corresponde al dominio. Revisa la URL o el sistema."
+            ),
+            "tls",
         )
     if isinstance(reason, ssl.SSLError):
-        return TLSValidationError(
-            "La conexión segura (TLS) falló con el servidor: "
-            + redact_text(_short(str(reason)))
+        return _con_reason(
+            TLSValidationError(
+                "La conexión segura (TLS) falló con el servidor: "
+                + redact_text(_short(str(reason)))
+            ),
+            "tls",
         )
     if isinstance(reason, socket.gaierror):
-        return NetworkError(
-            "No se pudo encontrar el servidor: el nombre no resuelve en DNS."
+        return _con_reason(
+            NetworkError(
+                "No se pudo encontrar el servidor: el nombre no resuelve en DNS."
+            ),
+            "dns",
         )
     if isinstance(reason, (socket.timeout, TimeoutError)):
-        return NetworkError(f"Tiempo de espera agotado ({timeout:g}s).")
+        return _con_reason(
+            NetworkError(f"Tiempo de espera agotado ({timeout:g}s)."), "timeout"
+        )
     if isinstance(reason, ConnectionRefusedError):
-        return NetworkError("El servidor rechazó la conexión.")
+        return _con_reason(NetworkError("El servidor rechazó la conexión."), "refused")
     if isinstance(reason, OSError) and getattr(reason, "errno", None) in (101, 51, 65):
-        return NetworkError("No hay ruta hasta el servidor (red no disponible).")
+        return _con_reason(
+            NetworkError("No hay ruta hasta el servidor (red no disponible)."),
+            "unreachable",
+        )
 
     text = str(reason) if str(reason) else str(exc)
     text = text.replace("<urlopen error ", "").strip(" []")
@@ -209,13 +241,22 @@ def _map_network_error(exc: BaseException, timeout: float) -> NetworkError:
         text = "error de red"
     if len(text) > 90:
         text = text[:87] + "..."
-    return NetworkError("No se pudo conectar con el servidor: " + redact_text(text))
+    return _con_reason(
+        NetworkError("No se pudo conectar con el servidor: " + redact_text(text)),
+        "connection",
+    )
 
 
 def _check_deadline(deadline: float, budget: float) -> None:
     if time.monotonic() > deadline:
-        raise NetworkError(
-            f"La descarga ha superado el tiempo máximo permitido ({budget:g}s)."
+        # Es un timeout del presupuesto global, no del socket: el mismo `reason`
+        # porque para el usuario es la misma cosa («tardó demasiado»), y así el
+        # presentador no necesita distinguir dos relojes.
+        raise _con_reason(
+            NetworkError(
+                f"La descarga ha superado el tiempo máximo permitido ({budget:g}s)."
+            ),
+            "timeout",
         )
 
 
@@ -281,10 +322,32 @@ def _raise_for_status(resp: "SafeResponse") -> None:
     if resp.status == 429:
         retry = (resp.headers.get("retry-after") or "").strip()
         hint = f" Espera {retry} s." if retry.isdigit() else ""
-        raise RateLimitError(
-            "Demasiadas solicitudes. El servidor pide esperar un momento." + hint
+        raise _with_status(
+            RateLimitError(
+                "Demasiadas solicitudes. El servidor pide esperar un momento." + hint
+            ),
+            resp.status,
         )
-    raise NetworkError(_status_message(resp.status, resp.reason))
+    raise _with_status(NetworkError(_status_message(resp.status, resp.reason)), resp.status)
+
+
+def _with_status(exc: ProviderError, status: int) -> ProviderError:
+    """Fija ``.status`` (F1-bis) y devuelve el error.
+
+    La prosa de :func:`_status_message` no cambia —«(HTTP 403)» sigue dentro—:
+    lo que se añade es el **dato**, para que quien presente el error pueda
+    poner «Código HTTP: 403» como detalle secundario sin tener que parsear la
+    frase (§8, §9). Los tests que asertan el texto siguen viendo lo mismo.
+
+    El parámetro es un :class:`ProviderError` y no un :class:`NetworkError` a
+    propósito: ``RateLimitError`` es un 429 del servidor y **no** hereda de
+    ``NetworkError``, así que escribir el tipo concreto obligaría a un ``type:
+    ignore`` que escondería justo el error que se quiere atrapar. Como
+    ``status`` está declarado en :class:`ProviderError`, ambos lo tienen y el
+    presentador busca el atributo, no la clase base.
+    """
+    exc.status = int(status)
+    return exc
 
 
 def _loads_json(raw: bytes) -> "dict[str, Any] | list[Any]":
@@ -565,7 +628,7 @@ class SafeHttpClient:
         if not (200 <= opened.status < 300):
             status, reason = opened.status, opened.reason
             _close(opened.fp)
-            raise NetworkError(_status_message(status, reason))
+            raise _with_status(NetworkError(_status_message(status, reason)), status)
         try:
             yield from _iter_body(opened.fp, opened.headers, cap, started, timeout, chunk_size)
         finally:
@@ -682,7 +745,10 @@ class SafeHttpClient:
         except urllib.error.URLError as exc:
             raise _map_network_error(exc, sock_timeout) from exc
         except (TimeoutError, socket.timeout) as exc:
-            raise NetworkError(f"Tiempo de espera agotado ({sock_timeout:g}s).") from exc
+            raise _con_reason(
+                NetworkError(f"Tiempo de espera agotado ({sock_timeout:g}s)."),
+                "timeout",
+            ) from exc
         except ssl.SSLError as exc:
             raise _map_network_error(exc, sock_timeout) from exc
         except OSError as exc:
@@ -771,7 +837,9 @@ def _consume(
             "El servidor envió una respuesta comprimida dañada."
         ) from exc
     except (TimeoutError, socket.timeout) as exc:
-        raise NetworkError(f"Tiempo de espera agotado ({budget:g}s).") from exc
+        raise _con_reason(
+            NetworkError(f"Tiempo de espera agotado ({budget:g}s)."), "timeout"
+        ) from exc
     except OSError as exc:
         raise _map_network_error(exc, budget) from exc
 

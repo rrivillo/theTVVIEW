@@ -24,7 +24,21 @@ class IPTVError(Exception):
 
 
 class ProviderError(IPTVError):
-    """Error base de cualquier operación con un proveedor IPTV."""
+    """Error base de cualquier operación con un proveedor IPTV.
+
+    **Atributo ``status`` (F1-bis).** Vive aquí y no en :class:`NetworkError`
+    porque no es sólo la red la que sabe un código HTTP: ``RateLimitError`` es un
+    429 del servidor y no hereda de ``OSError``, y sin el atributo declarado la
+    presentación del error no podría leerlo sin ``getattr`` a ciegas. Se declara
+    como atributo de clase con valor por defecto (no campo del constructor) para
+    que siga siendo retrocompatible: ``ProviderError(msg)`` se sigue
+    construyendo igual, y quien no lo fije lee ``None``.
+    """
+
+    #: Código HTTP con el que respondió el proveedor, o ``None`` si el fallo no
+    #: fue una respuesta (DNS, timeout, validación local…). El valor real se fija
+    #: **en la instancia** (``exc.status = 429``), nunca en la clase.
+    status: int | None = None
 
 
 class InvalidSourceError(ProviderError):
@@ -40,7 +54,28 @@ class NetworkError(ProviderError, OSError):
 
     Hereda de ``OSError`` a propósito: la mayor parte del código de red
     preexistente ya propagaba ``OSError`` con mensaje amigable.
+
+    **Estado estructurado (F1-bis).** El mensaje es prosa y la prosa cambia; la
+    UI necesita el dato, no la frase. ``status`` —heredado de
+    :class:`ProviderError`— es el código HTTP cuando el fallo fue una respuesta,
+    y ``reason`` es el motivo de red cuando fue el transporte, para que la
+    presentación del error pueda **clasificar por atributo** en vez de por
+    *string matching*.
+
+    ``reason`` es un **atributo de clase** con valor por defecto, no un campo
+    del constructor: añadirlo así es retrocompatible (se lee igual de un
+    ``NetworkError(msg)`` que de uno construido en otro sitio) y ninguna
+    subclase —``TLSValidationError``, ``SSRFBlockedError``,
+    ``ResponseTooLargeError``— lo define, así que none colisiona. El valor se
+    fija **en la instancia** al crearla (``exc.reason = "dns"``), nunca en la
+    clase, que es sólo el valor por defecto.
     """
+
+    #: Motivo del fallo de transporte: ``"tls"``, ``"dns"``, ``"timeout"``,
+    #: ``"refused"``, ``"unreachable"``, ``"connection"`` o ``None``.
+    #: Vocabulario cerrado a propósito: si mañana hace falta uno más se añade
+    #: aquí, no se adivina leyendo el mensaje.
+    reason: str | None = None
 
 
 class TLSValidationError(NetworkError):

@@ -261,6 +261,38 @@ es `fit_actions` quien decide qué sobrevive.
 `SearchModal` sigue admitiendo un `hint` de texto (hay callers que lo pasan a
 propósito); si no se pasa, la pista se deriva de su `actions()`.
 
+### El modal de error: `wrap` y `keys`
+
+El modal de error es el único que usa las dos extensiones opt-in de `Modal`:
+
+```python
+Modal(titulo, cuerpo, ["Aceptar"], acciones, wrap=True,
+      keys={ord("R"): "retry", ord("D"): "diagnose"})
+```
+
+- **`wrap=True`** envuelve el mensaje al ancho disponible con `wrap_block` en vez
+  de recortarlo con `clip_cells`, y hace que el alto se ajuste a la ventana. Sin
+  ancho fijo: el ancho sale del bloque ya envuelto. Sólo el modal de error lo
+  activa; los otros veinte `Modal` se comportan exactamente igual que antes.
+- **`keys`** ata un atajo a un resultado de `handle_key`, y se consulta **antes**
+  que la navegación de botones. Es lo que hace que «shortcuts mostrados =
+  implementados» sea un invariante comprobable por test y no una promesa
+  (§5): sin `keys`, el pie podría anunciar `R Reintentar` y la `R` no haría
+  nada.
+
+Y hay una regla que este pie respeta y que conviene conocer **antes** de
+construir cualquier otro:
+
+> **Una acción sólo se declara si tiene un callback detrás.**
+
+`App.show_error(err, retry=…, diagnose=…)` construye el pie a partir de lo que
+recibe: sin `retry` no existe `R`, sin `diagnose` no existe `D`. No es una
+limitación del modal, es la razón de que el pie no pueda mentir.
+
+`StatusBar.show(…, modal=False)` es el otro lado de la misma regla: el modal de
+error abre **su** modal, así que la barra no escala también a un
+`Modal("Error", …)` genérico que lo taparía.
+
 ---
 
 ## 8. Referencia rápida
@@ -268,14 +300,18 @@ propósito); si no se pasa, la pista se deriva de su `actions()`.
 ```text
 thetvview/ui/actions.py     Action, P, V, validate, fit_actions
 thetvview/ui/textwidth.py   cell_width, char_width, clip_cells
+thetvview/ui/errormsg.py    UiError, describe_playlist_error,
+                            describe_playback_error → qué se le dice al usuario
 thetvview/ui/screens.py     Screen.actions() → catálogo de la pantalla
 thetvview/ui/app.py         App._despachar_tecla() → quién atiende cada tecla
-thetvview/ui/widgets.py     FooterBar.set_actions, Modal(actions=...),
-                            modal_actions() → pie por defecto de un modal
+                            App.show_error() → el pie del modal de error
+thetvview/ui/widgets.py     FooterBar.set_actions, Modal(actions=..., wrap=,
+                            keys=...), modal_actions() → pie por defecto
 
 tests/test_actions.py               modelo, ajuste y pies de modal
 tests/test_actions_por_pantalla.py  la invariante, por pantalla
 tests/test_despacho_teclas.py       el reparto global/local, de verdad
+tests/test_error_messages.py        atajos truthful, seguridad, terminal corta
 docs/actions.md                     este documento
 ```
 

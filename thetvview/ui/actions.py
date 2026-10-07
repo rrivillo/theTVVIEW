@@ -107,6 +107,11 @@ class V:
     DETENER = "Detener"  # Reproduciendo: q
     DIAGNOSTICO = "Diagnóstico"  # Reproduciendo: d
     INFO = "Info"  # Reproduciendo: i
+    #: Modales de error: R reintenta la operación que falló (§7 del SDD de
+    #: errores). Existe **una sola vez** aquí porque `validate()` rechaza
+    #: cualquier etiqueta fuera de este vocabulario, y sin ella el pie del
+    #: modal de error no podría anunciar su propia acción.
+    REINTENTAR = "Reintentar"
 
 
 #: Conjunto cerrado de etiquetas permitidas (§21). `validate()` lo comprueba.

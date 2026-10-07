@@ -30,12 +30,17 @@ from thetvview.tracks.labels import audio_label, subtitle_label, video_label
 from thetvview.tracks.manager import QUICK_AUTO, SelectTrackError
 from thetvview.tracks.models import MediaCapabilities, PlaybackSelection
 from thetvview.player.capabilities import KIND_SUBTITLES
+from thetvview.player.router import NoCompatibleBackend
 
 from .tracks import SECTION_LABELS
 
 from . import colors
 from . import icons
 from .actions import Action, P, V
+from .errormsg import (
+    describe_playback_error,
+    empty_playlist_error,
+)
 from .textwidth import cell_width, clip_cells
 from .widgets import EmptyState, ScrollableList, render_separator
 
@@ -147,6 +152,46 @@ def _error(app, message: str) -> None:  # noqa: ANN001
         fn(message)
     else:
         app.status.show(message, error=True)
+
+
+def _mostrar_error(app, err, *, retry=None, diagnose=None) -> None:  # noqa: ANN001
+    """Presenta un :class:`UiError` con las acciones que existen (F4/F5).
+
+    Un único camino para los errores de playlist y de reproducción, y con
+    **degradación** para las apps de prueba: si el doble no tiene
+    ``show_error``, el mensaje va a la barra como antes. Así el call site no
+    necesita saber si quien lo llama es la `App` real o un doble, que es lo
+    que hacía imposible probar el flujo sin levantar curses.
+    """
+    fn = getattr(app, "show_error", None)
+    if callable(fn):
+        fn(err, retry=retry, diagnose=diagnose)
+        return
+    app.status.show(err.cuerpo(), error=True)
+
+
+def _error_xtream(name: str, que: str, exc: BaseException):
+    """`:class:`UiError` de un fallo Xtream, con el cuerpo de `friendly_message`.
+
+    El **título** es contextual («No se pudo cargar la lista») y el **mensaje**
+    es el que ya produce :func:`thetvview.xtream_errors.friendly_message`: esa
+    función sabe distinguir cuenta caducada, credenciales, límite de peticiones y
+    servidor caído, y garantiza que ninguno de esos textos lleve un código HTTP
+    ni una URL. Reutilizarla en vez de traducir con `describe_playlist_error` es
+    lo que evita tener dos versiones que se contradigan: aquí el error no viene de
+    `safe_http` sino del proveedor Xtream, que tiene su propia taxonomía.
+    """
+    from thetvview.xtream_errors import friendly_message
+
+    from .errormsg import ErrorKind, UiError
+
+    quien = f"'{str(name).strip()}' " if str(name or "").strip() else ""
+    return UiError(
+        title=f"La lista {quien}{que}.",
+        message=friendly_message(exc),
+        detail=None,
+        kind=ErrorKind.PLAYLIST,
+    )
 
 
 def format_channel_name(ch: Channel, *, favorite: bool = False) -> str:
@@ -3083,6 +3128,7 @@ def open_playlist(app, entry: PlaylistEntry) -> None:
         return
 
     from .app import load_playlist_source
+    from .errormsg import describe_playlist_error, empty_playlist_error
 
     source = entry.source.strip()
     get_cached = getattr(app, "cached_playlist", None)
@@ -3097,7 +3143,15 @@ def open_playlist(app, entry: PlaylistEntry) -> None:
                 source, allow_private=entry.allow_private_network
             )
         except (OSError, ValueError) as exc:
-            app.status.show(str(exc), error=True)
+            _mostrar_error(
+                app,
+                describe_playlist_error(exc),
+                # El retry **es** la operación que falló, no un segundo intento
+                # con otro camino: se llama a sí misma con la misma entrada
+                # (§7). `load_playlist_source` no cachea un fallo, así que
+                # repetirlo vuelve a pedir la lista.
+                retry=lambda: open_playlist(app, entry),
+            )
             return
         remember = getattr(app, "remember_playlist", None)
         if callable(remember):
@@ -3109,7 +3163,9 @@ def open_playlist(app, entry: PlaylistEntry) -> None:
                 pass
     playlist.kind = entry.kind
     if not playlist.channels:
-        app.status.show(f"'{entry.name}' no contiene canales.", error=True)
+        # **Sin** `retry`: recargar una lista vacía no la va a llenar, y el
+        # §13 no permite anunciar una tecla que no repara nada.
+        _mostrar_error(app, empty_playlist_error(entry.name))
         return
     _explicar_camaras(app, playlist)
     auto_epg = getattr(app, "auto_load_playlist_epg", None)
@@ -3223,13 +3279,21 @@ def _open_xtream_playlist(app, entry: PlaylistEntry) -> None:
         allow_private_network=entry.allow_private_network,
     )
     app.show_loading("Conectando…", sub=server_url)
+    # El cuerpo del mensaje sale de `friendly_message`, que ya existe y ya
+    # garantiza que ningún texto para el usuario lleve un código HTTP
+    # (`xtream_errors.py`). Lo que cambia es el **título**: en vez del
+    # genérico «Error» —que no dice qué pasó— pasa a ser el de la lista, que sí
+    # lo dice. El `detail` se deja deliberadamente vacío: `friendly_message` no
+    # da status y la lista Xtream se reintenta cambiando la configuración, no
+    # pulsando «reintentar» sobre lo mismo.
+    reintentar = lambda: _open_xtream_playlist(app, entry)
     try:
         authenticate(cfg)
     except Exception as exc:
-        from thetvview.xtream_errors import friendly_message
-        app.status.show(
-            f"No se pudo abrir '{entry.name}': {friendly_message(exc)}",
-            error=True,
+        _mostrar_error(
+            app,
+            _error_xtream(entry.name, "no se pudo abrir", exc),
+            retry=reintentar,
         )
         return
 
@@ -3238,10 +3302,10 @@ def _open_xtream_playlist(app, entry: PlaylistEntry) -> None:
         categories = get_live_categories(cfg)
         streams = get_live_streams(cfg)
     except Exception as exc:
-        from thetvview.xtream_errors import friendly_message
-        app.status.show(
-            f"No se pudo cargar '{entry.name}': {friendly_message(exc)}",
-            error=True,
+        _mostrar_error(
+            app,
+            _error_xtream(entry.name, "no se pudo cargar", exc),
+            retry=reintentar,
         )
         return
 
@@ -3259,7 +3323,9 @@ def _open_xtream_playlist(app, entry: PlaylistEntry) -> None:
         channels.append(ch)
 
     if not channels:
-        app.status.show(f"'{entry.name}' no contiene canales.", error=True)
+        # Sin `retry`: la autenticación fue bien y la lista llegó vacía. Volver
+        # a pedirla no la va a llenar, así que `R` no se anuncia (§13).
+        _mostrar_error(app, empty_playlist_error(entry.name))
         return
 
     playlist = Playlist(
@@ -3390,7 +3456,15 @@ def play_channel(  # noqa: ANN001
     try:
         resolved = resolve_channel_url(channel.url, _almacen_de(app))
     except (MissingCredentialsError, MissingCamCredentialsError) as exc:
-        _error(app, str(exc))
+        # **Sin** `retry`: no hay contraseña, y repetir la resolución daría
+        # exactamente el mismo error. Lo que sí tiene sentido es el diagnóstico,
+        # porque la credencial puede estar en el almacén del sistema y que el
+        # usuario lo ignore (F5).
+        _mostrar_error(
+            app,
+            _error_credenciales(channel.name, str(exc)),
+            diagnose=lambda: _diagnosticar(app, channel),
+        )
         return
     es_camara = resolved != channel.url
     if es_camara:
@@ -3472,9 +3546,33 @@ def play_channel(  # noqa: ANN001
         if proxy is not None:
             proxy.stop()
         # Un `NoCompatibleBackend` no es «falló la reproducción» sino «este
-        # canal no se puede abrir aquí»; el mensaje ya lo dice y el §14 pide
-        # no confundirlos, así que no se le añade nada encima.
-        _error(app, str(exc))
+        # canal no se puede abrir aquí» (§14 del SDD-M). Se preserva tal cual,
+        # con su modal de un botón y sin capa de presentación encima: el
+        # diagnóstico no añadiría nada (el problema es del entorno, no del
+        # canal) y el retry volvería a elegir los mismos reproductores.
+        if isinstance(exc, NoCompatibleBackend):
+            _error(app, str(exc))
+            return
+        # El retry es un **cierre sobre los mismos argumentos** con los que se
+        # llegó aquí (F5, H10): no se reconstruye el router ni se toca
+        # `player/router.py` ni el supervisor (§17). `extra` ya tiene el
+        # `proxy_url` resuelto, y `proxy` se ha parado justo antes, así que un
+        # reintento rebuilding construye uno nuevo.
+        _mostrar_error(
+            app,
+            describe_playback_error(exc),
+            retry=lambda: play_channel(
+                app,
+                channel,
+                player_name,
+                catchup_playback=catchup_playback,
+                catchup_program=catchup_program,
+                selection=selection,
+                capabilities=capabilities,
+                track_session=track_session,
+            ),
+            diagnose=lambda: _diagnosticar(app, channel),
+        )
         return
     if track_session is not None:
         track_session.ipc_path = ipc_path
@@ -3506,6 +3604,41 @@ def play_channel(  # noqa: ANN001
         )
         return
     app.status.show(f"Reproduzco '{channel.name}' con {effective_name.upper()} (pid {proc.pid}).")
+
+
+def _diagnosticar(app, channel) -> None:  # noqa: ANN001
+    """Abre el diagnóstico **existente** con comprobación de conexión (F5, H9).
+
+    Es un reenvío a ``App.show_diagnose``, no un segundo mecanismo: el informe,
+    la redacción y la pantalla son las que ya había (SDD §11). Lo único que se
+    añade es ``con_conexion=True``, porque el §11 lo pide —«puedes revisar el
+    diagnóstico» sólo significa algo si el diagnóstico comprueba de verdad— y
+    ese modo ya estaba cableado en ``handle_action`` desde antes.
+    """
+    fn = getattr(app, "show_diagnose", None)
+    if callable(fn):
+        fn(channel, con_conexion=True)
+
+
+def _error_credenciales(nombre: str, detalle: str):
+    """`:class:`UiError` de una credencial ausente, sin `retry` (E6).
+
+    El cuerpo conserva el texto del dominio (``MissingCredentialsError`` /
+    ``MissingCamCredentialsError`` ya están escritos para el usuario y no llevan
+    ni la URL ni el usuario), pero **redactado**: no se copia sin pasar por
+    `redact_text`, porque el contrato de §2.4 no admite excepciones por «el
+    mensaje ya venía bien».
+    """
+    from thetvview.security.redaction import redact_text
+
+    from .errormsg import ErrorKind, UiError
+
+    return UiError(
+        title="No se pudo reproducir este canal",
+        message=redact_text(str(detalle)),
+        detail=None,
+        kind=ErrorKind.PLAYBACK,
+    )
 
 
 def _lanzar_con_router(channel, player_name, preferred, fallos, extra):  # noqa: ANN001

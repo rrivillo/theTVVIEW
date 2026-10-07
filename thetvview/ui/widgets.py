@@ -182,7 +182,17 @@ class StatusBar:
     def set(self, shortcuts: str) -> None:
         self.shortcuts = shortcuts
 
-    def show(self, message: str, error: bool = False) -> None:
+    def show(self, message: str, error: bool = False, *, modal: bool = True) -> None:
+        """Muestra `message`; si es error, escala a modal (no negociable #1).
+
+        ``modal=False`` es para el **único** sitio que abre su propio modal de
+        error: :meth:`thetvview.ui.app.App.show_error`. Escalar también ahí
+        significaría abrir dos modales —el bueno, con `R`/`D`, y detrás un
+        `Modal("Error", cuerpo)` genérico sin acciones—, y el segundo taparía al
+        primero. El parámetro existe para que esa decisión sea explícita y no
+        un efecto lateral: por defecto la barra sigue escalando sola, que es lo
+        que hacen los ~15 ``status.show(…, error=True)`` de las pantallas.
+        """
         import time
 
         from ..security.redaction import redact_text
@@ -193,7 +203,7 @@ class StatusBar:
         self.message = message
         self.is_error = error
         self._flash_until = time.monotonic() + (4.0 if message else 0.0)
-        if error and message and self.on_error is not None:
+        if error and modal and message and self.on_error is not None:
             self.on_error("Error", message)
 
     def _current_message(self) -> str:
@@ -796,6 +806,12 @@ class Modal:
     Sin campos de texto: para escribir algo está `FormModal`, que es lo que se
     usa de verdad. Aquí una caja de input sería una segunda forma de lo mismo,
     y una que además nadie ha activado nunca.
+
+    **Dos extensiones opt-in para el modal de error** (SDD de errores §6, §12,
+    §13): ``wrap`` para que un mensaje largo se parta en vez de recortarse, y
+    ``keys`` para que un atajo anunciado en el pie tenga una tecla real detrás.
+    Ambas con default de «no hacer nada»: los veinte modales existentes se
+    comportan exactamente igual que antes de que existieran.
     """
 
     def __init__(
@@ -804,13 +820,79 @@ class Modal:
         message: str,
         buttons: list[str] | None = None,
         actions: list[Action] | None = None,
+        *,
+        wrap: bool = False,
+        keys: dict[int, str] | None = None,
     ) -> None:
+        """
+        Args:
+            wrap: envuelve el mensaje al ancho disponible en vez de recortarlo
+                con `clip_cells`. **Opt-in** (por defecto ``False``): hay veinte
+                modales que dependen del comportamiento actual y un recorte
+                distinto en alguno de ellos sería un fallo de maquetación, no una
+                mejora.
+            keys: atajos adicionales ``{ord("R"): "retry"}``. Se consultan
+                **antes** que la navegación de botones, y es lo que hace que un
+                atajo anunciado en el pie tenga una tecla real detrás (§13):
+                sin este diccionario el pie podría mentir.
+        """
         self.title = title
         self.message = message
         self.buttons = buttons or ["Aceptar"]
         self.selected_button: int = 0
         #: Pie de acciones (§35). Vacío = sin pie (comportamiento anterior).
         self.actions: list[Action] = list(actions or [])
+        #: Opt-in: ver el docstring del parámetro ``wrap``.
+        self.wrap = bool(wrap)
+        #: Opt-in: ver el docstring del parámetro ``keys``.
+        self.keys: dict[int, str] = dict(keys or {})
+
+    def _lines(self, inner_w: int | None = None) -> list[str]:
+        """El mensaje tal y como se dibuja, ya envuelto si toca.
+
+        Con ``wrap=False`` es un ``split("\\n")`` y por tanto **exactamente** lo
+        que se dibujaba antes: es el camino que usan los veinte modales
+        existentes. Con ``wrap=True`` delega en :func:`wrap_block`, que ya
+        existe y ya mide con `cell_width` —no se escribe un segundo envolvedor.
+        """
+        if not self.wrap:
+            return self.message.split("\n")
+        return wrap_block(self.message, max(1, (inner_w or self._natural_w()) - 4))
+
+    def _natural_w(self) -> int:
+        """Ancho que tendría el modal sin envolver: el de antes."""
+        lines = self.message.split("\n")
+        btn_line = "  ".join(
+            f"{'>' if i == self.selected_button else ' '} {b} "
+            for i, b in enumerate(self.buttons)
+        )
+        return max(
+            cell_width(self.title) + 4,
+            max((cell_width(line) for line in lines), default=0) + 4,
+            cell_width(btn_line) + 4,
+            30,
+        )
+
+    def _layout(self, max_y: int, max_x: int) -> tuple[list[str], int]:
+        """``(líneas del mensaje, ancho interior)`` para una ventana dada.
+
+        Vive aquí y no en :meth:`_calc_rect` porque **los dos** necesitan la
+        misma respuesta: el que calcula el rectángulo (para saber cuántas filas
+        reservar) y el que dibuja (para saber qué pintar en ellas). Calcularlo
+        dos veces era la forma natural de que dejaran de cuadrar.
+
+        Sin ancho fijo (§6): el ancho sale del contenido. Con ``wrap=True`` sale
+        del bloque ya envuelto contra el ancho **disponible** —si se envolviera
+        contra el ancho natural, el mensaje se partiría al tamaño que ya era
+        demasiado grande y el modal acabaría más ancho que la terminal.
+        """
+        inner_w = self._natural_w()
+        if not self.wrap:
+            return self.message.split("\n"), inner_w
+        disponible = max(12, int(max_x) - 8)
+        lines = self._lines(min(inner_w, disponible))
+        ancho = max((cell_width(line) for line in lines), default=0) + 4
+        return lines, min(max(inner_w, ancho), disponible)
 
     def _actions_line(self, avail: int) -> str:
         """Texto del pie de acciones, ajustado al ancho real (`cell_width`).
@@ -826,15 +908,17 @@ class Modal:
         return SEPARATOR.join(a.chip() for a in ajustadas)
 
     def _calc_rect(self, max_y: int, max_x: int) -> tuple[int, int, int, int]:
-        """Calcula (y, x, h, w) del modal centrado."""
-        lines = self.message.split("\n")
-        btn_line = "  ".join(
-            f"{'>' if i == self.selected_button else ' '} {b} "
-            for i, b in enumerate(self.buttons)
-        )
-        inner_w = max(cell_width(self.title) + 4,
-                      max((cell_width(l) for l in lines), default=0) + 4,
-                      cell_width(btn_line) + 4, 30)
+        """Calcula (y, x, h, w) del modal centrado.
+
+        Sin ancho fijo (§6) y **sin alto fijo tampoco**: si el bloque envuelto
+        no cabe en la ventana, el modal se queda en lo que le cabe y lo que
+        sobra se deja de pintar, en vez de dibujar un borde por debajo de la
+        pantalla. Sólo el ``wrap=True`` recorta —la terminal estrecha es el
+        caso que el §12 exige)— y siempre por el final, que es donde el
+        ``render`` tiene el botón y el pie: el título y las primeras líneas
+        sobreviven, y las acciones nunca son lo que se pierde (§12).
+        """
+        lines, inner_w = self._layout(max_y, max_x)
         # El pie de acciones es contenido: el modal crece para que quepa entero
         # en vez de recortar «Enter Confirmar · Esc Cancelar» a media etiqueta
         # (§46). Si la terminal es más estrecha, ya lo ajustará `_actions_line`.
@@ -843,7 +927,19 @@ class Modal:
             inner_w = max(inner_w, pie_ancho + 4)
         inner_w = min(inner_w, max_x - 4)
         # +1 fila si hay pie de acciones: es una fila más que dibujar.
-        inner_h = len(lines) + 3 + (1 if self.actions else 0)
+        filas_extra = 1 if self.actions else 0
+        lineas = len(lines)
+        if self.wrap:
+            # Alto máximo **dentro de la ventana**: `y >= 1` siempre, así que
+            # la última fila dibujable es `max_y - 1` y el alto no puede pasar
+            # de `max_y - 1`; descontando los dos bordes, la fila del título (que
+            # se pinta sobre el borde superior) y las de botones y pie queda
+            # lo que ve. Sin esto, en una ventana baja el modal dibujaba su
+            # borde por debajo de la última fila y el `addstr` de la esquina
+            # lanzaba `curses.error` (§39).
+            caben = max(1, int(max_y) - 6 - filas_extra)
+            lineas = min(lineas, caben)
+        inner_h = lineas + 3 + filas_extra
         total_h = inner_h + 2  # borders
         total_w = inner_w + 2
         y = max(1, (max_y - total_h) // 2)
@@ -851,7 +947,17 @@ class Modal:
         return y, x, total_h, total_w
 
     def handle_key(self, key: int) -> str | None:
-        """Devuelve el nombre del botón presionado o None."""
+        """Devuelve el nombre del botón presionado o None.
+
+        Los atajos de ``keys`` se consultan **primero**: una tecla que anuncia
+        una acción del pie tiene que ejecutar esa acción, y no mueve el cursor
+        entre botones ni se pierde en el ``None`` de «nada que hacer aquí»
+        (§13). Por eso el orden no es un detalle: es la garantía.
+        """
+        if self.keys:
+            accion = self.keys.get(key)
+            if accion is not None:
+                return accion
         # Navegación de botones
         if key in (curses.KEY_LEFT, ord("\t")):
             self.selected_button = (self.selected_button - 1) % len(self.buttons)
@@ -909,7 +1015,7 @@ class Modal:
         limite = fila_botones
 
         # Mensaje
-        lines = self.message.split("\n")
+        lines, _inner = self._layout(max_y, max_x)
         for i, line in enumerate(lines):
             row = y + 1 + i
             if row >= limite:

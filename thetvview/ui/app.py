@@ -25,6 +25,7 @@ from thetvview.prefs import PrefsManager
 from thetvview.recents import RecentsManager
 
 from . import colors, theme
+from .errormsg import describe_playlist_error
 from .widgets import FooterBar, HeaderBar, StatusBar
 from .screens import (
     ChannelsScreen,
@@ -1503,6 +1504,87 @@ class App:
         # encabezado, así que no se duplica en la barra de estado.
         self._show_notice(f"Diagnóstico · {channel.name}", texto)
 
+    # --- Errores: barra redactada + modal con las acciones que existen -------
+
+    def show_error(
+        self,
+        err,
+        *,
+        retry=None,
+        diagnose=None,
+    ) -> None:
+        """Muestra un error con **las acciones que existen**, y sólo ésas.
+
+        Es el punto de presentación de :mod:`thetvview.ui.errormsg`: recibe un
+        :class:`~thetvview.ui.errormsg.UiError` ya clasificado y decide cómo se
+        ve. La regla que gobierna el método es una sola y es literal:
+
+        > **Un atajo que se anuncia tiene que hacer algo.**
+
+        Por eso el pie se construye a partir de los callbacks recibidos, no de
+        una lista fija. Sin ``retry`` no se dibuja ``R``; sin ``diagnose`` no se
+        dibuja ``D`` (§13). Anunciar ``[R] Reintentar`` y que la tecla no haga
+        nada es peor que no anunciarlo: el usuario pulsa, no ocurre nada, y la
+        siguiente vez deja de leer el pie.
+
+        - El mensaje va **también** a la barra de estado, ya redactada: quien
+          usa la app por scripts o en modoheadless debe ver el fallo aunque no
+          haya terminal (§14 y :class:`StatusBar`, que además redacta otra vez).
+        - El modal usa ``wrap=True`` y los atajos ``R``/``D`` de verdad.
+        - ``Esc`` devuelve ``"cancel"`` y no ejecuta nada: cerrar un modal de
+          error es siempre volver (AC-06).
+
+        La degradación **no** es suya: reutiliza la guarda de :meth:`_run_modal`
+        (sin curses, desde un hilo, o con otro modal abierto se devuelve ``None``
+        sin abrir nada), de modo que el mensaje queda sólo en la barra en vez de
+        colgar la TUI.
+        """
+        from thetvview.ui.errormsg import UiError
+
+        from .actions import P, V, Action
+        from .widgets import Modal
+
+        if not isinstance(err, UiError):  # defensivo: el mensaje igual sale
+            err = UiError(title="Error", message=str(err))
+
+        cuerpo = err.cuerpo()
+        # La barra primero: si el modal no puede abrirse, el usuario tiene que
+        # leer el fallo igualmente (§14 — la barra es para información).
+        # `modal=False` porque este método **ya** abre el modal de verdad: si la
+        # barra escalara también, se abriría un segundo `Modal("Error", ...)`
+        # genérico sin acciones detrás y taparía al informative.
+        try:
+            self.status.show(cuerpo, error=True, modal=False)
+        except Exception:  # noqa: BLE001 - un status roto no tapa el modal
+            pass
+
+        acciones: list[Action] = []
+        atajos: dict[int, str] = {}
+        if callable(retry):
+            acciones.append(
+                Action("R", V.REINTENTAR, P.PRIMARIA, essential=True)
+            )
+            atajos[ord("R")] = "retry"
+        if callable(diagnose):
+            acciones.append(
+                Action("D", V.DIAGNOSTICO, P.SECUNDARIA, essential=True)
+            )
+            atajos[ord("D")] = "diagnose"
+        # `Esc` siempre: es la salida de un error y tiene que existir aunque no
+        # haya nada que reintentar (AC-06).
+        acciones.append(Action("Esc", V.VOLVER, P.NAVEGACION, essential=True))
+
+        # Un solo botón neutro: la elección se hace con las teclas del pie, no
+        # navegando. El botón existe porque `Modal.handle_key` devuelve el texto
+        # del botón en Enter y aquí no hay nada que confirmar.
+        modal = Modal(err.title, cuerpo, ["Aceptar"], actions=acciones,
+                      wrap=True, keys=atajos)
+        res = self._run_modal(modal)
+        if res == "retry" and callable(retry):
+            retry()
+        elif res == "diagnose" and callable(diagnose):
+            diagnose()
+
     def _run_modal(self, modal) -> str | None:  # noqa: ANN001
         """Bucle de modal centrado; devuelve el botón o None si no hay UI.
 
@@ -1643,7 +1725,15 @@ class App:
                 allow_private=self._allow_private_for(source),
             )
         except (OSError, ValueError) as exc:
-            self.status.show(str(exc), error=True)
+            # El retry es esta misma operación (F4, decisión de §1): no hay un
+            # segundo camino de recarga, así que la acción `R` vuelve a hacer
+            # exactamente lo que el usuario pidió al pulsar «Actualizar». Se
+            # ejecuta **después** de que `_run_modal` haya restaurado
+            # `_in_modal = False`, así que no se abre un modal encima del otro.
+            self.show_error(
+                describe_playlist_error(exc),
+                retry=self.reload_current_playlist,
+            )
             return
         old_n = len(playlist.channels)
         new_n = len(fresh.channels)
