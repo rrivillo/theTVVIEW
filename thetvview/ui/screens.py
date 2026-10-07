@@ -115,6 +115,16 @@ class Screen:
         """
         return []
 
+    def header_context(self) -> str:
+        """Contexto corto de la cabecera (SDD §12), por defecto el título.
+
+        `title` es el título *funcional* y puede ser largo y detallado
+        ("EPG · CNN", "Resolución · CNN"). Lo que va a la cabecera es otra cosa:
+        responder "¿dónde estoy?" en un vistazo (§3.3). Por eso son dos métodos
+        y no uno: ésta es la vista, aquél la ficha.
+        """
+        return self.title
+
     def handle_key(self, key: int) -> dict | None:
         return None
 
@@ -227,6 +237,9 @@ class PlaylistsScreen(Screen):
     """Catálogo de playlists registradas (playlists.json) — vista cards."""
 
     title = "Playlists"
+
+    def header_context(self) -> str:
+        return f"{icons.ICON_LIST} Listas"
 
     def __init__(self, app) -> None:
         super().__init__(app)
@@ -555,6 +568,9 @@ class ChannelsScreen(Screen):
         self._search_texts: list[str] | None = None
         self._search_src: list[Channel] | None = None
         self._apply_filter()
+
+    def header_context(self) -> str:
+        return f"{icons.ICON_TV} Canales · {len(self.visible_idx)}"
 
     # --- Filtrado -------------------------------------------------------------
 
@@ -1121,6 +1137,9 @@ class FavoritesScreen(Screen):
 
     title = "Favoritos"
 
+    def header_context(self) -> str:
+        return f"{icons.ICON_STAR} Favoritos"
+
     def __init__(self, app) -> None:
         super().__init__(app)
         self.list = ScrollableList()
@@ -1220,6 +1239,9 @@ class FavoritesScreen(Screen):
 class RecentsScreen(Screen):
     title = "Recientes"
 
+    def header_context(self) -> str:
+        return f"{icons.ICON_ARCHIVE} Recientes"
+
     def __init__(self, app) -> None:  # noqa: ANN001
         super().__init__(app)
         self.list = ScrollableList()
@@ -1305,6 +1327,9 @@ class GroupsScreen(Screen):
     """
 
     title = "Grupos"
+
+    def header_context(self) -> str:
+        return f"{icons.ICON_GROUP} Grupos"
 
     def __init__(self, app, playlist: Playlist) -> None:
         super().__init__(app)
@@ -1646,6 +1671,9 @@ class ResolutionScreen(Screen):
             (i for i, v in enumerate(variants) if v is channel), 0
         )
 
+    def header_context(self) -> str:
+        return "Calidad"
+
     def shortcuts(self) -> str:
         return "←/→ · Enter ▶ · ? Ayuda · t Tema · Esc ←"
 
@@ -1770,6 +1798,9 @@ class TrackOptionsScreen(Screen):
         #: salir y no se guarda como preferencia.
         self.marcados: set[tuple[str, str]] = set()
         self._focus()
+
+    def header_context(self) -> str:
+        return "Audio y calidad"
 
     # -- navegación ---------------------------------------------------------
 
@@ -2197,6 +2228,9 @@ class PlayerScreen(Screen):
         ]
         self.selected: int = 0
 
+    def header_context(self) -> str:
+        return f"{icons.ICON_PLAY} Reproductor"
+
     def shortcuts(self) -> str:
         return "↑/↓ · Enter ▶ · ? Ayuda · t Tema · Esc ←"
 
@@ -2380,6 +2414,9 @@ class NowPlayingScreen(Screen):
             except Exception:
                 # degradar silencioso si no se puede crear el monitor
                 self.health = ChannelHealthMonitor(channel, interval=10.0, timeout=2.0, auto_start=False)
+
+    def header_context(self) -> str:
+        return f"{icons.ICON_PLAY} Reproduciendo"
 
     def shortcuts(self) -> str:
         # Audio, subtítulos y calidad ya se eligieron antes de elegir
@@ -2913,6 +2950,9 @@ class EpgScreen(Screen):
         except Exception:  # noqa: BLE001 - sin catch-up, directo intacto
             self.catchup = catchup.DISABLED
         self.refresh_programs()
+
+    def header_context(self) -> str:
+        return f"{icons.ICON_EPG} Guía TV"
 
     @property
     def has_catchup(self) -> bool:

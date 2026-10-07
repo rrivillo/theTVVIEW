@@ -913,7 +913,7 @@ thetvview/
     ├── app.py          # bucle principal, stack de pantallas, ayuda
     ├── screens.py      # todas las pantallas
     ├── tracks.py       # sesión de pistas del canal abierto (estado)
-    ├── widgets.py      # listas, modales, formularios, toast, loading
+    ├── widgets.py      # cabecera, listas, modales, formularios, toast, loading
     ├── actions.py      # Action, prioridades, vocabulario y ajuste del pie
     ├── errormsg.py     # clasificación de errores → mensaje para el usuario
     ├── textwidth.py    # ancho en celdas (cell_width/clip_cells)

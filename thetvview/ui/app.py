@@ -869,7 +869,7 @@ class App:
                 pass
 
             stdscr.erase()
-            self.header.render(stdscr, self.screen.title, len(self.stack))
+            self.header.render(stdscr, self._header_context(), len(self.stack))
             self.screen.render(stdscr)
             self._render_footer(stdscr)
             modal.render(stdscr)
@@ -933,7 +933,7 @@ class App:
                         return None
                     continue
                 stdscr.erase()
-                self.header.render(stdscr, self.screen.title, len(self.stack))
+                self.header.render(stdscr, self._header_context(), len(self.stack))
                 self.screen.render(stdscr)
                 self._render_footer(stdscr)
                 modal.render(stdscr)
@@ -1168,7 +1168,7 @@ class App:
                 pass
 
             stdscr.erase()
-            self.header.render(stdscr, self.screen.title, len(self.stack))
+            self.header.render(stdscr, self._header_context(), len(self.stack))
             self.screen.render(stdscr)
             self._render_footer(stdscr)
             modal.render(stdscr)
@@ -1232,7 +1232,7 @@ class App:
                 pass
 
             stdscr.erase()
-            self.header.render(stdscr, self.screen.title, len(self.stack))
+            self.header.render(stdscr, self._header_context(), len(self.stack))
             self.screen.render(stdscr)
             self._render_footer(stdscr)
             modal.render(stdscr)
@@ -1605,7 +1605,7 @@ class App:
                     stdscr.erase()
                     try:
                         self.header.render(
-                            stdscr, getattr(self.screen, "title", ""), len(self.stack)
+                            stdscr, self._header_context(), len(self.stack)
                         )
                     except Exception:
                         pass
@@ -1678,7 +1678,7 @@ class App:
         try:
             stdscr.erase()
             try:
-                self.header.render(stdscr, getattr(self.screen, "title", ""), len(self.stack))
+                self.header.render(stdscr, self._header_context(), len(self.stack))
             except Exception:
                 pass
             LoadingOverlay.render(stdscr, message, sub=sub)
@@ -2368,7 +2368,7 @@ class App:
                 pass
 
             stdscr.erase()
-            self.header.render(stdscr, self.screen.title, len(self.stack))
+            self.header.render(stdscr, self._header_context(), len(self.stack))
             self.screen.render(stdscr)
             self._render_footer(stdscr)
             stdscr.refresh()
@@ -2549,6 +2549,28 @@ class App:
                 chips.append(("", tokens[0]))
         return chips
 
+    def _header_context(self) -> str:
+        """§7.3: `App` no sabe qué pantalla es, sólo recoge su contexto.
+
+        Degradación a propósito: una pantalla doblada sin `header_context()` (o
+        que lo lance) no puede tumbar la cabecera entera, que es el cromo que
+        hace legible toda la app. Mismo espíritu que `_warn`/`_error` en
+        `screens.py`.
+        """
+        try:
+            screen = self.screen
+        except Exception:
+            # `screen` es una property sobre `stack[-1]`: con el stack vacío
+            # lanza `IndexError`, que `getattr(..., None)` no atrapa.
+            return ""
+        fn = getattr(screen, "header_context", None)
+        if callable(fn):
+            try:
+                return str(fn() or "")
+            except Exception:
+                pass
+        return str(getattr(screen, "title", "") or "")
+
     def _render_footer(self, stdscr: curses.window) -> None:
         """Renderiza footer moderno con chips + toast stack.
 
@@ -2637,7 +2659,7 @@ class App:
                 pass
 
             stdscr.erase()
-            self.header.render(stdscr, self.screen.title, len(self.stack))
+            self.header.render(stdscr, self._header_context(), len(self.stack))
             self.screen.render(stdscr)
             self._render_footer(stdscr)
 

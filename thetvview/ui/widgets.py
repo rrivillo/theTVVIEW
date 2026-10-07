@@ -277,70 +277,97 @@ def render_status_bar(stdscr: curses.window, shortcuts: str, message: str = "", 
 
 
 class HeaderBar:
-    """Barra de título moderna con logo + breadcrumbs + indicador de tema."""
+    """Cabecera consistente: identidad a la izquierda, contexto a la derecha.
+
+    La pantalla dice **qué** contexto se ve (`Screen.header_context()`); este
+    widget decide **cómo** se dibuja y no sabe nada más: ni de qué pantalla
+    viene, ni de qué datos hay cargados. Todo lo que necesita le llega como
+    argumento, así que aquí dentro no hay ni una comparación de tipos ni una
+    referencia al dominio (§31/§35); hay un test que lo vigila para siempre.
+
+    Todo se mide con `cell_width()` de `textwidth`, nunca con `len()`: `★ ▶ ◈`
+    son *East Asian Ambiguous* y un emoji ocupa 2 celdas, así que medir en
+    caracteres desalinearía la línea entera (§17).
+
+    Degradación cuando falta ancho, por este orden (§16, §18):
+
+    1. si caben logo + contexto + tema → relleno `─` y contexto pegado a la
+       derecha (**nunca centrado**, §10);
+    2. si no → cae el indicador de tema (es lo último en caer: es secundario);
+    3. si no → se trunca el contexto por el final con `…`;
+    4. si no → sólo la identidad, recortada por celdas y nunca partida.
+    """
 
     def __init__(self, app: Any = None) -> None:
         self.app = app
 
     @staticmethod
-    def _truncate_middle(text: str, max_len: int) -> str:
-        if max_len <= 0:
-            return ""
-        if len(text) <= max_len:
-            return text
-        if max_len <= 3:
-            return text[:max_len]
-        # keep start and end
-        keep = max_len - 3
-        left = keep // 2
-        right = keep - left
-        return text[:left] + "…" + text[-right:]
+    def _pad_cells(s: str, max_x: int) -> str:
+        """Rellena con espacios hasta `max_x` **celdas** (nunca con `len()`)."""
+        return s + " " * max(0, max_x - cell_width(s))
 
     def render(self, stdscr: curses.window, title: str, stack_depth: int = 1) -> None:
+        """Pinta la cabecera.
+
+        `stack_depth` se conserva en la firma por compatibilidad con los dobles
+        de test (`FakeHeader`) y con los call sites de `App`, pero ya no se usa
+        para pintar breadcrumbs: la cabecera es un identificador de contexto y
+        la profundidad de navegación ya se anuncia en el footer con `Esc` (§13).
+        """
         max_y, max_x = stdscr.getmaxyx()
-        if max_y < 1 or max_x < 10:
+        if max_y < 1 or max_x < 12:
             return
-        # Breadcrumbs
-        crumbs: list[str] = []
-        if stack_depth > 1:
-            crumbs.append("◂" * min(stack_depth - 1, 3) + " ")
-        crumbs.append(title)
-        breadcrumb = "".join(crumbs)
 
         theme_name = getattr(self.app, "theme_name", "light") if self.app else "light"
-        theme_icon = f" {icons.ICON_THEME_DARK} " if theme_name == "dark" else f" {icons.ICON_THEME_LIGHT} "
+        theme = (
+            f" {icons.ICON_THEME_DARK} "
+            if theme_name == "dark"
+            else f" {icons.ICON_THEME_LIGHT} "
+        )
         logo = f" {icons.ICON_TV} theTVVIEW "
+        ctx = (title or "").strip()
 
-        # Layout robusto para terminales estrechas
-        # Prioridad: logo siempre, theme_icon siempre, breadcrumb truncado
-        avail_for_crumb = max(0, max_x - len(logo) - len(theme_icon))
-        if avail_for_crumb < 8:
-            breadcrumb = self._truncate_middle(breadcrumb, max(0, max_x - len(logo) - len(theme_icon)))
-            line = f"{logo}{breadcrumb}{theme_icon}"
-            line = line[:max_x].ljust(max_x)
+        w_logo = cell_width(logo)
+        w_theme = cell_width(theme)
+
+        # --- ¿cabe todo? --------------------------------------------------
+        with_theme = True
+        avail = max_x - w_logo - w_theme
+        if ctx and cell_width(ctx) > avail:
+            # Segundo en caer: el tema (elemento secundario, §16).
+            with_theme = False
+            avail = max_x - w_logo
+            if cell_width(ctx) > avail:
+                # Tercero: el contexto, truncado por el final con "…" (§18).
+                ctx = clip_cells(ctx, avail - 1) + "…"
+
+        if not ctx:
+            # Sin contexto (o sin ancho para él): la identidad manda y el
+            # espacio sobrante se rellena, nunca se recorta el logo (§16).
+            line = self._pad_cells(clip_cells(logo, max_x), max_x)
             try:
-                stdscr.addstr(0, 0, line[:max_x], colors.pair(colors.PAIR_TITLE) | curses.A_BOLD)
-                stdscr.addstr(0, 0, logo[:max_x], colors.pair(colors.PAIR_ACCENT) | curses.A_BOLD)
+                stdscr.addstr(0, 0, line, colors.pair(colors.PAIR_TITLE) | curses.A_BOLD)
+                stdscr.addstr(0, 0, clip_cells(logo, max_x), colors.pair(colors.PAIR_ACCENT) | curses.A_BOLD)
             except curses.error:
                 pass
             return
 
-        crumb_w = min(len(breadcrumb), max(6, avail_for_crumb - 2))
-        breadcrumb = self._truncate_middle(breadcrumb, crumb_w)
-        used = len(logo) + len(breadcrumb) + len(theme_icon)
-        padding = max(0, max_x - used)
-        left_pad = padding // 2
-        right_pad = padding - left_pad
-        line = f"{logo}{'─' * left_pad}{breadcrumb}{'─' * right_pad}{theme_icon}"
-        line = line[:max_x]
+        used = cell_width(ctx) + (w_theme if with_theme else 0)
+        fill = "─" * max(0, max_x - w_logo - used)
+        line = f"{logo}{fill}{ctx}" + (theme if with_theme else "")
+        # La suma de celdas da exactamente `max_x` en el camino normal; el
+        # `clip_cells` es la red de seguridad para anchos extremos (§18).
+        line = self._pad_cells(clip_cells(line, max_x), max_x)
+
         try:
-            # Banda sólida: PAIR_TITLE ocupa toda la fila con BOLD
-            stdscr.addstr(0, 0, line[:max_x], colors.pair(colors.PAIR_TITLE) | curses.A_BOLD)
-            # Logo resaltado por encima en accent
-            stdscr.addstr(0, 0, logo[:max_x], colors.pair(colors.PAIR_ACCENT) | curses.A_BOLD)
-            theme_x = max_x - len(theme_icon)
-            if 0 <= theme_x < max_x:
-                stdscr.addstr(0, theme_x, theme_icon[:max_x - theme_x], colors.pair(colors.PAIR_DIM))
+            # Banda sólida: PAIR_TITLE ocupa toda la fila con BOLD.
+            stdscr.addstr(0, 0, line, colors.pair(colors.PAIR_TITLE) | curses.A_BOLD)
+            # Logo resaltado por encima en accent.
+            stdscr.addstr(0, 0, clip_cells(logo, max_x), colors.pair(colors.PAIR_ACCENT) | curses.A_BOLD)
+            if with_theme:
+                theme_x = max_x - w_theme
+                if 0 <= theme_x < max_x:
+                    stdscr.addstr(0, theme_x, theme, colors.pair(colors.PAIR_DIM))
         except curses.error:
             pass
 
