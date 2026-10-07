@@ -26,6 +26,7 @@ ver y con qué reproductor.
 | **EPG** | XMLTV en ruta o URL, `.xml` o `.gz`, con cache y recarga (`r`); si la lista lo trae, se carga solo. |
 | **Archivo** | Catch-up solo si el proveedor lo declara (ver la sección dedicada). |
 | **Extras** | Recientes, salud del canal en vivo, tema claro/oscuro, ayuda contextual, ratón. |
+| **Cabecera** | Igual en todas las pantallas: la identidad a la izquierda y el contexto a la derecha. |
 | **Rendimiento** | Cachés en disco con TTL + carga en segundo plano: abrir listas grandes es instantáneo. |
 
 ---
@@ -132,7 +133,7 @@ Listas ──Enter──▶ Canales ──Enter──▶ [Pistas] ──▶ Repr
   │                  │                  │              │               │
   │                  ├── /  buscar      │ sólo si el    │ sólo los       │ q detiene
   │                  ├── g  grupos      │ proveedor     │ instalados     │ y vuelve
-  │                  ├── f  favoritos   │ publica algo, │               │
+  │                  ├── f  marcar ★    │ publica algo, │               │
   │                  ├── e  guía EPG    │ y sólo tras   │               │
   │                  └── p  reproductor │ ⏱ máx 2,5 s   │               │
   │                                     │ (4 s en Win)  │               │
@@ -152,6 +153,46 @@ alternativas, ese paso no aparece y se va directo al reproductor. Y si el
 análisis llega tarde y las pistas se ofrecen al confirmar el reproductor,
 `Enter` en esa pantalla **reproduce directamente** con el reproductor ya
 elegido: nunca te hacen elegirlo dos veces.
+
+### Cómo leer la cabecera
+
+La cabecera es siempre la misma, en las 11 pantallas:
+
+```
+ ◉ theTVVIEW ───────────────────────────── ◉ Canales · 1284 ☀
+```
+
+- **La izquierda es la identidad** y no se cede nunca: `theTVVIEW` se lee
+  completo incluso en una terminal de 20 columnas.
+- **La derecha es el contexto**: dónde estás y, en Canales, cuántos canales
+  hay a la vista. El número cuenta los **canales visibles**, así que baja solo
+  al escribir en la búsqueda (`/`) o al entrar en un grupo (`g`).
+- **El indicador de tema** (`☀` / `☽`) va al final de la cabecera. Es lo
+  primero que desaparece cuando falta ancho, porque es lo único prescindible.
+
+Los contextos que verás:
+
+| Contexto | Pantalla |
+| --- | --- |
+| `▤ Listas` | Catálogo de listas. |
+| `◉ Canales · N` | Lista de canales, con los visibles a la vista. |
+| `▣ Grupos` | Grupos (categorías) de la lista. |
+| `★ Favoritos` | Canales marcados con `f`. |
+| `◷ Recientes` | Historial de reproducción. |
+| `◈ Guía TV` | Programación del canal. |
+| `Calidad` | Selector de resolución. |
+| `Audio y calidad` | Selector de pistas. |
+| `▶ Reproductor` | Elección de mpv / mplayer / vlc. |
+| `▶ Reproduciendo` | Canal abierto en otra ventana. |
+
+El contexto es corto a propósito. El detalle —el nombre del canal, el grupo, la
+calidad o el programa actual— se ve **en el cuerpo de la pantalla**, no en la
+cabecera: así la cabecera siempre dice lo mismo y sabes dónde estás de un
+vistazo, sin que un canal con un nombre enorme la desborde.
+
+Cuando la ventana es estrecha, la cabecera cede por partes y en este orden:
+primero cae el indicador de tema, después se recorta el final del contexto con
+`…`, y el logo nunca se parte a la mitad.
 
 ### Navegación (común a casi todas las pantallas)
 
@@ -203,8 +244,12 @@ Las Listas Especiales X se resaltan en púrpura; las M3U en amarillo.
 `g` sólo abre la pantalla de grupos si la lista tiene **dos o más**: con cero
 o un grupo no hay nada que elegir y te lo dice en la barra de estado.
 
-El título muestra el nombre de la lista, el grupo (sólo cuando estás dentro
-de uno), los canales visibles/totales y un `★` si esa lista tiene favoritos.
+El título **de la pantalla** muestra el nombre de la lista, el grupo (sólo
+cuando estás dentro de uno), los canales visibles/totales y un `★` si esa lista
+tiene favoritos. Ese título va arriba del cuerpo; la cabecera, en cambio, sólo
+muestra `◉ Canales · N`, con el número de canales a la vista (ver «Cómo leer
+la cabecera»).
+
 Los canales de radio se marcan con `♪`. A partir de 70 columnas (y de 80
 para el reparto ancho) aparece un panel lateral con los datos del canal
 seleccionado: grupo, URL, días de archivo si los declara y el programa actual
@@ -215,8 +260,11 @@ si el EPG está cargado.
 | Pantalla | Teclas |
 | --- | --- |
 | **Grupos** | `Enter` abrir · `/` buscar · `R` actualizar |
-| **Favoritos** | `Enter` reproducir · `f` quitar · `p` reproductor |
-| **Recientes** | `Enter` volver a ver · `f` guardar en favoritos · `r` borrar historial |
+| **Favoritos** | `Enter` reproducir · `f` quitar |
+| **Recientes** | `Enter` volver a ver · `f` guardar en favoritos · `r` borrar el historial |
+
+En las tres vale `Esc` para volver, y también las globales `p` (elegir
+reproductor) y `?` (ayuda).
 
 Los canales sin `group-title` se agrupan al final como `(sin grupo)`, y los
 grupos salen siempre ordenados por nombre. El catálogo y la pantalla de grupos
@@ -369,7 +417,8 @@ siempre.
   - El resto del mando: `-j/--jobs` sondeos simultáneos (4 por defecto),
     `--timeout` segundos por canal (8), `-n 0` para recorrerla entera,
     `--muestreo inicio|aleatorio|fin`, `--ejemplos N` ejemplos por veredicto
-    y `--solo-menu` para ver sólo los que sí tendrían menú.
+    (5 por defecto) y `--solo-menu` para ver sólo los que sí tendrían menú.
+    Sin `-n` analiza los primeros 40 canales.
   - Medido sobre listas reales: 1755 canales → 60 sondeos, 5 (8 %) ofrecen
     pistas. 387 canales (todas `.m3u8`) → 53 de 387 (13,7 %), de ellos **51
     sólo calidad**, 1 sólo audio y 1 sólo subtítulos, ninguno las tres a la
@@ -551,8 +600,6 @@ motivo. Es lo que puedes copiar a un canal de soporte sin filtrar un token.
 
 ### Pantalla de reproducción
 
-### Pantalla de reproducción
-
 Mientras ves el canal, la app se queda en una pantalla informativa (el vídeo
 está en otra ventana) con:
 
@@ -646,7 +693,7 @@ Funcionan en cualquier pantalla salvo mientras escribes en una búsqueda.
 | `p` | Elegir reproductor del canal actual. |
 | `u` | Deshacer el último borrado de lista. |
 | `!` | Comprobar la seguridad (`security-check`); el resultado sale en un modal. |
-| Ratón | Clic para seleccionar, doble clic para abrir. |
+| Ratón | Clic para seleccionar, doble clic para abrir (en Listas, Canales, Grupos, Favoritos y Guía). |
 
 En la pantalla `Reproduciendo` quedan dos teclas:
 
@@ -804,7 +851,7 @@ convertir la app en algo que no responde. Editables a mano:
 ## Tests
 
 ```bash
-# Suite completa (1956 tests, ~2,5 min)
+# Suite completa (2108 tests, ~1,6 min)
 python -m unittest -v
 
 # Solo tests de una parte
@@ -827,6 +874,15 @@ selección, preferencias, argv, IPC y proxy de calidad) y el multi-stream
 (transporte, detector, router, errores, cámara IP, supervisor, diagnóstico,
 preferencias e integración).
 
+La cabecera tiene su propia suite, `tests/test_header_consistente.py`, que
+además de comprobar el contexto de cada pantalla verifica dos cosas que son
+fáciles de romper sin que nadie lo note: que la línea 0 nunca se pase del ancho
+de la terminal (midiendo en **celdas**, no en caracteres, porque `★ ▶ ◈` ocupan
+más de un carácter) y que el `HeaderBar` siga sin saber qué pantalla tiene
+delante. Ese último se comprueba sobre el código fuente, así que nadie puede
+colar un `isinstance` de pantallas ni una lectura del dominio "sólo para un
+caso raro" sin que la suite lo note.
+
 Las acciones contextuales tienen su propia suite, y una invariante que la
 sostiene: **todo lo que la barra inferior anuncia, la pantalla ya lo hace**
 (`keys(actions()) ⊆ shortcuts() ∧ ⊆ handle_key`). La convención está en
@@ -835,6 +891,7 @@ sostiene: **todo lo que la barra inferior anuncia, la pantalla ya lo hace**
 ```bash
 python -m unittest tests.test_catchup -v      # dominio catch-up
 python -m unittest tests.test_catchup_ui -v   # guía, marcadores y modales
+python -m unittest tests.test_header_consistente -v  # cabecera
 python -m unittest tests.test_tracks_manager -v   # política de selección
 python -m unittest tests.test_streams_hls -v       # parser HLS
 python -m unittest tests.test_player_track_args -v # argv por reproductor
@@ -911,12 +968,12 @@ thetvview/
 │                       # errores, seguridad y config
 └── ui/
     ├── app.py          # bucle principal, stack de pantallas, ayuda
-    ├── screens.py      # todas las pantallas
+    ├── screens.py      # todas las pantallas (cada una con su header_context)
     ├── tracks.py       # sesión de pistas del canal abierto (estado)
     ├── widgets.py      # cabecera, listas, modales, formularios, toast, loading
     ├── actions.py      # Action, prioridades, vocabulario y ajuste del pie
     ├── errormsg.py     # clasificación de errores → mensaje para el usuario
-    ├── textwidth.py    # ancho en celdas (cell_width/clip_cells)
+    ├── textwidth.py    # ancho en celdas (cell_width/clip_cells); lo usa la cabecera
     ├── layout.py       # rectángulos (header/main/footer)
     ├── theme.py        # paletas dual light/dark (256/8 colores, NO_COLOR)
     ├── colors.py       # IDs de pares de color
