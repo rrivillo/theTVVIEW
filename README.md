@@ -20,6 +20,7 @@ ver y con qué reproductor.
 | **Catálogo** | Guarda varias listas en `data/playlists.json`; añadir/borrar con `a`/`d`, deshacer con `u`. |
 | **Fuentes** | M3U/M3U8/TS local o `http(s)`, y Listas Especiales X (auth con test de conexión). |
 | **Canales** | Lista con búsqueda incremental (`/`), favoritos (`f`), grupos (`g`), EPG (`e`). |
+| **Favoritos** | Tus canales con lo que emiten ahora, si hay guía; sin guía, la lista de siempre. |
 | **Calidad** | Selector de resolución **solo** si el canal tiene variantes reales. |
 | **Pistas** | Audio, subtítulos y calidad del canal **solo si el proveedor los publica** (HLS master / DASH). En caliente con mpv. |
 | **Reproductor** | Elige mpv/mplayer/vlc (solo se ofrecen los instalados) y reproduce. |
@@ -260,11 +261,38 @@ si el EPG está cargado.
 | Pantalla | Teclas |
 | --- | --- |
 | **Grupos** | `Enter` abrir · `/` buscar · `R` actualizar |
-| **Favoritos** | `Enter` reproducir · `f` quitar |
+| **Favoritos** | `Enter` reproducir · `f` quitar · `e` guía del canal |
 | **Recientes** | `Enter` volver a ver · `f` guardar en favoritos · `r` borrar el historial |
 
 En las tres vale `Esc` para volver, y también las globales `p` (elegir
 reproductor) y `?` (ayuda).
+
+Favoritos muestra cada canal en dos columnas: el nombre y, a la derecha, lo
+que están dando ahora mismo:
+
+```text
+★ Favoritos
+
+CNN               Noticias
+BBC One           Breakfast
+ESPN              Football
+Discovery         Planet Earth
+```
+
+La guía es **opcional y complementaria**: Favoritos nunca la pide. Si no hay
+XMLTV cargado, la lista se ve tal como estaba antes (con su `★` y su nombre);
+si la guía está descargándose, la segunda columna dice `Cargando…`. Un canal
+que no aparece en la guía, o que no tiene nada en emisión a esta hora, se
+queda con un `—` atenuado: es un dato que no está, no un error, y el favorito
+sigue ahí, se sigue viendo y se sigue pudiendo reproducir.
+
+El programa se calcula al pintar y no se guarda en `data/favorites.json`: un
+favorito sigue siendo un canal, no un programa. Los favoritos que ya tenías
+siguen valiendo tal cual. La lista se refresca sola cuando llega la guía o al
+volver de ella con `e`; mientras estás mirando, no cambia por su cuenta.
+
+En terminales angostas (menos de 34 columnas) la segunda columna desaparece y
+queda sólo el nombre del canal: el nombre nunca se recorta por el programa.
 
 Los canales sin `group-title` se agrupan al final como `(sin grupo)`, y los
 grupos salen siempre ordenados por nombre. El catálogo y la pantalla de grupos
@@ -629,8 +657,10 @@ está en otra ventana) con:
   con el de la cabecera como valor por defecto.
 - La correspondencia se busca por `tvg-id` y, si no aparece, por `tvg-name`
   (o por el nombre del canal) contra los `<channel>` del XMLTV, comparando el
-  `display-name` **exacto** y sin distinguir mayúsculas. No hay búsqueda
-  parcial: si el XMLTV llama al canal de otra forma, no hay correspondencia.
+  `display-name` **exacto** y sin distinguir mayúsculas ni repetir espacios.
+  No hay búsqueda parcial: si el XMLTV llama al canal de otra forma, no hay
+  correspondencia. La búsqueda por nombre va con índice, así que no se recorre
+  la guía entera canal por canal.
 - `●` marca el programa que se está emitiendo ahora.
 - `r` fuerza la recarga (en URLs re-descarga; en ficheros re-lee).
 - Si pulsas `e` mientras el EPG de la lista **sigue descargándose**, la app
@@ -911,6 +941,8 @@ thetvview/
 ├── models.py           # dataclasses: Channel, Playlist, Program
 ├── m3u_parser.py       # parser M3U/M3U8/TS (archivo y URL, cache TTL)
 ├── epg_parser.py       # parser XMLTV (.xml/.gz) con cache TTL
+├── epg_match.py        # qué canal de la guía es este canal (tvg-id, luego
+│                       #   nombre indexado) — sin red ni curses
 ├── playlist_manager.py # catálogo de playlists (JSON, M3U + Especiales X)
 ├── favorites.py        # favoritos (JSON)
 ├── recents.py          # historial de recientes (20, con URL redactada)
@@ -971,9 +1003,10 @@ thetvview/
     ├── screens.py      # todas las pantallas (cada una con su header_context)
     ├── tracks.py       # sesión de pistas del canal abierto (estado)
     ├── widgets.py      # cabecera, listas, modales, formularios, toast, loading
+    ├── favorite_rows.py# Favoritos: programa actual y reparto en dos columnas
     ├── actions.py      # Action, prioridades, vocabulario y ajuste del pie
     ├── errormsg.py     # clasificación de errores → mensaje para el usuario
-    ├── textwidth.py    # ancho en celdas (cell_width/clip_cells); lo usa la cabecera
+    ├── textwidth.py    # ancho en celdas (cell_width/clip_cells/pad_cells)
     ├── layout.py       # rectángulos (header/main/footer)
     ├── theme.py        # paletas dual light/dark (256/8 colores, NO_COLOR)
     ├── colors.py       # IDs de pares de color
@@ -1004,6 +1037,7 @@ degradando en silencio.
 | *Aviso: «necesita una terminal interactiva (TTY)»* | Ejecútalo desde una consola real (PowerShell, CMD, bash), no desde un IDE, un pipe ni una tarea programada. |
 | *No hay reproductor disponible* | Instala `mpv`, `vlc` o `mplayer`. La app busca también fuera del `PATH` (Program Files, Homebrew, snap/flatpak…). |
 | *Sin correspondencia EPG* | El `tvg-id` del canal no está en el XMLTV. Prueba otra fuente (`e` → `r`). |
+| *En Favoritos sale `—` al lado de un canal* | La guía no tiene nada para ese canal: o no lo conoce, o no emite nada a esta hora. El favorito sigue igual; con `e` abres su guía para confirmarlo. |
 | *Sin guía en Listas Especiales X* | La TUI todavía pide un XMLTV para la parrilla (el EPG del panel no se consulta): indica una ruta local o una URL al abrir la guía. |
 | *Sin archivo (catch-up)* | El proveedor no lo declara para ese canal: revisa que traiga `tv_archive` **y** `tv_archive_duration`, o `catchup` + `catchup-days` + `catchup-source` en el `#EXTINF`. |
 | *Lista vacía* | Revisa que el fichero tenga canales; los `.ts` también valen. |

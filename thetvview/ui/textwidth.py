@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import unicodedata
 
-__all__ = ["char_width", "cell_width", "clip_cells"]
+__all__ = ["char_width", "cell_width", "clip_cells", "pad_cells"]
 
 # Anchuras que ocupan dos celdas (CJK, emoji de presentación ancha, Hangul…).
 _WIDE_CLASSES = frozenset("WF")
@@ -74,3 +74,17 @@ def clip_cells(s: str, max_cells: int) -> str:
         out.append(ch)
         total += w
     return "".join(out)
+
+
+def pad_cells(s: str, min_cells: int) -> str:
+    """Rellena ``s`` por la derecha hasta ``min_cells`` celdas.
+
+    El complemento de `clip_cells` para pintar filas: en curses, lo que no se
+    escribe se queda de lo que hubiera antes, así que una fila se "limpia"
+    escribiendo también los huecos. Y hay que contarlos en celdas: `ljust`
+    cuenta caracteres y dejaría la línea `len()`-céldas más corta de lo que se
+    cree, que es como el texto se descoloca hacia la izquierda al aparecer
+    emoji o caracteres de Asia oriental en un canal.
+    """
+    faltan = min_cells - cell_width(s)
+    return s if faltan <= 0 else s + " " * faltan

@@ -13,14 +13,25 @@ from typing import Any
 from . import colors
 from . import icons
 from .actions import LEADING, P, SEPARATOR, Action, V, fit_actions
-from .textwidth import cell_width, clip_cells
+from .textwidth import cell_width, clip_cells, pad_cells as _pad_cells
 
 
 class ScrollableList:
-    """Lista con scroll y selección; renderiza solo lo visible."""
+    """Lista con scroll y selección; renderiza solo lo visible.
+
+    Opcionalmente cada fila lleva un **texto secundario** paralelo (`subitems`):
+    la columna del programa en Favoritos. Es opt-in a propósito —sin
+    subelementos el render es exactamente el de siempre— porque el mismo widget
+    lo usan nueve pantallas más y ninguna de ellas necesita dos columnas.
+    """
+
+    #: Prefijos de la fila: el de selección y el de hueco. Ambos miden 3 celdas.
+    PREFIX_SELECTED = " ▸ "
+    PREFIX_PLAIN = "   "
 
     def __init__(self, items: list[str] | None = None, selected_pair: int | None = None) -> None:
         self.items: list[str] = items or []
+        self.subitems: list[str] = []
         self.selected = 0
         self.top = 0
         self.selected_pair = selected_pair if selected_pair is not None else colors.PAIR_SELECTED
@@ -29,8 +40,24 @@ class ScrollableList:
         """Cambia el color de la fila seleccionada (p. ej. por tipo de lista)."""
         self.selected_pair = pair_id
 
-    def set_items(self, items: list[str], keep_selection: bool = False) -> None:
+    def set_items(
+        self,
+        items: list[str],
+        subitems: list[str] | None = None,
+        keep_selection: bool = False,
+    ) -> None:
+        """Fija las filas y, si se pasan, sus textos secundarios.
+
+        `subitems` es *paralelo* a `items`: un texto por fila, en el mismo
+        orden. Si no viene, o si no cuadra con el número de filas, la lista se
+        dibuja a una columna: degradar es mejor que pintar la segunda columna
+        descolocada o leer un índice que no existe.
+        """
         self.items = items
+        if subitems is not None and len(subitems) == len(items):
+            self.subitems = list(subitems)
+        else:
+            self.subitems = []
         if not keep_selection or self.selected >= len(items):
             self.selected = 0
         self.top = 0
@@ -97,8 +124,68 @@ class ScrollableList:
         thumb_top = int(self.top * (height - thumb_h) / max_top)
         return (thumb_top, thumb_h)
 
-    def render(self, stdscr: curses.window, y: int, x: int, height: int, width: int) -> None:
-        self.clamp(height)
+    def _two_columns(self) -> bool:
+        """True si esta lista se dibuja con su columna secundaria.
+
+        Sólo con subelementos no vacíos **y** uno por fila: es la bandera que
+        deja intacto el render de las otras nueve pantallas.
+        """
+        return bool(self.subitems) and len(self.subitems) == len(self.items)
+
+    def _render_scrollbar(self, stdscr: curses.window, line_y: int, scroll_x: int,
+                          rows: int, i: int) -> None:
+        """Dibuja el scrollbar en su columna reservada (una celda)."""
+        thumb = self._scrollbar_thumb(rows)
+        if thumb is None:
+            stdscr.addstr(line_y, scroll_x, "│",
+                          colors.pair(colors.PAIR_DIM) | curses.A_DIM)
+            return
+        t_top, t_h = thumb
+        is_thumb = t_top <= i < t_top + t_h
+        ch = "█" if is_thumb else "│"
+        sa = (
+            (colors.pair(colors.PAIR_SCROLLBAR) | curses.A_BOLD)
+            if is_thumb
+            else (colors.pair(colors.PAIR_DIM) | curses.A_DIM)
+        )
+        stdscr.addstr(line_y, scroll_x, ch, sa)
+
+    def _render_row_two_columns(self, stdscr: curses.window, line_y: int, x: int,  # noqa: ANN001
+                                content_w: int, idx: int, selected: bool,
+                                has_scroll: bool, rows: int, i: int) -> None:
+        """Pinta una fila en dos columnas: el canal y su texto secundario.
+
+        El canal va en `PAIR_NORMAL` y lo secundario en `PAIR_DIM` —el dato
+        complementario no debe competir con el nombre— y la fila seleccionada lo
+        lleva entero en el par de selección: es lo que hace que se lea como una
+        sola fila y no como dos textos sueltos.
+
+        Todo se mide y se recorta en celdas (`clip_cells`), nunca con `len()`: un
+        nombre con emoji no puede empujar la segunda columna ni desbordar la
+        línea. La segunda columna empieza donde acaba la primera porque la
+        primera llega ya rellenada con su hueco (`favorite_rows.layout_columns`):
+        aquí no hace falta saber el ancho de ninguna columna.
+        """
+        prefix = self.PREFIX_SELECTED if selected else self.PREFIX_PLAIN
+        attr = colors.pair(self.selected_pair if selected else colors.PAIR_NORMAL)
+        sub_attr = attr if selected else colors.pair(colors.PAIR_DIM)
+
+        principal = clip_cells(self.items[idx], max(0, content_w - cell_width(prefix)))
+        cabeza = f"{prefix}{principal}"
+        ancho_cabeza = cell_width(cabeza)
+        secundario = ""
+        if ancho_cabeza < content_w:
+            secundario = clip_cells(self.subitems[idx], content_w - ancho_cabeza)
+        stdscr.addstr(line_y, x, _pad_cells(cabeza, content_w), attr)
+        if secundario:
+            stdscr.addstr(line_y, x + ancho_cabeza,
+                          _pad_cells(secundario, content_w - ancho_cabeza), sub_attr)
+        if has_scroll:
+            self._render_scrollbar(stdscr, line_y, x + content_w, rows, i)
+
+    def _render_two_columns(self, stdscr: curses.window, y: int, x: int,  # noqa: ANN001
+                            height: int, width: int) -> None:
+        """Render de dos columnas: el de Favoritos con el programa actual."""
         rows = max(1, height)
         for i in range(rows):
             idx = self.top + i
@@ -107,33 +194,46 @@ class ScrollableList:
                 break
             if idx >= len(self.items):
                 continue
-            text = self.items[idx][: max(0, width - 2)]
-            if idx == self.selected:
-                prefix = " ▸ "
-                attr = colors.pair(self.selected_pair)
-            else:
-                prefix = "   "
-                attr = colors.pair(colors.PAIR_NORMAL)
-            full_line = f"{prefix}{text}"
             # Dejar 1 col para scrollbar si hay overflow
             has_scroll = len(self.items) > rows and width > 8
             content_w = width - 1 - (1 if has_scroll else 0)
             try:
-                stdscr.addstr(line_y, x, full_line.ljust(content_w)[: content_w], attr)
+                self._render_row_two_columns(
+                    stdscr, line_y, x, content_w, idx, idx == self.selected,
+                    has_scroll, rows, i,
+                )
+            except curses.error:
+                pass  # última celda de la esquina inferior derecha
+
+    def render(self, stdscr: curses.window, y: int, x: int, height: int, width: int) -> None:
+        self.clamp(height)
+        if self._two_columns():
+            self._render_two_columns(stdscr, y, x, height, width)
+            return
+        rows = max(1, height)
+        for i in range(rows):
+            idx = self.top + i
+            line_y = y + i
+            if line_y >= stdscr.getmaxyx()[0]:
+                break
+            if idx >= len(self.items):
+                continue
+            selected = idx == self.selected
+            prefix = self.PREFIX_SELECTED if selected else self.PREFIX_PLAIN
+            attr = colors.pair(self.selected_pair if selected else colors.PAIR_NORMAL)
+            # Dejar 1 col para scrollbar si hay overflow
+            has_scroll = len(self.items) > rows and width > 8
+            content_w = width - 1 - (1 if has_scroll else 0)
+            # Recorte y relleno en **celdas**, nunca en caracteres (§42, §43).
+            # Contando caracteres, un nombre de Asia oriental o con emoji deja
+            # la fila más ancha que la ventana: se come el scrollbar y, en la
+            # esquina inferior derecha, `curses.error`. Para texto de una celda
+            # por carácter —todo lo que había antes— el resultado es idéntico.
+            text = clip_cells(self.items[idx], max(0, content_w - cell_width(prefix)))
+            try:
+                stdscr.addstr(line_y, x, _pad_cells(f"{prefix}{text}", content_w), attr)
                 if has_scroll:
-                    scroll_x = x + content_w
-                    thumb = self._scrollbar_thumb(rows)
-                    if thumb is not None:
-                        t_top, t_h = thumb
-                        is_thumb = t_top <= i < t_top + t_h
-                        ch = "█" if is_thumb else "│"
-                        if is_thumb:
-                            sa = colors.pair(colors.PAIR_SCROLLBAR) | curses.A_BOLD
-                        else:
-                            sa = colors.pair(colors.PAIR_DIM) | curses.A_DIM
-                        stdscr.addstr(line_y, scroll_x, ch, sa)
-                    else:
-                        stdscr.addstr(line_y, scroll_x, "│", colors.pair(colors.PAIR_DIM) | curses.A_DIM)
+                    self._render_scrollbar(stdscr, line_y, x + content_w, rows, i)
             except curses.error:
                 pass  # última celda de la esquina inferior derecha
 

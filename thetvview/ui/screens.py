@@ -19,6 +19,7 @@ from thetvview import player, resolutions
 from thetvview import catchup
 from thetvview import config
 from thetvview.channel_health import ChannelHealthMonitor
+from thetvview import epg_match
 from thetvview.epg_parser import Epg, parse_file
 from thetvview.groups import groups_of
 from thetvview.models import Channel, Playlist
@@ -41,6 +42,7 @@ from .errormsg import (
     describe_playback_error,
     empty_playlist_error,
 )
+from .favorite_rows import FavoriteRow, build_rows, layout_columns, two_columns_fit
 from .textwidth import cell_width, clip_cells
 from .widgets import EmptyState, ScrollableList, render_separator
 
@@ -135,15 +137,14 @@ class Screen:
         raise NotImplementedError
 
 
-def _epg_channel_id(epg: Epg, channel: Channel) -> str | None:
-    """Resuelve el channel_id del EPG para un canal (tvg-id, luego nombre)."""
-    if channel.tvg_id and channel.tvg_id in epg.programs:
-        return channel.tvg_id
-    want = (channel.tvg_name or channel.name).casefold()
-    for cid, name in epg.channels_by_id.items():
-        if cid in epg.programs and name.casefold() == want:
-            return cid
-    return None
+def _epg_channel_id(epg: Epg | None, channel: Channel) -> str | None:
+    """Resuelve el channel_id del EPG para un canal (tvg-id, luego nombre).
+
+    No decide nada: la política vive en :mod:`thetvview.epg_match`, que además
+    la resuelve en tiempo constante. Canales, Grupos, la guía y Favoritos pasan
+    por aquí, así que los cuatro comparten una sola asociación y un solo índice.
+    """
+    return epg_match.resolve_channel_id(epg, channel)
 
 
 def _warn(app, message: str) -> None:  # noqa: ANN001
@@ -1133,7 +1134,18 @@ class ChannelsScreen(Screen):
 
 
 class FavoritesScreen(Screen):
-    """Canales marcados como favoritos (favorites.json)."""
+    """Canales marcados como favoritos (favorites.json).
+
+    Cada fila es un canal y, si hay guía, lo que están dando ahora mismo. El
+    programa se **resuelve al pintar** y no se guarda en ningún sitio: el
+    favorito sigue siendo un canal, y `favorites.json` no cambia de formato
+    (§4, §26, CA-09). Lo único que se guarda en memoria es la fila ya
+    resuelta, que se tira en cuanto la guía cambia.
+
+    La guía es un adorno, nunca un requisito: sin `Epg` la lista se dibuja
+    exactamente como antes de esta mejora, y un canal sin correspondencia o sin
+    emisión se marca con `—` en vez de desaparecer (§11.2, §11.4, §11.6).
+    """
 
     title = "Favoritos"
 
@@ -1144,11 +1156,109 @@ class FavoritesScreen(Screen):
         super().__init__(app)
         self.list = ScrollableList()
         self.channels: list[Channel] = []
+        self.rows: list[FavoriteRow] = []
+        # Identidad de la guía con la que se construyeron las filas, y si había
+        # una carga en marcha. Es lo que decide cuándo hay que rehacerlas
+        # (§16): no un temporizador, sino un cambio de datos.
+        self._epg_visto: Epg | None = None
+        self._epg_cargando_visto = False
+        # ¿Las filas llevan programa? Sin guía no se reserva la segunda columna.
+        self._hay_programas = False
         self.reload()
 
     def reload(self) -> None:
+        """Relee los favoritos de `favorites.json` y vuelve a resolverlos.
+
+        La lista en pantalla se actualiza en el render siguiente, que es
+        inmediatamente después: aquí sólo se releen los datos.
+        """
         self.channels = self.app.favorites.load()
-        self.list.set_items([format_channel_name(c, favorite=True) for c in self.channels])
+        self.rebuild_rows()
+
+    # --- Filas: la guía sólo se lee, nunca se pide ---------------------------
+
+    def _epg(self) -> Epg | None:
+        """La guía ya cargada en memoria, o `None`. Nunca pide una."""
+        return getattr(self.app, "epg", None)
+
+    def _epg_cargando(self) -> bool:
+        """¿Hay una carga de EPG en marcha en segundo plano?
+
+        Se lee con `getattr` a propósito: los dobles de test (y una app que no
+        tenga el atributo) no tienen por qué saber de hilos de carga, y esta
+        pantalla tiene que funcionar igual sin él.
+        """
+        hilo = getattr(self.app, "_epg_load_thread", None)
+        if hilo is None:
+            return False
+        vivo = getattr(hilo, "is_alive", None)
+        return bool(vivo()) if callable(vivo) else True
+
+    def filas_al_dia(self) -> bool:
+        """¿Las filas se construyeron con los datos que hay ahora?
+
+        Se compara **identidad**, no contenido: cambiar de guía es un hecho, y
+        recorrer 20 000 canales de la parrilla en cada frame para comprobar si
+        es la misma es justo lo que el §17 prohíbe. Es la regla de la entrega
+        sin temporizador: se rehace al cargar la guía y al volver de ella.
+        """
+        return (
+            self._epg() is not self._epg_visto
+            or self._epg_cargando() != self._epg_cargando_visto
+        )
+
+    def rebuild_rows(self, now: datetime | None = None) -> None:
+        """Resuelve los favoritos contra la guía que ya está en memoria.
+
+        Nunca llama a `ensure_epg()`: pedir la guía es trabajo de la pantalla
+        de la guía, con su modal y su hilo. Aquí sólo se lee `app.epg`, que es
+        lo que garantiza que mostrar Favoritos no genere ni una petición por
+        favorito (CA-08).
+
+        No toca la lista ni el cursor: el reparto en columnas depende del ancho
+        y lo hace `render()`.
+        """
+        epg = self._epg()
+        cargando = self._epg_cargando()
+        self._epg_visto = epg
+        self._epg_cargando_visto = cargando
+        # ¿Hay algo que decir en la segunda columna? Sin guía y sin carga en
+        # marcha, no: la lista se dibuja exactamente como antes de esta mejora
+        # (§11.6). Con la guía a medio camino sí, y dice "Cargando…" (§11.5).
+        self._hay_programas = epg is not None or cargando
+        self.rows = build_rows(
+            self.channels,
+            epg,
+            now if now is not None else datetime.now().astimezone(),
+            epg_loading=cargando,
+        )
+
+    def _aplicar_columnas(self, width: int) -> None:
+        """Vuelca las filas en la lista, en dos columnas si caben.
+
+        Sólo se toca la lista si los textos han cambiado de verdad. Es lo que
+        permite refrescar en cada frame sin que el usuario pierda el scroll a
+        media lista cada vez que llega una tecla.
+        """
+        if not self._hay_programas:
+            items = [format_channel_name(c, favorite=True) for c in self.channels]
+            subitems: list[str] = []
+        else:
+            pares = layout_columns(self.rows, width)
+            items = [canal for canal, _ in pares]
+            subitems = (
+                [programa for _, programa in pares]
+                if two_columns_fit(width)
+                else []
+            )
+        if items == self.list.items and subitems == self.list.subitems:
+            return  # nada cambió: ni la lista ni su cursor se mueven
+        # `set_items` deja el scroll arriba; recargar la misma lista no puede
+        # saltar al primer favorito mientras el usuario está mirando el quince.
+        top, selected = self.list.top, self.list.selected
+        self.list.set_items(items, subitems=subitems or None, keep_selection=True)
+        self.list.selected = selected
+        self.list.top = top
 
     def current_channel(self) -> Channel | None:
         if not self.channels:
@@ -1156,7 +1266,10 @@ class FavoritesScreen(Screen):
         return self.channels[self.list.selected]
 
     def shortcuts(self) -> str:
-        return "↑/↓ · Enter ▶ · f ★ · p Reproductor · ? Ayuda · t Tema · Esc ←"
+        return (
+            "↑/↓ · Enter ▶ · f ★ · e EPG · p Reproductor · "
+            "? Ayuda · t Tema · Esc ←"
+        )
 
     def actions(self) -> list[Action]:
         """Catálogo de Favoritos.
@@ -1164,11 +1277,16 @@ class FavoritesScreen(Screen):
         Todo lo que hay aquí es favorito por definición, así que `f` siempre
         dice «Quitar»: anunciar «Favorito» sobre una tecla que quita sería
         mentir (§9, R-04).
+
+        `e EPG` es la misma acción que en Canales y con el mismo contrato: abre
+        la guía que ya existe en lugar de inventar una segunda guía dentro de
+        esta pantalla (§3).
         """
         hay = self.current_channel() is not None
         return [
             Action("Enter", V.VER, P.PRIMARIA, enabled=hay),
             Action("f", V.QUITAR, P.CONTEXTUAL, enabled=hay),
+            Action("e", V.EPG, P.SECUNDARIA, enabled=hay),
             Action("Esc", V.VOLVER, P.NAVEGACION),
             Action("?", V.AYUDA, P.AYUDA, essential=True),
         ]
@@ -1202,6 +1320,15 @@ class FavoritesScreen(Screen):
                     pass
                 return None
             return {"action": "unfavorite", "channel": channel}
+        if key == ord("e"):
+            channel = self.current_channel()
+            if channel is None:
+                _warn(self.app, "No hay favoritos: marca canales con 'f' para ver su guía.")
+                return None
+            # Sin `epg_url`: un favorito puede venir de cualquier lista y la app
+            # no tiene una "lista actual" única. La guía sabe esperar al hilo de
+            # carga y, si no hay guía, abre su propio prompt.
+            return {"action": "show_epg", "channel": channel}
         if key in (curses.KEY_ENTER, 10, 13):
             channel = self.current_channel()
             if channel is None:
@@ -1220,6 +1347,9 @@ class FavoritesScreen(Screen):
 
     def render(self, stdscr: curses.window) -> None:
         max_y, max_x = stdscr.getmaxyx()
+        if self.filas_al_dia():
+            self.rebuild_rows()
+        self._aplicar_columnas(max_x)
         if not self.channels:
             # **Sin CTA, a propósito.** En esta pantalla `f` *quita* el
             # favorito, no lo añade (`actions()` lo dice: todo lo que hay aquí
