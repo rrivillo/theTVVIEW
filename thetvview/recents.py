@@ -9,6 +9,9 @@ from . import config
 from .models import Channel
 from .security.local_files import chmod_private
 from .security.redaction import needs_redaction_for_storage, redact_text
+from .storage.errors import StorageError
+from .storage.json_store import atomic_write_json, file_lock, read_json_with_recovery
+from .storage.schemas import validate_recents
 from .stream_ref import is_opaque_ref
 from .tracks.prefs import channel_key
 
@@ -105,11 +108,23 @@ class RecentsManager:
         self.max_items = max(1, max_items)
 
     def _read(self) -> list[dict]:
-        if not self.path.exists():
-            return []
+        """Lee `recents.json`. Un historial roto se trata como vacío.
+
+        A diferencia de la persistencia crítica (favoritos, listas), aquí un
+        fichero corrupto **no** es un error: el historial es un registro de
+        uso, no un dato que el usuario haya creado a mano. Perderlo es una
+        molestia, no una pérdida de datos, y bloquear la app por él sería
+        peor (STORE-004 distingue lo crítico de lo reconstruible).
+
+        El store conserva una copia ``.corrupt-<timestamp>`` del fichero
+        dañado para diagnóstico y devuelve ``None`` en vez de lanzar.
+        """
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            data = read_json_with_recovery(self.path, schema_version=None)
+        except StorageError:
+            # Conservado el .corrupt-*; el historial vuelve a empezar vacío.
+            return []
+        if data is None:
             return []
         # Un `recents.json` que no sea una lista (un `{}`, un número) es un
         # archivo dañado, no un error: se ignora entero (FR-REC-08).
@@ -118,10 +133,12 @@ class RecentsManager:
         return [e for e in data if isinstance(e, dict)]
 
     def _write(self, items: list[RecentItem]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps([asdict(i) for i in items], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(self.path)
+        atomic_write_json(
+            self.path,
+            [asdict(i) for i in items],
+            schema_version=None,
+            validate=validate_recents,
+        )
         chmod_private(self.path)
 
     @staticmethod
@@ -183,22 +200,43 @@ class RecentsManager:
         """
         url, _ = self._safe_url(channel.url)
         clave = channel_key(channel)
-        if clave is None:
-            # Sin identidad (canal sin URL): la URL es lo único que hay.
-            items = [i for i in self.load() if i.url != url]
-        else:
-            items = [
-                i for i in self.load()
-                if i.identidad() != clave and i.url != url
-            ]
-        items.insert(0, RecentItem(
-            name=channel.name,
-            url=url,
-            group=channel.group,
-            player=player,
-            tvg_id=str(getattr(channel, "tvg_id", "") or "") or None,
-        ))
-        self._write(items[: self.max_items])
+        # El par leer-modificar-escribir va bajo el candado del fichero
+        # (STORE-006): el historial es corto pero se escribe desde el hilo de
+        # reproducción y desde el principal.
+        with file_lock(self.path):
+            if clave is None:
+                # Sin identidad (canal sin URL): la URL es lo único que hay.
+                items = [i for i in self.load() if i.url != url]
+            else:
+                items = [
+                    i for i in self.load()
+                    if i.identidad() != clave and i.url != url
+                ]
+            items.insert(0, RecentItem(
+                name=channel.name,
+                url=url,
+                group=channel.group,
+                player=player,
+                tvg_id=str(getattr(channel, "tvg_id", "") or "") or None,
+            ))
+            self._write(items[: self.max_items])
+
+    def remove(self, url: str) -> bool:
+        """Quita el registro con esa `url`. Devuelve True si había alguno.
+
+        Lo usa el borrado de una lista (STORE-006): sus recientes quedan
+        inservibles cuando la lista desaparece, y se quitan en el mismo paso
+        que la lista para no dejar historial que no se puede abrir.
+        """
+        objetivo = (url or "").strip()
+        if not objetivo:
+            return False
+        items = self.load()
+        kept = [i for i in items if i.url != objetivo]
+        if len(kept) == len(items):
+            return False
+        self._write(kept)
+        return True
 
     def clear(self) -> None:
         self._write([])

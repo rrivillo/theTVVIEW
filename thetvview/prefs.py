@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Any, overload
 
 from . import config
+from .storage.json_store import atomic_write_json, read_json_with_recovery
+from .storage.errors import StorageError
+from .storage.json_store import file_lock
+from .storage.migrations import migrate_file
+from .storage.schemas import validate_prefs
 
 
 @dataclass
@@ -71,7 +76,12 @@ class PrefsManager:
 
     def load(self) -> Prefs:
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            self._migrate()
+            data = read_json_with_recovery(
+                self.path, schema_version=None, validate=validate_prefs
+            )
+            if data is None:
+                return Prefs()
             return Prefs(
                 last_player=str(data.get("last_player") or "") or None,
                 last_group_sort=str(data.get("last_group_sort") or "name") or "name",
@@ -95,19 +105,31 @@ class PrefsManager:
                     data.get("diagnostics_enabled", True)
                 ),
             )
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        except (StorageError, OSError):
             return Prefs()
 
+    def _migrate(self) -> None:
+        """Migra prefs.json a la versión actual (idempotente)."""
+        try:
+            migrate_file(self.path, nombre="prefs")
+        except (StorageError, OSError):
+            pass  # la carga decide; migrar nunca debe impedir abrir la app
+
     def save(self, prefs: Prefs) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(asdict(prefs), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(self.path)
+        atomic_write_json(self.path, asdict(prefs), schema_version=1)
 
     def set_last_player(self, name: str | None) -> None:
-        p = self.load()
-        p.last_player = name
-        self.save(p)
+        """Fija el último reproductor usado (STORE-006).
+
+        Es un par leer-modificar-escribir: sin candado, dos llamadas seguidas
+        desde hilos distintos podían pisarse y perder un cambio. El candado
+        cubre **el par entero**, no sólo la escritura, que es donde está el
+        problema.
+        """
+        with file_lock(self.path):
+            p = self.load()
+            p.last_player = name
+            self.save(p)
 
     def last_player(self) -> str | None:
         """Último reproductor elegido (o None si nunca se eligió uno).
@@ -120,9 +142,10 @@ class PrefsManager:
     def set_last_group_sort(self, value: str) -> None:
         if value not in ("name", "count"):
             return
-        p = self.load()
-        p.last_group_sort = value
-        self.save(p)
+        with file_lock(self.path):
+            p = self.load()
+            p.last_group_sort = value
+            self.save(p)
 
 
 def _opt_str(value: Any) -> str | None:

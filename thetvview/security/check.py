@@ -168,17 +168,20 @@ def check_tls_verification() -> str:
             min_v >= ssl.TLSVersion.TLSv1_2,
             f"TLS mínimo {min_v} < 1.2",
         )
-    # El cliente no debe montar un opener con verificación desactivada.
-    import urllib.request
-
-    from .safe_http import SafeHttpClient
+    # El cliente usa http.client con el contexto estricto compartido.
+    from .safe_http import SafeHttpClient, _PinnedHTTPSConnection
 
     client = SafeHttpClient()
-    handlers = getattr(client._opener, "handlers", [])
-    https = [h for h in handlers if isinstance(h, urllib.request.HTTPSHandler)]
-    _require(bool(https), "SafeHttpClient sin HTTPSHandler con contexto estricto")
-    ctx_https = [h for h in https if getattr(h, "_context", None) is ctx]
-    _require(bool(ctx_https), "HTTPSHandler no usa el contexto estricto compartido")
+    _require(
+        _PinnedHTTPSConnection is not None,
+        "SafeHttpClient sin _PinnedHTTPSConnection",
+    )
+    # Verificar que el contexto estricto se usa en la conexión HTTPS
+    conn = _PinnedHTTPSConnection("example.com", 443, context=ctx)
+    _require(
+        conn._context is ctx,
+        "_PinnedHTTPSConnection no usa el contexto estricto compartido",
+    )
     return "CERT_REQUIRED + check_hostname + TLS>=1.2"
 
 
@@ -259,13 +262,13 @@ def check_redirect_policy() -> str:
     """SDD §13 / SEC-003: sin auto-redirect, tope 3 y sin https→http."""
     from .errors import NetworkError, TLSValidationError
     from .limits import get_limits
-    from .safe_http import SafeHttpClient, _NoRedirect
+    from .safe_http import SafeHttpClient
 
     client = SafeHttpClient(allow_private=True)
-    handlers = getattr(client._opener, "handlers", [])
+    # http.client no sigue redirects automáticamente: se validan a mano.
     _require(
-        any(isinstance(h, _NoRedirect) for h in handlers),
-        "el opener sigue redirects de urllib automáticamente",
+        not hasattr(client, "_opener"),
+        "SafeHttpClient sigue usando urllib (debe usar http.client)",
     )
     cap = int(get_limits().max_redirects)
     _require(0 < cap <= 3, f"max_redirects={cap} fuera de 1..3")
@@ -1197,6 +1200,100 @@ def check_track_discovery_is_sandboxed() -> str:
 
 
 # ---------------------------------------------------------------------------
+# 15. Persistencia: escritura atómica y versionado
+# ---------------------------------------------------------------------------
+
+
+def check_persistence_atomic() -> str:
+    """STORE-001/002/003/004: escritura atómica, schema_version y migración.
+
+    Este check existe para que la verificación siga siendo ejecutable con una
+    tecla (``!``) sin tener que acordarse de que el store tiene una garantía.
+    Comprueba tres cosas concretas, y las tres fallan si alguien reintroduce
+    el patrón viejo de ``tmp.write_text()`` + ``replace()``:
+
+    1. **atomicidad real**: una escritura deja el fichero legible y completo,
+       incluso si se inyecta un fallo en mitad del ``flush``/``fsync``; el
+       fichero anterior sobrevive intacto.
+    2. **versionado**: los formatos persistentes llevan ``schema_version``.
+    3. **migración idempotente**: un fichero v0 pasa a v1 una vez y no se
+       vuelve a migrar.
+    """
+    from ..storage.json_store import atomic_write_json, read_json_with_recovery
+    from ..storage.migrations import migrate_file, needs_migration
+    from ..storage.schemas import SCHEMA_VERSION, get_validator
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ruta = Path(tmp) / "check.json"
+
+        def leer_valor(destino: Path) -> str:
+            """Valor persistido, o un texto que delata que no es JSON.
+
+            Devolver una cadena en vez de dejar propagar el
+            ``JSONDecodeError`` es a propósito: el mensaje del check tiene que
+            explicar **qué garantía se rompió**, no escribir el error interno
+            de ``json`` y dejar que el que corre ``!`` vea una traza.
+            """
+            try:
+                datos = json.loads(destino.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                return "<no es JSON válido>"
+            if not isinstance(datos, dict):
+                return "<no es un objeto JSON>"
+            return str(datos.get("valor", "<sin valor>"))
+
+        # (1) atomicidad: el estado bueno está siempre en disco.
+        atomic_write_json(ruta, {"valor": "uno"})
+        _require(
+            leer_valor(ruta) == "uno",
+            "la escritura atómica no dejó el fichero legible",
+        )
+        # Fallo inyectado en el punto más caro (el fsync del temporal).
+        try:
+            with mock.patch("os.fsync", side_effect=OSError("disco lleno")):
+                atomic_write_json(ruta, {"valor": "dos"})
+        except Exception:
+            pass  # el error es lo esperado; lo que importa es el estado
+        _require(
+            leer_valor(ruta) == "uno",
+            f"un fallo a mitad de escritura dejó {leer_valor(ruta)!r} en disco: "
+            "el estado bueno debería haber sobrevivido intacto",
+        )
+        # Y no debe quedar ningún temporal por medio.
+        _require(
+            not list(Path(tmp).glob(".*.tmp")),
+            "la escritura dejó un temporal abandonado",
+        )
+
+        # (2) versionado: los formatos con validador están registrados.
+        for nombre in ("prefs", "playlists", "favorites", "recents", "theme"):
+            _require(
+                get_validator(nombre) is not None,
+                f"el formato «{nombre}» no tiene validador semántico",
+            )
+        atomic_write_json(ruta, {"valor": "tres"}, schema_version=SCHEMA_VERSION)
+        datos = read_json_with_recovery(ruta, schema_version=SCHEMA_VERSION)
+        _require(datos.get("valor") == "tres", "schema_version no se escribió")
+
+        # (3) migración idempotente v0 -> v1.
+        v0 = Path(tmp) / "v0.json"
+        v0.write_text(json.dumps({"theme": "dark"}), encoding="utf-8")
+        _require(needs_migration({"theme": "dark"}), "un v0 no se reconoce como viejo")
+        primera = migrate_file(v0, nombre="theme")
+        _require(primera.changed, "la migración v0->v1 no migra")
+        segunda = migrate_file(v0, nombre="theme")
+        _require(not segunda.changed, "la migración se aplica dos veces (no es idempotente)")
+        _require(
+            json.loads(v0.read_text(encoding="utf-8")).get("schema_version")
+            == SCHEMA_VERSION,
+            "la migración no dejó el fichero en la versión actual",
+        )
+
+    return (f"escritura atómica verificada, schema_version={SCHEMA_VERSION}, "
+            "migración v0→v1 idempotente")
+
+
+# ---------------------------------------------------------------------------
 # Registro
 # ---------------------------------------------------------------------------
 
@@ -1219,6 +1316,8 @@ CHECKS: tuple[tuple[str, str, Callable[[], str]], ...] = (
      check_catchup_capability_gate),
     ("track_discovery_sandbox", "Track discovery sandbox",
      check_track_discovery_is_sandboxed),
+    ("persistence_atomic", "Atomic persistence & versioning",
+     check_persistence_atomic),
 )
 
 

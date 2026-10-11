@@ -32,6 +32,11 @@ from thetvview.models import Channel
 from thetvview.security.safe_http import SafeHttpClient
 from thetvview.security.url_policy import PURPOSE_STREAM
 from thetvview.streams.headers import build_headers as _build_headers
+from thetvview.tasks.manager import CancellationToken, TaskManager
+
+#: Gestor compartido para monitores que se crean sueltos (tests, uso sin TUI).
+_DEFAULT_MANAGER: TaskManager | None = None
+_MANAGER_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +511,12 @@ class ChannelHealthMonitor:
         mon.stop()
 
     Tests pueden usar auto_start=False y llamar a probe_once() manual.
+
+    Desde la fase 3 el sondeo periódico corre en el
+    :class:`~thetvview.tasks.manager.TaskManager` en vez de en un hilo propio:
+    gana cancelación cooperativa, límite de concurrencia y parada con plazo
+    al cerrar la app. ``task_manager`` deja inyectar el gestor compartido; si
+    no se pasa, el monitor usa uno propio.
     """
 
     def __init__(
@@ -517,6 +528,7 @@ class ChannelHealthMonitor:
         timeout: float = 3.0,
         auto_start: bool = True,
         allow_private: bool = False,
+        task_manager: TaskManager | None = None,
     ) -> None:
         self.channel = channel
         self.interval = max(0.5, float(interval))
@@ -528,6 +540,10 @@ class ChannelHealthMonitor:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        #: Handle de la tarea periódica cuando corre por el gestor.
+        self._handle: object | None = None
+        #: Gestor compartido; ``None`` = se crea uno propio para este monitor.
+        self._task_manager = task_manager
         if auto_start:
             self.start()
 
@@ -540,27 +556,66 @@ class ChannelHealthMonitor:
         return snap
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self.is_running:
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="health-probe", daemon=True)
-        self._thread.start()
+        self._handle = self._manager().submit("health-probe", self._loop)
+
+    def _manager(self) -> TaskManager:
+        """Gestor de tareas: el de la app si se pasó uno, o uno propio.
+
+        Lo propio es el caso de un monitor suelto (tests). Lo compartido es el
+        de la TUI, para que el cierre de la app lo pare con plazo en vez de
+        dejar un hilo midiendo la salud de un canal que ya no se ve.
+        """
+        global _DEFAULT_MANAGER
+        if self._task_manager is not None:
+            return self._task_manager
+        with _MANAGER_LOCK:
+            if _DEFAULT_MANAGER is None:
+                _DEFAULT_MANAGER = TaskManager(max_global=8, max_per_category=2)
+            return _DEFAULT_MANAGER
 
     def stop(self) -> None:
         self._stop.set()
+        handle = self._handle
+        if handle is not None:
+            try:
+                handle.cancel("ya no se está viendo este canal")  # type: ignore[attr-defined]
+                handle.join(timeout=0.6)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            self._handle = None
         thr = self._thread
         if thr and thr.is_alive():
             thr.join(timeout=0.6)
         self._thread = None
 
-    def _loop(self) -> None:
+    def _loop(self, token: CancellationToken | None = None) -> None:
         # Probe inmediato para que la UI tenga dato rápido sin bloquear el
         # hilo principal; luego cada `interval` segundos.
+        #
+        # La cancelación es cooperativa y se comprueba en dos sitios: la
+        # espera entre sondas (`_stop.wait`, que devuelve True si alguien
+        # puso la señal) y antes de cada sonda. Es lo que hace que `stop()`
+        # sea rápido aunque el intervalo sea largo.
+        def _cancelado() -> bool:
+            if self._stop.is_set():
+                return True
+            return bool(token is not None and token.check())
+
         try:
             self.probe_once()
         except Exception:
             pass
-        while not self._stop.wait(self.interval):
+        while not _cancelado():
+            # `wait` sobre el evento: devuelve False al agotarse el plazo y
+            # True en cuanto alguien cancela, así que no hay ni sondeo
+            # fantasma ni espera a ciegas.
+            if self._stop.wait(self.interval):
+                break
+            if _cancelado():
+                break
             try:
                 self.probe_once()
             except Exception:
@@ -582,5 +637,8 @@ class ChannelHealthMonitor:
 
     @property
     def is_running(self) -> bool:
+        handle = self._handle
+        if handle is not None:
+            return bool(not handle.done)  # type: ignore[attr-defined]
         t = self._thread
         return bool(t and t.is_alive())

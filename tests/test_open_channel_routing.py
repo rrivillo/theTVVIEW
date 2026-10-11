@@ -158,10 +158,28 @@ class TestOpenChannelNoBloquea(AppCase):
         return entry
 
     def _join_warm(self, timeout: float = 10.0) -> None:
-        thread = self.app._warm_thread
-        if thread is not None:
-            thread.join(timeout=timeout)
-            self.assertFalse(thread.is_alive(), "el hilo de catálogo no terminó")
+        """Espera a que el warming termine y aplica lo que descargó.
+
+        Desde la fase 3 el warming corre en el gestor de tareas, así que ya
+        no hay un ``threading.Thread`` al que hacerle ``join``: se espera al
+        handle que dejó la tarea y luego se drena la cola, que es lo que
+        mete las playlists en la caché. Sin ese drenaje, los asserts de
+        debajo comprobarían un caché que el worker todavía no ha tocado.
+        """
+        deadline = time.monotonic() + timeout
+        manager = self.app._tasks
+        while time.monotonic() < deadline:
+            vivos = manager.active_for("catalog-warm")
+            if not vivos:
+                break
+            for handle in vivos:
+                handle.join(timeout=0.05)
+        # Drenar es lo que aplica el resultado: el worker sólo devuelve.
+        self.app._drain_tasks()
+        self.assertFalse(
+            manager.active_for("catalog-warm"),
+            "la tarea de catálogo no terminó",
+        )
 
     def test_open_channel_pinta_sin_esperar_a_la_red(self) -> None:
         entrada = self._entrada("http://lenta.example/lista.m3u")

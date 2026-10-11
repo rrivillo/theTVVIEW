@@ -472,3 +472,40 @@ def check_url(
     else:
         check_host(parts.host, allow_private=allow_private)
     return parts
+
+
+def check_url_pinned(
+    url: str,
+    purpose: str = "metadata",
+    *,
+    allow_private: bool = False,
+) -> tuple[UrlParts, str]:
+    """Valida la URL y resuelve el destino devolviendo ``(partes, ip_fijada)``.
+
+    A diferencia de :func:`check_url`, esta función devuelve la IP a la que se
+    debe conectar el cliente, de modo que la validación y la conexión usan
+    la misma resolución DNS (protección anti-DNS-rebinding/TOCTOU, SDD §4.4).
+
+    Todas las IPs que devuelve el nombre se validan contra la política anti-SSRF;
+    si alguna está bloqueada, se lanza :class:`SSRFBlockedError` y no se
+    devuelve ninguna IP. La IP devuelta es la primera válida.
+
+    Args:
+        url: URL candidata.
+        purpose: ``"metadata"`` o ``"stream"``.
+        allow_private: excepción por fuente (nunca global).
+
+    Returns:
+        ``(partes_validadas, ip_fijada)``. ``ip_fijada`` es ``""`` si no hay
+        destino de red (``ffmpeg://`` con ruta relativa).
+
+    Raises:
+        InvalidUrlError: la URL no cumple la política de esquema/forma.
+        SSRFBlockedError: el destino es privado/interno/de metadata.
+        NetworkError: el DNS falló o tardó demasiado.
+    """
+    parts = validate_url(url, purpose=purpose)
+    if not parts.host:
+        return parts, ""
+    ips = resolve_and_check(parts.host, parts.port, allow_private=allow_private)
+    return parts, ips[0] if ips else ""

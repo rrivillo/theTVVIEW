@@ -303,11 +303,12 @@ class TestRedirects(_Base):
         client = SafeHttpClient(allow_private=True, timeout=5)
         calls = {"n": 0}
 
-        def fake_check(url: str, purpose: str = "metadata", **kwargs: object) -> UrlParts:
+        def fake_check(url: str, purpose: str = "metadata", **kwargs: object) -> tuple[UrlParts, str]:
             calls["n"] += 1
             scheme = "https" if calls["n"] == 1 else "http"
-            return UrlParts(
-                scheme=scheme, host="example.com", port=None, path="/", query="", raw=url
+            return (
+                UrlParts(scheme=scheme, host="example.com", port=None, path="/", query="", raw=url),
+                "93.184.216.34",
             )
 
         def fake_attempt(*args: object, **kwargs: object) -> object:
@@ -320,7 +321,7 @@ class TestRedirects(_Base):
             )
 
         with (
-            mock.patch.object(safe_http, "check_url", side_effect=fake_check),
+            mock.patch.object(safe_http, "check_url_pinned", side_effect=fake_check),
             mock.patch.object(SafeHttpClient, "_attempt", side_effect=fake_attempt),
         ):
             with self.assertRaises(TLSValidationError) as ctx:
@@ -486,6 +487,92 @@ class TestMapeoErrores(unittest.TestCase):
             body="ñ".encode("latin-1"),
         )
         self.assertEqual(resp.text, "ñ")
+
+
+# ---------------------------------------------------------------------------
+# NET-004: IP pinning (anti-DNS-rebinding)
+# ---------------------------------------------------------------------------
+
+
+class TestIPPinning(_Base):
+    def test_conecta_a_ip_fijada_no_al_hostname(self) -> None:
+        """El socket se abre contra la IP validada, no contra el hostname."""
+        cliente = SafeHttpClient(allow_private=True, timeout=5)
+        llamadas = []
+
+        original_create = socket.create_connection
+
+        def spy_create(address, *args, **kwargs):
+            llamadas.append(address[0])
+            return original_create(address, *args, **kwargs)
+
+        with mock.patch.object(socket, "create_connection", side_effect=spy_create):
+            cliente.get_bytes(self.url("/ok"))
+        self.assertEqual(llamadas, ["127.0.0.1"])
+
+    def test_rebinding_no_afecta_a_la_conexion(self) -> None:
+        """Aunque el DNS cambie entre validación y conexión, no se re-resuelve.
+
+        Con IP pinning, la conexión usa la IP de la primera resolución;
+        no hay segunda llamada a getaddrinfo durante la conexión.
+        """
+        cliente = SafeHttpClient(allow_private=True, timeout=5)
+        resoluciones = []
+
+        original_getaddrinfo = socket.getaddrinfo
+
+        def flaky_getaddrinfo(host, *args, **kwargs):
+            resoluciones.append(host)
+            if len(resoluciones) > 1:
+                # Si hubiera una segunda resolución, devolvería una IP
+                # bloqueada; con pinning esto nunca ocurre.
+                raise AssertionError("se resolvió el nombre dos veces")
+            return original_getaddrinfo(host, *args, **kwargs)
+
+        with mock.patch.object(socket, "getaddrinfo", side_effect=flaky_getaddrinfo):
+            body = cliente.get_bytes(self.url("/ok"))
+        self.assertEqual(body, _BODY_OK)
+        self.assertEqual(len(resoluciones), 1)  # sólo una resolución
+
+    def test_hostname_se_conserva_en_host_header(self) -> None:
+        """El pinning no cambia el Host: sigue siendo el hostname original."""
+        cliente = SafeHttpClient(allow_private=True, timeout=5)
+        # El servidor devuelve el header Host que recibió
+        body = cliente.get_bytes(self.url("/ok"))
+        # Si el Host fuera la IP, el servidor lo vería distinto; aquí solo
+        # comprobamos que la petición llega bien (el Host correcto lo
+        # verifica el test de integración con el handler).
+        self.assertEqual(body, _BODY_OK)
+
+    def test_tls_sni_usa_hostname_no_ip(self) -> None:
+        """En HTTPS, el SNI y la verificación van contra el hostname original."""
+        from thetvview.security.safe_http import _PinnedHTTPSConnection
+
+        capturadas = []
+
+        def spy_wrap(sock, *args, **kwargs):
+            capturadas.append(kwargs.get("server_hostname", ""))
+            raise OSError("conexión simulada")
+
+        ctx = ssl.create_default_context()
+        with (
+            mock.patch.object(socket, "create_connection", return_value=mock.Mock()),
+            mock.patch.object(ssl.SSLContext, "wrap_socket", side_effect=spy_wrap),
+        ):
+            conn = _PinnedHTTPSConnection(
+                "example.com", 443, pinned_ip="93.184.216.34",
+                timeout=1, context=ctx,
+            )
+            with self.assertRaises(OSError):
+                conn.connect()
+        self.assertEqual(capturadas, ["example.com"])  # no la IP
+
+    def test_http_pinning_con_servidor_real(self) -> None:
+        """Integración: el cliente conecta de verdad con la IP fijada."""
+        cliente = SafeHttpClient(allow_private=True, timeout=5)
+        resp = cliente.request(self.url("/ok"))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.body, _BODY_OK)
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

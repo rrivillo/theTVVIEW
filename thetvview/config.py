@@ -208,6 +208,18 @@ def ensure_dirs() -> None:
         directory.mkdir(parents=True, exist_ok=True)
         chmod_private(directory, directory=True)
 
+    # Política de cachés (RES-005): caduca y recorta lo que sobra **sólo** en
+    # los directorios de caché. Nunca toca prefs.json, playlists.json,
+    # favorites.json ni los backups: eso es persistencia, no caché.
+    # Cualquier fallo aquí se ignora a propósito — una limpieza que no se
+    # puede hacer no puede impedir abrir la app.
+    try:
+        from .storage.cache_policy import limpiar_todo
+
+        limpiar_todo()
+    except Exception:
+        pass
+
 
 def load_theme() -> str:
     """Lee el tema persistente de theme.json. Devuelve 'light' si falla."""

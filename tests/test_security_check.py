@@ -61,7 +61,77 @@ class TestLosChecksPasan(unittest.TestCase):
         self.assertIn("Zero pip dependencies", labels[11:])
         self.assertIn("Catch-up capability gate", labels[12:])
         self.assertIn("Track discovery sandbox", labels[13:])
+        self.assertIn("Atomic persistence & versioning", labels[14:])
         self.assertEqual(len(set(c[0] for c in sec_check.CHECKS)), len(sec_check.CHECKS))
+
+
+class TestPersistenciaDetectada(unittest.TestCase):
+    """El check 15 verifica, no supone: se rompe cada garantía y se ve.
+
+    Un check que sólo pasa no demuestra nada. Estos testsuwitnessen que el
+    check **falla** cuando se deshace lo que dice comprobar: si alguien
+    reintroduce el patrón viejo de ``tmp.write_text()`` + ``replace()``, o
+    quita el ``schema_version``, o hace la migración no idempotente, el
+    check tiene que ponerse rojo.
+    """
+
+    def test_detecta_escritura_no_atomica(self) -> None:
+        """Si el store deja JSON parcial al fallar, el check falla.
+
+        Se sustituye ``atomic_write_json`` por una versión que escribe el
+        destino **a medias**, que es exactamente el fallo que STORE-001
+        prohíbe: el usuario se queda con un ``prefs.json`` ilegible.
+        """
+        from thetvview.storage import json_store
+
+        def no_atomica(path, data, **_kwargs):
+            ruta = Path(path)
+            ruta.parent.mkdir(parents=True, exist_ok=True)
+            texto = json.dumps(data, ensure_ascii=False, indent=2)
+            ruta.write_text(texto[: len(texto) // 2], encoding="utf-8")
+
+        with mock.patch.object(json_store, "atomic_write_json", no_atomica):
+            with self.assertRaises(sec_check.CheckFailure) as ctx:
+                sec_check.check_persistence_atomic()
+        self.assertIn("legible", str(ctx.exception))
+        # Y el mensaje explica la rotura, no suelta el error interno de json.
+        self.assertNotIn("Unterminated", str(ctx.exception))
+
+    def test_detecta_falta_de_schema_version(self) -> None:
+        """Si un formato pierde su validador, el check lo nota."""
+        from thetvview.storage import schemas
+
+        with mock.patch.dict(schemas.SCHEMAS, {}, clear=True):
+            with self.assertRaises(sec_check.CheckFailure) as ctx:
+                sec_check.check_persistence_atomic()
+        self.assertIn("validador", str(ctx.exception))
+
+    def test_detecta_migracion_no_idempotente(self) -> None:
+        """Si migrar dos veces vuelve a cambiar algo, el check lo nota."""
+        from thetvview.storage import migrations
+
+        original = migrations.migrate_file
+
+        def no_idempotente(path, **kwargs):
+            resultado = original(path, **kwargs)
+            # Simula una migración que se reaplica siempre.
+            return migrations.MigrationResult(
+                {
+                    "data": resultado.data,
+                    "changed": True,
+                    "from_version": 0,
+                    "to_version": 1,
+                }
+            )
+
+        with mock.patch.object(migrations, "migrate_file", no_idempotente):
+            with self.assertRaises(sec_check.CheckFailure) as ctx:
+                sec_check.check_persistence_atomic()
+        self.assertIn("idempotente", str(ctx.exception))
+
+    def test_el_check_real_pasa(self) -> None:
+        """Y con el código real, pasa."""
+        self.assertIsInstance(sec_check.check_persistence_atomic(), str)
 
 
 class TestCatchupGate(unittest.TestCase):
@@ -268,9 +338,34 @@ class TestTrackDiscoverySandbox(unittest.TestCase):
     def _con_archivo_relajado(self, ruta_rel, antes, despues):
         """Relaja un invariante en el fichero y devuelve cómo deshacerlo.
 
-        Vacía además la caché de imports: si no, el check seguiría viendo
-        el módulo viejo ya cargado y el test no probaría nada.
+        **Se recarga con ``importlib.reload`` en vez de hacer
+        ``sys.modules.pop`` + reimportar.** La diferencia parece menor y no lo
+        es: ``pop`` deja vivos **dos** objetos del mismo módulo —el viejo, al
+        que apuntan todas las referencias importadas antes, y el nuevo, que
+        crea el siguiente ``import``— y a partir de ahí los dos caminos dejan
+        de verse. Con el módulo viejo sin recargar, el check leería el código
+        viejo y el test no probaría nada.
+
+        Pasaba de verdad. ``unittest`` importa **todos** los módulos de test
+        durante el descubrimiento, antes de ejecutar ninguno, así que
+        :mod:`tests.test_tasks_migracion` ya tenía el ``TrackProbe`` viejo
+        cuando estos tests se ejecutaban. Su ``mock.patch("…
+        .probe_capabilities")`` parcheaba el módulo nuevo mientras el worker
+        llamaba al viejo, el parche no interceptaba nada y el sondeo se salía
+        a la red de verdad: el test pasaba en aislamiento y fallaba en la
+        suite completa, sin explicación aparente.
+
+        ``reload`` reutiliza el mismo objeto de módulo **y su mismo
+        ``__dict__``**, así que las funciones y clases ya capturadas siguen
+        viendo los globals actualizados. Se recarga dos veces: una para que
+        el check vea el código relajado, otra para restaurarlo.
+
+        Sólo se recarga el módulo tocado, no sus submódulos: recargar de más
+        multiplicaba el tiempo de la suite sin aportar nada, porque el check
+        lee el fichero con :mod:`ast` y sólo necesita el código del módulo
+        modificado.
         """
+        import importlib
         import sys
 
         ruta = sec_check.PACKAGE_DIR / ruta_rel
@@ -278,15 +373,18 @@ class TestTrackDiscoverySandbox(unittest.TestCase):
         self.assertIn(antes, original)
         modulo = "thetvview." + ruta_rel.removesuffix(".py").replace("/", ".")
 
-        def _restaurar():
+        def _recargar() -> None:
+            mod = sys.modules.get(modulo)
+            if mod is not None:
+                importlib.reload(mod)
+
+        def _restaurar() -> None:
             ruta.write_text(original, encoding="utf-8")
-            sys.modules.pop(modulo, None)
+            _recargar()
 
         self.addCleanup(_restaurar)
-        for nombre in list(sys.modules):
-            if nombre == modulo or nombre.startswith(modulo + "."):
-                sys.modules.pop(nombre, None)
         ruta.write_text(original.replace(antes, despues), encoding="utf-8")
+        _recargar()
 
     def test_detecta_urlopen_fuera_de_safe_http(self) -> None:
         self._con_archivo_relajado(

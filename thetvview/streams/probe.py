@@ -47,10 +47,16 @@ from ..tracks.models import (
     MediaCapabilities,
     Protocol,
 )
+from ..tasks.manager import CancellationToken, TaskManager
 from .dash import parse_dash
 from .detector import detect_protocol
 from .headers import build_headers, strip_ffmpeg
 from .hls import HlsParseError, parse_hls
+
+#: Gestor compartido para los sondeos que se lanzan sueltos (sin TUI que lo
+#: pase). Dentro de la app, ``TrackSession`` inyecta el del ``App``.
+_DEFAULT_MANAGER: TaskManager | None = None
+_MANAGER_LOCK = threading.Lock()
 
 __all__ = [
     "ProbeResult",
@@ -555,10 +561,13 @@ class TrackProbe:
     cache_dir: Path | None = TRACK_CACHE_DIR
     use_cache: bool = True
 
-    _thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _result: ProbeResult | None = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _on_ready: Callable[[ProbeResult], None] | None = field(default=None, init=False, repr=False)
+    #: Handle de la tarea en marcha. Antes era un ``threading.Thread`` suelto.
+    _handle: Any = field(default=None, init=False, repr=False)
+    #: Gestor donde se lanza el sondeo. ``None`` = usa el compartido.
+    _task_manager: Any = field(default=None, init=False, repr=False, compare=False)
 
     # -- API ---------------------------------------------------------------
 
@@ -570,8 +579,9 @@ class TrackProbe:
 
     @property
     def is_running(self) -> bool:
-        thread = self._thread
-        return bool(thread and thread.is_alive())
+        """True mientras el sondeo sigue en marcha."""
+        handle = self._handle
+        return bool(handle is not None and not handle.done)
 
     def probe_now(self) -> ProbeResult:
         """Sondea en este hilo (síncrono). Nunca lanza."""
@@ -587,34 +597,88 @@ class TrackProbe:
         return result
 
     def start(self, on_ready: Callable[[ProbeResult], None] | None = None) -> None:
-        """Arranca el hilo daemon. Si ya está corriendo, no hace nada."""
+        """Arranca el sondeo en segundo plano. Si ya está corriendo, no hace nada.
+
+        Desde la fase 3 el trabajo se pide al :class:`~thetvview.tasks.manager.
+        TaskManager` en vez de crear un hilo suelto. Lo que gana, sin cambiar
+        la API: cancelación cooperativa, límite de concurrencia, y que el
+        cierre de la app pueda pararlo con plazo en vez de abandonarlo.
+
+        Args:
+            on_ready: se llama con el resultado cuando el sondeo acaba. No
+                debe tocar ``curses``: vive en un hilo de tarea.
+        """
         with self._lock:
-            if self._thread is not None and self._thread.is_alive():
+            if self._handle is not None and not self._handle.done:
                 return
             self._on_ready = on_ready
-            self._thread = threading.Thread(
-                target=self._run, name="track-probe", daemon=True
-            )
-        self._thread.start()
 
-    def stop(self, timeout: float = 0.6) -> None:
-        """Espera (breve) al hilo. Es daemon: no bloquea la salida."""
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=max(0.0, timeout))
-        self._thread = None
+        def trabajo(token: CancellationToken) -> ProbeResult:
+            resultado = self._work(token)
+            # El callback se invoca desde el hilo de tarea, como antes: la
+            # sesión que lo recibe sólo guarda el resultado y encola avisos
+            # (`_on_ready`), no toca curses. Lo que cambia es que ahora el
+            # hilo es del gestor: se puede cancelar y el cierre lo alcanza.
+            if not token.check():
+                callback = self._on_ready
+                if callback is not None:
+                    try:
+                        callback(resultado)
+                    except Exception:  # noqa: BLE001
+                        pass
+            return resultado
 
-    def _run(self) -> None:
+        self._handle = self._manager().submit(
+            "track-probe", trabajo, supersede=False
+        )
+
+    def _manager(self) -> TaskManager:
+        """El gestor a usar. Se crea uno propio si no se pasó ninguno.
+
+        El caso propio es el de los usos sueltos (``TrackProbe`` en tests o
+        fuera de la TUI); dentro de la app se le pasa el gestor de la sesión
+        para que el cierre la alcance.
+        """
+        global _DEFAULT_MANAGER
+        if self._task_manager is None:
+            with _MANAGER_LOCK:
+                if _DEFAULT_MANAGER is None:
+                    _DEFAULT_MANAGER = TaskManager(
+                        max_global=8, max_per_category=4
+                    )
+                return _DEFAULT_MANAGER
+        return self._task_manager
+
+    def _work(self, token: CancellationToken) -> ProbeResult:
+        """El sondeo en sí. Corre en un hilo de tarea.
+
+        Avisa por callback al acabar, igual que antes, pero el callback lo
+        invoca el gestor cuando la tarea termina y ya no está en su punto más
+        frágil (durante el sondeo). El contrato no cambia: si el sondeo se
+        cancela, **no** se avisa, porque un resultado de una tarea que el
+        usuario ya no espera sólo sirve para confundir.
+        """
         try:
-            result = self.probe_now()
+            resultado = self.probe_now()
         except Exception as exc:  # noqa: BLE001 - red de seguridad total
-            result = ProbeResult(
+            resultado = ProbeResult(
                 reason=redact_text(_short(str(exc))) or "El sondeo falló."
             )
-        callback = self._on_ready
-        if callback is None:
-            return
-        try:
-            callback(result)
-        except Exception:  # noqa: BLE001 - un callback roto no tumba el hilo
-            pass
+        return resultado
+
+    def stop(self, timeout: float = 0.6) -> None:
+        """Espera (breve) al sondeo.
+
+        Pide cancelación primero, para que el worker no se quede bajando un
+        manifiesto que ya no le sirve a nadie, y sólo después espera el plazo.
+        """
+        handle = self._handle
+        if handle is not None:
+            handle.cancel("el canal ya no es el mismo")
+            handle.join(timeout=max(0.0, timeout))
+            self._handle = None
+
+    @property
+    def is_running(self) -> bool:
+        handle = self._handle
+        return bool(handle is not None and not handle.done)

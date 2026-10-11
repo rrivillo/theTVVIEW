@@ -245,8 +245,9 @@ class TestIdentidad(BaseRecentsTemporal):
 class TestDatosDanadosYOrden(BaseRecentsTemporal):
     def test_json_corrupto_no_impide_abrir(self) -> None:
         self.ruta.write_text("{esto no es json", encoding="utf-8")
+        # Un historial roto no impide abrir la app: se trata como vacío
+        # y se puede seguir escribiendo encima.
         self.assertEqual(self.rm.load(), [])
-        # Y se puede seguir escribiendo encima sin que sea un error fatal.
         self.rm.push(Channel(name="La 1", url="http://a.test/1"), player="mpv")
         self.assertEqual(len(self.rm.load()), 1)
 

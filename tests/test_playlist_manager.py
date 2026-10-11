@@ -47,9 +47,31 @@ class TestPlaylistManager(unittest.TestCase):
         self.assertFalse(self.mgr.remove("borrable"))  # ya no existe
 
     def test_json_corrupto_lanza_error_amigable(self) -> None:
+        # El store lanza StorageError; el módulo lo traduce a PlaylistError,
+        # que es el contrato que la TUI sabe presentar en un modal.
         self.path.write_text("{no es json", encoding="utf-8")
         with self.assertRaises(PlaylistError):
             self.mgr.load()
+
+    def test_el_error_de_corrupcion_es_del_tipo_que_la_ui_maneja(self) -> None:
+        """La corrupción debe salir como ``PlaylistError``, no como ``StorageError``.
+
+        La TUI captura ``PlaylistError`` en los puntos donde lee el catálogo;
+        si escapara un ``StorageError`` —que es de otra jerarquía— la pantalla
+        se quedaría a medias en vez de mostrar el aviso (STORE-004).
+        """
+        self.path.write_text("{no es json", encoding="utf-8")
+        with self.assertRaises(PlaylistError):
+            self.mgr.load()
+
+    def test_la_corrupcion_conserva_copia_para_diagnostico(self) -> None:
+        """El fichero dañado se conserva: no se sobrescribe ni se pierde."""
+        self.path.write_text("{no es json", encoding="utf-8")
+        with self.assertRaises(PlaylistError):
+            self.mgr.load()
+        copias = list(self.path.parent.glob(".playlists.json.corrupt-*"))
+        self.assertEqual(len(copias), 1)
+        self.assertEqual(copias[0].read_text(encoding="utf-8"), "{no es json")
 
     def test_formato_no_lista_lanza_error(self) -> None:
         self.path.write_text(json.dumps({"name": "x"}), encoding="utf-8")

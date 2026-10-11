@@ -15,6 +15,9 @@ from pathlib import Path
 from .models import Channel
 from .security.local_files import chmod_private
 from .security.redaction import needs_redaction_for_storage, redact_text
+from .storage.errors import StorageError
+from .storage.json_store import atomic_write_json, file_lock, read_json_with_recovery
+from .storage.schemas import validate_favorites
 from .stream_ref import is_opaque_ref
 
 
@@ -40,25 +43,32 @@ class FavoritesManager:
     # --- Persistencia -------------------------------------------------------
 
     def _read(self) -> list[dict]:
-        if not self.path.exists():
-            return []
+        """Lee el fichero de favoritos.
+
+        El store lanza :class:`StorageError` cuando el JSON está corrupto, y
+        aquí se traduce a :class:`FavoritesError`: el contrato de este módulo
+        es "favoritos o un error de favoritos", y quien lo llama —la TUI— ya
+        sabe presentar ese tipo en un modal. Dejar que ``StorageError``
+        escapara significaría que una corrupción de ``favorites.json``
+        reventara la pantalla en vez de explicarse.
+        """
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise FavoritesError(
-                f"No se pudo leer {self.path}: {exc.__class__.__name__}. "
-                "El archivo puede estar corrupto."
-            ) from exc
+            data = read_json_with_recovery(self.path, schema_version=None)
+        except StorageError as exc:
+            raise FavoritesError(str(exc)) from exc
+        if data is None:
+            return []
         if not isinstance(data, list):
             raise FavoritesError(f"Formato inesperado en {self.path} (se esperaba lista).")
         return [e for e in data if isinstance(e, dict)]
 
     def _write(self, channels: list[Channel]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        payload = json.dumps([asdict(c) for c in channels], ensure_ascii=False, indent=2)
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(self.path)  # atómico en POSIX
+        atomic_write_json(
+            self.path,
+            [asdict(c) for c in channels],
+            schema_version=None,
+            validate=validate_favorites,
+        )
         chmod_private(self.path)  # 0600: puede traer URLs con login heredadas
         self._cache = list(channels)
         try:
@@ -127,26 +137,33 @@ class FavoritesManager:
         return channel.url in self.favorite_urls()
 
     def toggle(self, channel: Channel) -> bool:
-        """Añade o quita el canal. True si quedó como favorito."""
+        """Añade o quita el canal. True si quedó como favorito.
+
+        Todo el par leer-modificar-escribir va bajo el candado del fichero
+        (STORE-006): sin él, dos llamadas simultáneas podían leer la misma
+        lista y la segunda escritura se comía el cambio de la primera.
+        """
         channel = self._clean(channel)
-        entries = self.load()
-        kept = [c for c in entries if c.url != channel.url]
-        if len(kept) != len(entries):
-            self._write(kept)
-            return False
-        entries.append(channel)
-        self._write(entries)
-        return True
+        with file_lock(self.path):
+            entries = self.load()
+            kept = [c for c in entries if c.url != channel.url]
+            if len(kept) != len(entries):
+                self._write(kept)
+                return False
+            entries.append(channel)
+            self._write(entries)
+            return True
 
     def remove(self, channel: Channel) -> bool:
         """Quita por url. Devuelve True si se eliminó algo."""
         channel = self._clean(channel)
-        entries = self.load()
-        kept = [c for c in entries if c.url != channel.url]
-        if len(kept) == len(entries):
-            return False
-        self._write(kept)
-        return True
+        with file_lock(self.path):
+            entries = self.load()
+            kept = [c for c in entries if c.url != channel.url]
+            if len(kept) == len(entries):
+                return False
+            self._write(kept)
+            return True
 
     @staticmethod
     def _clean(channel: Channel) -> Channel:

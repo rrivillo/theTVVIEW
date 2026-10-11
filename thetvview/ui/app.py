@@ -23,6 +23,8 @@ from thetvview.platform_check import OS_WINDOWS, detect_os
 from thetvview.playlist_manager import PlaylistError, PlaylistManager
 from thetvview.prefs import PrefsManager
 from thetvview.recents import RecentsManager
+from thetvview.stream_ref import is_opaque_ref
+from thetvview.tasks.manager import CancellationToken, TaskManager
 
 from . import colors, theme
 from .errormsg import describe_playlist_error
@@ -533,6 +535,30 @@ def _is_plain_http(source: str) -> bool:
     return (source or "").strip().lower().startswith("http://")
 
 
+class _EpgLoadOutcome:
+    """Lo que devuelve el worker de EPG. Lo aplica el hilo principal.
+
+    Existe para que el hilo de descarga **no** escriba en `self.epg`: entre
+    que termina de descargar y que el hilo principal drena la cola hay una
+    ventana en la que el usuario puede haber cambiado de lista. Si el worker
+    escribiera directamente, ese EPG antiguo aparecería sobre el nuevo.
+    """
+
+    __slots__ = ("epg", "source", "error", "cancelled")
+
+    def __init__(
+        self,
+        epg: Epg | None = None,
+        source: str = "",
+        error: str = "",
+        cancelled: bool = False,
+    ) -> None:
+        self.epg = epg
+        self.source = source
+        self.error = error
+        self.cancelled = cancelled
+
+
 class App:
     """Estado global + stack de pantallas + bucle de eventos."""
     def __init__(self, stdscr: curses.window) -> None:
@@ -559,6 +585,10 @@ class App:
         self._epg_auto_source: str | None = None
         # Carga en segundo plano del EPG que declara la playlist abierta.
         self._epg_load_thread: threading.Thread | None = None
+        # Gestor común de tareas: toda la carga en segundo plano pasa por aquí
+        # (generación, cancelación, límites y publicación por cola). El worker
+        # no toca la interfaz; el hilo principal drena en _drain_tasks().
+        self._tasks = TaskManager(max_global=4, max_per_category=2)
         self._epg_failed: dict[str, float] = {}
         self.theme_name: str = self.prefs.load().theme or config.load_theme()
         self.playlist_cache: dict[str, Playlist] = {}
@@ -574,7 +604,19 @@ class App:
         self._warm_queue: list[str] = []
         self._warm_queued: set[str] = set()
         self._warm_failed: dict[str, float] = {}
-        self._warm_thread: threading.Thread | None = None
+        #: ``True`` mientras haya una tanda de warming en marcha. Antes era el
+        #: ``threading.Thread``; ahora el hilo lo tiene el gestor de tareas y
+        #: esto sólo dice «¿hay alguien descargas?», que es lo que necesita
+        #: saber el resto del código.
+        self._warm_thread: bool = False
+        #: Señal de cancelación cooperativa del warming del catálogo. La
+        #: comprueba el worker entre fuentes; el cierre la pone para no
+        #: depender de que el hilo termine por su cuenta (TASK-004).
+        self._warm_stop = threading.Event()
+        #: Claves pendiente de indexar. El worker no indexa (eso es del hilo
+        #: principal), así que las anota aquí para que `_drain_tasks` las
+        #: resuelva al recibir el resultado.
+        self._warm_indexes: list[str] = []
         # Sesión de pistas del canal abierto (audio/subtítulos/calidad).
         # Vive aquí para que el sondeo sobreviva al cambio de pantalla y para
         # que el flujo "reproductor -> opciones de pistas -> reproducir" tenga
@@ -807,6 +849,12 @@ class App:
         Llena la caché de sesión fuera del hilo de la interfaz para que
         variants_for(catalog=False) encuentre variantes entre listas sin
         bloquear la pantalla. Idempotente: lo ya cargado o en cola se salta.
+
+        El trabajo se pide al :class:`~thetvview.tasks.manager.TaskManager`:
+        el hilo **descarga y devuelve**, y quien lo indexa y lo mete en la
+        caché es el bucle principal (:meth:`_drain_tasks`). Antes el worker
+        escribía en `playlist_cache` desde su propio hilo, que es la misma
+        carrera que se corrigió para el EPG.
         """
         pending = self.pending_catalog_sources()
         if not pending and self._first_unindexed() is None:
@@ -821,11 +869,10 @@ class App:
             ]
             self._warm_queue.extend(fresh)
             self._warm_queued.update(fresh)
-            if self._warm_thread is None:
-                self._warm_thread = threading.Thread(
-                    target=self._warm_worker, name="catalog-warm", daemon=True
-                )
-                self._warm_thread.start()
+            if not self._warm_thread:
+                self._warm_stop.clear()
+                self._warm_thread = True
+                self._tasks.submit("catalog-warm", self._warm_worker)
 
     def _first_unindexed(self) -> tuple[str, Playlist] | None:
         """Primera playlist cacheada sin índice, para construirlo en caliente."""
@@ -834,29 +881,53 @@ class App:
                 return key, playlist
         return None
 
-    def _warm_worker(self) -> None:
-        """Hilo daemon: primero indexa lo ya parseado, luego descarga el resto."""
+    def _warm_worker(self, token: CancellationToken) -> None:
+        """Descarga las fuentes en cola. **No toca la caché**: sólo devuelve.
+
+        Devuelve la lista de ``(source, playlist)`` que pudo cargar. Quien las
+        indexa y las mete en `playlist_cache` es :meth:`_drain_tasks`, en el
+        hilo principal: mutar el modelo desde un hilo de descarga es lo que
+        producía estados a medias.
+
+        La cancelación es cooperativa y se comprueba entre fuentes, que es
+        donde se puede parar sin dejar nada a medias.
+        """
+        cargadas: list[tuple[str, Playlist]] = []
         try:
-            while True:
+            while not token.check():
                 unindexed = self._first_unindexed()
                 if unindexed is not None:
-                    self._base_index(*unindexed)
-                    continue
+                    # Indexar es rápido y sólo toca el hilo principal. Aquí no
+                    # se puede (es estado compartido), así que se anota la
+                    # clave y sigue: el bucle tiene tope para no girar
+                    # indefinidamente esperando a que el principal lo haga.
+                    clave = unindexed[0]
+                    if clave not in self._warm_indexes:
+                        self._warm_indexes.append(clave)
+                        continue
+                    # Ya está anotada y el principal aún no la ha tomado: no
+                    # tiene sentido seguir pidiendo lo mismo.
+                    with self._warm_lock:
+                        vacia = not self._warm_queue
+                    if vacia:
+                        return cargadas
                 with self._warm_lock:
                     if not self._warm_queue:
-                        # Sale con el candado puesto: warm_catalog no puede
-                        # quedar con cola sin hilo que la procese.
-                        self._warm_thread = None
-                        return
+                        return cargadas
                     source = self._warm_queue.pop(0)
+                if token.check():
+                    # Cancelado justo al sacar la fuente: se devuelve a la
+                    # cola para que la siguiente tanda la recoja.
+                    with self._warm_lock:
+                        self._warm_queue.insert(0, source)
+                    return cargadas
                 try:
                     playlist = load_playlist_source(
                         source, allow_private=self._allow_private_for(source)
                     )
                     if playlist is None:
                         raise ValueError(f"fuente ilegible: {source}")
-                    self.remember_playlist(source, playlist)
-                    self._base_index(source, playlist)
+                    cargadas.append((source, playlist))
                 except Exception:  # red caída/fuente inválida: se reintenta luego
                     with self._warm_lock:
                         self._warm_failed[source] = time.monotonic()
@@ -867,7 +938,8 @@ class App:
             # Red de seguridad: si el hilo muere por algo imprevisto, la
             # próxima llamada a warm_catalog() pueda relanzarlo.
             with self._warm_lock:
-                self._warm_thread = None
+                self._warm_thread = False
+        return cargadas
 
     def siguiente_tema(self) -> str:
         """El tema que sigue al actual en el ciclo de los tres (puro)."""
@@ -1235,12 +1307,160 @@ class App:
         self._undo_stack.append({"action": "restore_playlist", "entry": saved})
         self._confirm_remove_playlist(name, source=entry.source)
 
+    def referencias_a_lista(self, source: str) -> dict[str, int]:
+        """Cuántos favoritos y recientes apuntan a esta lista (STORE-006).
+
+        Borrar una lista no debería dejar direcciones apuntando a un servidor
+        que ya no está en el catálogo: esos favoritos y recientes son
+        inservibles y lo raro es que el usuario se entere por su cuenta. Antes
+        de borrar, se cuenta y se dice en el modal; después, se limpian.
+
+        Se compara por dos vías, porque con cualquiera de las dos sola se
+        escaparían casos:
+
+        - **mismo servidor**: la lista es una URL y los canales cuelgan de ese
+          host (caso normal en M3U);
+        - **mismo ``tvg-id``**: la lista es Xtream y sus canales son
+          referencias opacas que no contienen ni el host ni la ruta.
+
+        Returns:
+            ``{"favoritos": n, "recientes": m}``, con ceros si no hay nada.
+        """
+        from urllib.parse import urlsplit
+
+        vacio = {"favoritos": 0, "recientes": 0}
+        if not (source or "").strip():
+            return vacio
+
+        host_lista = ""
+        if source.strip().lower().startswith(("http://", "https://")):
+            try:
+                host_lista = (urlsplit(source.strip()).hostname or "").lower()
+            except ValueError:
+                host_lista = ""
+
+        # `tvg-id` de los canales de la lista, si está en caché: es la única
+        # forma de reconocer los canales de una fuente Xtream.
+        ids: set[str] = set()
+        playlist = self.cached_playlist(source)
+        if playlist is not None:
+            for canal in playlist.channels:
+                if canal.tvg_id:
+                    ids.add(str(canal.tvg_id))
+
+        def _de_la_lista(url: str, tvg_id: str | None) -> bool:
+            if tvg_id and str(tvg_id) in ids:
+                return True
+            if not host_lista:
+                return False
+            if is_opaque_ref(url or ""):
+                return False
+            try:
+                return (urlsplit(url or "").hostname or "").lower() == host_lista
+            except ValueError:
+                return False
+
+        try:
+            favoritos = sum(
+                1 for c in self.favorites.load() if _de_la_lista(c.url, c.tvg_id)
+            )
+        except Exception:
+            favoritos = 0
+        try:
+            recientes = sum(
+                1 for i in self.recents.load() if _de_la_lista(i.url, i.tvg_id)
+            )
+        except Exception:
+            recientes = 0
+        return {"favoritos": favoritos, "recientes": recientes}
+
+    def limpiar_referencias_a_lista(self, source: str) -> int:
+        """Quita los favoritos y recientes que apuntan a `source`. Devuelve cuántos.
+
+        Se llama justo después de borrar la lista, y **sólo** sobre lo que el
+        modal ya le ha adelantado al usuario. Lo que no se puede quitar (un
+        error de escritura) se cuenta igual, para que el número que ve antes
+        y después case.
+        """
+        cuentas = self.referencias_a_lista(source)
+        if not cuentas["favoritos"] and not cuentas["recientes"]:
+            return 0
+        ids: set[str] = set()
+        playlist = self.cached_playlist(source)
+        if playlist is not None:
+            ids = {str(c.tvg_id) for c in playlist.channels if c.tvg_id}
+        host_lista = ""
+        if source.strip().lower().startswith(("http://", "https://")):
+            from urllib.parse import urlsplit
+
+            try:
+                host_lista = (urlsplit(source.strip()).hostname or "").lower()
+            except ValueError:
+                host_lista = ""
+
+        def _de_la_lista(url: str, tvg_id: str | None) -> bool:
+            if tvg_id and str(tvg_id) in ids:
+                return True
+            if not host_lista or is_opaque_ref(url or ""):
+                return False
+            from urllib.parse import urlsplit
+
+            try:
+                return (urlsplit(url or "").hostname or "").lower() == host_lista
+            except ValueError:
+                return False
+
+        quitados = 0
+        try:
+            for canal in list(self.favorites.load()):
+                if _de_la_lista(canal.url, canal.tvg_id):
+                    self.favorites.remove(canal)
+                    quitados += 1
+        except Exception:
+            pass
+        try:
+            for item in list(self.recents.load()):
+                if _de_la_lista(item.url, item.tvg_id):
+                    self.recents.remove(item.url)
+                    quitados += 1
+        except Exception:
+            pass
+        return quitados
+
     def _confirm_remove_playlist(self, name: str, source: str | None = None) -> None:
         from .actions import V
         from .widgets import Modal, modal_actions
 
-        modal = Modal("Confirmar", f"¿Eliminar playlist '{name}'?", ["Cancelar", "Eliminar"],
-                      actions=modal_actions(confirmar=V.ELIMINAR))
+        # STORE-006: antes de borrar, se cuenta lo que quedaría huérfano y se
+        # dice en el modal. Borrar en silencio y dejar favoritos inservibles
+        # es la forma de que el usuario pierda datos sin enterarse.
+        aviso = ""
+        if source:
+            cuentas = self.referencias_a_lista(source)
+            if cuentas["favoritos"] or cuentas["recientes"]:
+                partes = []
+                if cuentas["favoritos"]:
+                    partes.append(
+                        f"{cuentas['favoritos']} favorito"
+                        f"{'s' if cuentas['favoritos'] != 1 else ''}"
+                    )
+                if cuentas["recientes"]:
+                    partes.append(
+                        f"{cuentas['recientes']} reciente"
+                        f"{'s' if cuentas['recientes'] != 1 else ''}"
+                    )
+                aviso = (
+                    "Al eliminarla también se quitarán "
+                    + " y ".join(partes)
+                    + " que apuntan a esta lista, porque dejarían de funcionar."
+                )
+
+        modal = Modal(
+            "Confirmar",
+            f"¿Eliminar playlist '{name}'?" + (f"\n\n{aviso}" if aviso else ""),
+            ["Cancelar", "Eliminar"],
+            actions=modal_actions(confirmar=V.ELIMINAR),
+        )
         modal.selected_button = 0
         stdscr = self.stdscr
         # Render loop del modal
@@ -1288,6 +1508,11 @@ class App:
         except PlaylistError as exc:
             self.status.show(str(exc), error=True)
             return
+        if removed and source:
+            # Las referencias huérfanas se limpian **después** de borrar, y
+            # sólo si el borrado funcionó: si la lista sigue ahí, sus canales
+            # siguen sirviendo.
+            self.limpiar_referencias_a_lista(source)
         if source:
             self.forget_playlist(source)
         self.screen.reload()
@@ -1398,50 +1623,136 @@ class App:
         # El EPG lo declara la propia lista: hereda su excepción anti-SSRF.
         allow_private = self._allow_private_for(getattr(playlist, "source", "") or "")
         self.status.show(f"Cargando el EPG de '{name}'…")
-        worker = threading.Thread(
-            target=self._epg_load_worker,
-            args=(pending, allow_private),
-            name="epg-load",
-            daemon=True,
+        # La carga va por el gestor de tareas: la aplica el hilo principal al
+        # drenar la cola. El worker **solo** devuelve el resultado y nunca
+        # toca `self.epg` ni la barra de estado (TASK-003).
+        handle = self._tasks.submit(
+            "epg-load", self._epg_load_worker, pending, allow_private
         )
-        self._epg_load_thread = worker
-        worker.start()
+        # Se conserva el hilo vivo para las comprobaciones existentes
+        # (carga en curso, espera acotada) sin duplicar el estado.
+        self._epg_load_thread = handle.thread
         return True
 
-    def _epg_load_worker(self, sources: list[str], allow_private: bool = False) -> None:
-        """Hilo daemon: prueba las fuentes en orden y se queda con la primera.
+    def _epg_load_worker(
+        self,
+        token: CancellationToken,
+        sources: list[str],
+        allow_private: bool = False,
+    ) -> "_EpgLoadOutcome":
+        """Worker: prueba las fuentes en orden y devuelve la primera que sirve.
 
-        `allow_private` es la excepción anti-SSRF de la lista que declaró
-        estas fuentes (SDD §11); viaja en el hilo para no leer el catálogo
-        desde otro thread.
+        **No** modifica `self.epg` ni llama a `self.status`: eso lo hace el
+        hilo principal al drenar (:meth:`_drain_tasks`). Este worker es puro
+        respecto a la interfaz, que es lo que permite que un resultado tarde
+        lo que tarde en llegar sin tocar curses.
+
+        Args:
+            token: cancelación cooperativa. Lo pasa ``TaskManager.submit`` y
+                va primero porque es el parámetro fijo de todo trabajador;
+                se comprueba entre fuentes para no seguir probando una lista
+                que el usuario ya cambió.
+            sources: fuentes a probar, en orden de preferencia.
+            allow_private: excepción anti-SSRF de la lista que declaró estas
+                fuentes (SDD §11); viaja en el hilo para no leer el catálogo
+                desde otro thread.
+
+        Returns:
+            :class:`_EpgLoadOutcome` con el EPG cargado o el motivo del fallo.
         """
         last_error = ""
-        try:
-            for src in sources:
-                try:
-                    epg = load_epg_source(src, allow_private=allow_private)
-                except (OSError, ValueError) as exc:
-                    last_error = str(exc)
-                    self._epg_failed[src] = time.monotonic()
-                    continue
-                self.epg = epg
-                self.epg_source = src
-                self._epg_auto_source = src
-                self._epg_failed.pop(src, None)
-                self.status.show(f"EPG cargado de la lista ({len(epg.programs)} canales).")
-                return
-            self.status.show(
-                f"No se pudo cargar el EPG de la lista: {last_error or 'fuente ilegible'}",
-                error=True,
-            )
-        finally:
+        for src in sources:
+            if token.check():
+                return _EpgLoadOutcome(cancelled=True)
+            try:
+                epg = load_epg_source(src, allow_private=allow_private)
+            except (OSError, ValueError) as exc:
+                last_error = str(exc)
+                self._epg_failed[src] = time.monotonic()
+                continue
+            return _EpgLoadOutcome(epg=epg, source=src)
+        return _EpgLoadOutcome(error=last_error or "fuente ilegible")
+
+    def _drain_catalog_warm(self) -> None:
+        """Aplica lo que descargó el warming del catálogo.
+
+        Aquí se indexa y se mete en `playlist_cache`, que es estado que el
+        resto de la app lee. Que lo haga el hilo principal es lo que evita la
+        carrera que antes existía con el worker.
+        """
+        for resultado in self._tasks.drain("catalog-warm"):
+            if resultado.obsolete or resultado.cancelled:
+                continue
+            salida = resultado.value
+            if isinstance(salida, list):
+                for source, playlist in salida:
+                    try:
+                        self.remember_playlist(source, playlist)
+                        self._base_index(source, playlist)
+                    except Exception:
+                        # Una lista que no se puede indexar no puede impedir
+                        # que se indexen las demás.
+                        continue
+        # Las claves que el worker dejó sin indexar se resuelven aquí.
+        while self._warm_indexes:
+            clave = self._warm_indexes.pop(0)
+            playlist = self.playlist_cache.get(clave)
+            if playlist is None:
+                continue
+            try:
+                self._base_index(clave, playlist)
+            except Exception:
+                continue
+
+    def _drain_tasks(self) -> None:
+        """Aplica los resultados de tareas pendientes (sólo hilo principal).
+
+        Es el único punto donde un resultado de segundo plano toca el modelo
+        y la interfaz. Un resultado obsoleto —porque el usuario cambió de
+        lista mientras cargaba— se descarta aquí: ya hizo su limpieza, pero no
+        puede pisar lo más reciente.
+        """
+        self._drain_catalog_warm()
+        for resultado in self._tasks.drain("epg-load"):
+            if resultado.obsolete or resultado.cancelled:
+                self._epg_load_thread = None
+                continue
+            salida = resultado.value
             self._epg_load_thread = None
+            if isinstance(salida, _EpgLoadOutcome):
+                if salida.cancelled:
+                    continue
+                if salida.epg is not None and salida.source:
+                    self.epg = salida.epg
+                    self.epg_source = salida.source
+                    self._epg_auto_source = salida.source
+                    self._epg_failed.pop(salida.source, None)
+                    self.status.show(
+                        f"EPG cargado de la lista "
+                        f"({len(salida.epg.programs)} canales)."
+                    )
+                else:
+                    self.status.show(
+                        "No se pudo cargar el EPG de la lista: "
+                        f"{salida.error or 'fuente ilegible'}",
+                        error=True,
+                    )
+            elif resultado.error is not None:
+                # El worker lanzó: se explica sin volcar la traza.
+                self.status.show(
+                    "No se pudo cargar el EPG de la lista: "
+                    f"{resultado.error.__class__.__name__}",
+                    error=True,
+                )
 
     def wait_for_epg_load(self, timeout: float = EPG_WAIT_S) -> bool:
         """Espera a lo sumo `timeout` s a que termine la carga en curso.
 
         True si no queda ninguna carga en marcha (terminó bien, falló o no
         la había); False si sigue cargando al agotarse el tiempo.
+
+        Tras la espera, drena la cola: quien llama (los tests y el arranque)
+        quiere ver el efecto, y el efecto se aplica en el hilo principal.
         """
         thread = self._epg_load_thread
         if thread is not None and thread.is_alive():
@@ -1449,6 +1760,7 @@ class App:
             thread = self._epg_load_thread
             if thread is not None and thread.is_alive():
                 return False
+        self._drain_tasks()
         return True
 
     def ensure_epg(
@@ -2420,6 +2732,65 @@ class App:
             curses.mousemask(curses.ALL_MOUSE_EVENTS)
         except Exception:
             pass
+        try:
+            self._bucle_principal()
+        finally:
+            # Cierre acotado (TASK-004). Va en el `finally` para que también
+            # salte si el bucle revienta por una excepción: salir nunca deja
+            # hilos de carga sigueños ni el proxy levantado.
+            self._cerrar_recursos()
+
+    def _cerrar_recursos(self, join_timeout: float = 2.0) -> None:
+        """Apaga todo lo que vive fuera del hilo principal, con plazo.
+
+        El orden importa: primero se para el Reproductor (el usuario puede
+        querer que siga abierto en el modo «no cerrar»), después las tareas
+        en segundo plano, y al final el proxy de calidad. Cada paso tiene su
+        propio ``try/except``: que falle uno no impide cerrar los demás.
+        """
+        # 1. Reproductores y sondas de la pantalla actual.
+        try:
+            pantalla = self.screen
+            if hasattr(pantalla, "stop_health"):
+                pantalla.stop_health()
+        except Exception:
+            pass
+        try:
+            pantalla = self.screen
+            if hasattr(pantalla, "stop_tracks"):
+                pantalla.stop_tracks()
+        except Exception:
+            pass
+
+        # 2. Señal de parada del warming del catálogo. El worker la comprueba
+        #    entre fuentes; el gestor se encarga de la espera con plazo.
+        try:
+            self._warm_stop.set()
+        except Exception:
+            pass
+
+        # 3. Tareas en segundo plano: no se admiten más, se cancelan las vivas
+        #    (warming, EPG y sondeo de pistas) y se espera como mucho
+        #    `join_timeout` en total.
+        try:
+            self._tasks.shutdown(join_timeout=join_timeout)
+        except Exception:
+            pass
+
+        # 4. Carga del EPG en curso.
+        try:
+            hilo = self._epg_load_thread
+            if hilo is not None and hilo.is_alive():
+                hilo.join(timeout=0.6)
+            self._epg_load_thread = None
+        except Exception:
+            pass
+        self._warm_thread = None
+
+    def _bucle_principal(self) -> None:
+        """El bucle de la TUI. Vive aparte para que `run()` pueda envolverlo
+        en el `finally` de cierre sin indentarlo entero."""
+        stdscr = self.stdscr
         while True:
             sesion = self.track_session
             if (
@@ -2452,6 +2823,13 @@ class App:
                 stdscr.getch()
                 continue
 
+            # Resultados de las tareas en segundo plano: se aplican aquí, en el
+            # hilo de la interfaz. Es lo que impide que un worker toque curses
+            # o pise un resultado más reciente (TASK-002/TASK-003).
+            try:
+                self._drain_tasks()
+            except Exception:
+                pass
             # Avisos del sondeo de pistas: se sacan aquí, en el hilo de la
             # interfaz, porque un modal desde un hilo secundario no es
             # seguro con curses.

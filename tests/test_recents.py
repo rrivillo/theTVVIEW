@@ -50,6 +50,8 @@ class TestRecentsManager(unittest.TestCase):
             self.assertEqual(rm.load(), [])
 
     def test_load_tolera_json_roto(self):
+        # Un historial roto no impide abrir la app: el store conserva una
+        # copia .corrupt-* y el historial vuelve a empezar vacío.
         with tempfile.TemporaryDirectory() as td:
             ruta = Path(td) / "recents.json"
             ruta.write_text("{no es json", encoding="utf-8")

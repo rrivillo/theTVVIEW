@@ -19,6 +19,9 @@ from pathlib import Path
 
 from .security.local_files import chmod_private
 from .security.secrets import get_store
+from .storage.errors import StorageError
+from .storage.json_store import atomic_write_json, file_lock, read_json_with_recovery
+from .storage.schemas import validate_playlist_list
 
 
 # Prefijo de source que identifica una lista Xtream API.
@@ -116,29 +119,31 @@ class PlaylistManager:
     # --- Persistencia -----------------------------------------------------
 
     def _read(self) -> list[dict]:
-        if not self.path.exists():
-            return []
+        """Lee el catálogo.
+
+        Traduce el :class:`StorageError` del store a :class:`PlaylistError`:
+        el contrato del módulo es "catálogo o error de catálogo", y quien lo
+        llama —la TUI— ya sabe presentar ese tipo en un modal. Sin esta
+        traducción, un ``playlists.json`` corrupto escaparía como una
+        excepción que nadie espera y la pantalla se quedaría a medias.
+        """
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise PlaylistError(
-                f"No se pudo leer {self.path}: {exc.__class__.__name__}. "
-                "El archivo puede estar corrupto."
-            ) from exc
+            data = read_json_with_recovery(self.path, schema_version=None)
+        except StorageError as exc:
+            raise PlaylistError(str(exc)) from exc
+        if data is None:
+            return []
         if not isinstance(data, list):
             raise PlaylistError(f"Formato inesperado en {self.path} (se esperaba lista).")
         return [e for e in data if isinstance(e, dict)]
 
     def _write(self, entries: list[PlaylistEntry]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        payload = json.dumps(
+        atomic_write_json(
+            self.path,
             [e.to_dict() for e in entries],
-            ensure_ascii=False,
-            indent=2,
+            schema_version=None,
+            validate=validate_playlist_list,
         )
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(self.path)  # atómico en POSIX
         # Sin passwords dentro, pero igualmente restringimos a 0o600.
         chmod_private(self.path)
 
@@ -220,17 +225,21 @@ class PlaylistManager:
         name, source = name.strip(), source.strip()
         if not name or not source:
             raise PlaylistError("Nombre y origen son obligatorios.")
-        entries = self.load()
-        if any(e.name == name for e in entries):
-            raise PlaylistError(f"Ya existe una playlist llamada '{name}'.")
-        entry = PlaylistEntry(
-            name=name,
-            source=source,
-            kind="m3u",
-            allow_private_network=bool(allow_private_network),
-        )
-        entries.append(entry)
-        self._write(entries)
+        # Candado sobre el par leer-modificar-escribir (STORE-006): sin él,
+        # dos altas simultáneas con el mismo nombre podían pasar ambas la
+        # comprobación de duplicados y dejar dos entradas iguales.
+        with file_lock(self.path):
+            entries = self.load()
+            if any(e.name == name for e in entries):
+                raise PlaylistError(f"Ya existe una playlist llamada '{name}'.")
+            entry = PlaylistEntry(
+                name=name,
+                source=source,
+                kind="m3u",
+                allow_private_network=bool(allow_private_network),
+            )
+            entries.append(entry)
+            self._write(entries)
         return entry
 
     def add_xtream(
@@ -376,12 +385,13 @@ class PlaylistManager:
 
         Devuelve True si se eliminó algo.
         """
-        entry = self.get(name)
-        entries = self.load()
-        kept = [e for e in entries if e.name != name]
-        if len(kept) == len(entries):
-            return False
-        self._write(kept)
+        with file_lock(self.path):
+            entry = self.get(name)
+            entries = self.load()
+            kept = [e for e in entries if e.name != name]
+            if len(kept) == len(entries):
+                return False
+            self._write(kept)
         # El secreto ya no tiene dueño: borrarlo del almacén.
         if entry is not None and entry.is_xtream:
             try:

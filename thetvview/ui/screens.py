@@ -2701,11 +2701,21 @@ class NowPlayingScreen(Screen):
         if health_monitor is not None:
             self.health = health_monitor
         else:
+            # El gestor de tareas de la app: así el monitor entra en el
+            # cierre acotado y no es un hilo suelto que la app no alcanza.
+            # `getattr` porque los tests montan la pantalla con dobles.
+            tasks = getattr(app, "_tasks", None)
             try:
-                self.health = ChannelHealthMonitor(channel, interval=3.0, timeout=3.0, auto_start=True)
+                self.health = ChannelHealthMonitor(
+                    channel, interval=3.0, timeout=3.0, auto_start=True,
+                    task_manager=tasks,
+                )
             except Exception:
                 # degradar silencioso si no se puede crear el monitor
-                self.health = ChannelHealthMonitor(channel, interval=10.0, timeout=2.0, auto_start=False)
+                self.health = ChannelHealthMonitor(
+                    channel, interval=10.0, timeout=2.0, auto_start=False,
+                    task_manager=tasks,
+                )
 
     def header_context(self) -> str:
         return f"{icons.ICON_PLAY} Reproduciendo"

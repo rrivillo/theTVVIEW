@@ -32,6 +32,12 @@ data/track_cache/
 data/ipc/
 docs/plan-xtream-tui.md
 
+# Temporales y copias de recuperación de la escritura atómica.
+# Nunca son estado persistente: son restos de una escritura interrupted.
+data/.*.tmp
+data/.*.bak-*
+data/.*.corrupt-*
+
 # Archivos de sistema y editores
 .DS_Store
 Thumbs.db

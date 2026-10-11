@@ -142,7 +142,7 @@ class TestRun(unittest.TestCase):
     def test_arranca_ui_tras_preflight(self):
         from thetvview import __main__ as entry
 
-        with mock.patch.object(
+        with mock.patch.object(sys, "argv", ["thetvview"]), mock.patch.object(
             entry, "resolve_os", return_value=pc.OS_LINUX
         ) as resolve, mock.patch.object(entry, "prepare_console") as prep, mock.patch.object(
             entry, "curses_problem", return_value=None
@@ -158,7 +158,9 @@ class TestRun(unittest.TestCase):
         from thetvview import __main__ as entry
 
         stderr = io.StringIO()
-        with mock.patch.object(entry, "resolve_os", return_value=pc.OS_WINDOWS), mock.patch.object(
+        with mock.patch.object(sys, "argv", ["thetvview"]), mock.patch.object(
+            entry, "resolve_os", return_value=pc.OS_WINDOWS
+        ), mock.patch.object(
             entry, "prepare_console"
         ), mock.patch.object(
             entry, "curses_problem", return_value="pip install windows-curses"
@@ -174,7 +176,9 @@ class TestRun(unittest.TestCase):
     def test_ctrl_c_sale_limpio(self):
         from thetvview import __main__ as entry
 
-        with mock.patch.object(entry, "resolve_os", return_value=pc.OS_LINUX), mock.patch.object(
+        with mock.patch.object(sys, "argv", ["thetvview"]), mock.patch.object(
+            entry, "resolve_os", return_value=pc.OS_LINUX
+        ), mock.patch.object(
             entry, "prepare_console"
         ), mock.patch.object(entry, "curses_problem", return_value=None), mock.patch.object(
             entry, "_launch", side_effect=KeyboardInterrupt

@@ -40,22 +40,25 @@ Contrato de errores
 por el código HTTP (lo devuelven para que el caller decida);
 ``get_bytes``/``get_text``/``get_json``/``stream`` sí.
 
-**Residual conocido:** la validación DNS ocurre *antes* de conectar y se
-repite en cada redirect, pero el socket lo abre urllib resolviendo de nuevo.
-Fijar la IP (pinning) exigiría reescribir la capa de conexión; queda
-documentado en SECURITY.md.
+**Protección anti-DNS-rebinding (SDD §4.4):** la validación DNS y la
+conexion usan la misma resolución. :func:`thetvview.security.ssrf.check_url_pinned`
+valida *todas* las IPs del nombre y devuelve la primera válida; el socket se
+abre directamente contra esa IP mediante :class:`_PinnedHTTPConnection` /
+:class:`_PinnedHTTPSConnection`, sin re-resolver. El hostname original se
+conserva para el header ``Host:`` y para SNI/verificación TLS.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
+import errno
+import http.client
 import json
 import socket
 import ssl
 import threading
 import time
 import urllib.error
-import urllib.request
 import zlib
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
@@ -73,7 +76,7 @@ from .errors import (
 )
 from .limits import get_limits, human_size
 from .redaction import redact_text
-from .ssrf import check_url
+from .ssrf import check_url_pinned
 from .url_policy import PURPOSE_METADATA, UrlParts
 
 __all__ = [
@@ -145,22 +148,73 @@ def _semaphore() -> threading.BoundedSemaphore:
         return _SEM
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Convierte cualquier 3xx en ``HTTPError`` para seguirlo a mano."""
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """Conexión HTTP que se conecta a una IP ya validada (anti-DNS-rebinding).
 
-    def redirect_request(  # type: ignore[override]
-        self, req, fp, code, msg, headers, newurl
-    ):
-        return None
+    El hostname original se conserva como ``self.host`` para que
+    ``http.client`` genere el header ``Host:`` correcto. El socket se abre
+    directamente contra ``_pinned_ip``, sin re-resolver el nombre.
+    """
+
+    def __init__(self, *args: Any, pinned_ip: str = "", **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        if self._pinned_ip:
+            self.sock = socket.create_connection(
+                (self._pinned_ip, self.port), self.timeout, self.source_address
+            )
+            try:
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError as exc:
+                if exc.errno != errno.ENOPROTOOPT:
+                    raise
+        else:
+            super().connect()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS con IP pinning: conecta a la IP validada, verifica contra el hostname.
+
+    La verificación TLS (SNI y certificado) se hace contra el hostname
+    original (``self.host``), no contra la IP: así el pinning no debilita
+    la seguridad de la conexión segura.
+    """
+
+    def __init__(self, *args: Any, pinned_ip: str = "", **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        if self._pinned_ip:
+            self.sock = socket.create_connection(
+                (self._pinned_ip, self.port), self.timeout, self.source_address
+            )
+            try:
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError as exc:
+                if exc.errno != errno.ENOPROTOOPT:
+                    raise
+        else:
+            super().connect()
+        if self._tunnel_host:
+            self._tunnel()
+        # SNI y verificación de certificado contra el hostname original
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
 
 
 def _headers_of(message: Any) -> dict[str, str]:
-    """Cabeceras en minúsculas (``Location`` → ``location``)."""
+    """Cabeceras en minúsculas (``Location`` → ``location``).
+
+    Acepta un mapping o una lista de tuplas (lo que devuelve
+    ``http.client.HTTPResponse.getheaders()``).
+    """
     if message is None:
         return {}
     try:
         items = message.items()
-    except AttributeError:  # pragma: no cover - ya es un mapping
+    except AttributeError:
         items = list(message)
     return {str(k).lower(): str(v) for k, v in items}
 
@@ -171,10 +225,32 @@ def _short(text: str, limit: int = 90) -> str:
 
 
 def _close(fp: Any) -> None:
+    """Cierra un ``HTTPResponse`` (y su conexión si la trae adjunta).
+
+    Cerrar el response ya cierra el socket subyacente; cerrar la conexión
+    además libera el objeto ``http.client`` completo.
+    """
     try:
         fp.close()
     except Exception:  # noqa: BLE001 - socket ya cerrado
         pass
+    conn = getattr(fp, "_connection", None)  # type: ignore[attr-defined]
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _close_opened(opened: "_Opened") -> None:
+    """Cierra el response y la conexión de un ``_Opened``."""
+    _close(opened.fp)
+    conn = opened.conn
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _con_reason(exc: NetworkError, reason: str | None) -> NetworkError:
@@ -229,6 +305,11 @@ def _map_network_error(exc: BaseException, timeout: float) -> NetworkError:
         )
     if isinstance(reason, ConnectionRefusedError):
         return _con_reason(NetworkError("El servidor rechazó la conexión."), "refused")
+    if isinstance(reason, http.client.HTTPException):
+        return _con_reason(
+            NetworkError("El servidor respondió con un formato inesperado."),
+            "connection",
+        )
     if isinstance(reason, OSError) and getattr(reason, "errno", None) in (101, 51, 65):
         return _con_reason(
             NetworkError("No hay ruta hasta el servidor (red no disponible)."),
@@ -400,7 +481,7 @@ class SafeResponse:
 
 @dataclass
 class _Opened:
-    """Respuesta HTTP abierta (o un ``HTTPError`` con cuerpo) ya validada."""
+    """Respuesta HTTP abierta ya validada (``http.client.HTTPResponse``)."""
 
     fp: Any
     status: int
@@ -408,6 +489,7 @@ class _Opened:
     headers: Mapping[str, str]
     final_url: str
     redirects: int = 0
+    conn: Any = None  # http.client.HTTPConnection (para cerrar el socket)
 
 
 # ---------------------------------------------------------------------------
@@ -452,10 +534,6 @@ class SafeHttpClient:
         self.retries = retries
         self.headers: dict[str, str] = dict(headers or {})
         self.accept_gzip = bool(accept_gzip)
-        self._opener = urllib.request.build_opener(
-            _NoRedirect(),
-            urllib.request.HTTPSHandler(context=_ssl_context()),
-        )
 
     # -- resolución de límites ------------------------------------------------
 
@@ -534,7 +612,7 @@ class SafeHttpClient:
                 payload = self._read_body(fp, opened.headers, cap, started, timeout)
             reason = opened.reason
         finally:
-            _close(fp)
+            _close_opened(opened)
         return SafeResponse(
             url=url,
             final_url=opened.final_url,
@@ -627,12 +705,12 @@ class SafeHttpClient:
         )
         if not (200 <= opened.status < 300):
             status, reason = opened.status, opened.reason
-            _close(opened.fp)
+            _close_opened(opened)
             raise _with_status(NetworkError(_status_message(status, reason)), status)
         try:
             yield from _iter_body(opened.fp, opened.headers, cap, started, timeout, chunk_size)
         finally:
-            _close(opened.fp)
+            _close_opened(opened)
 
     # -- núcleo ---------------------------------------------------------------
 
@@ -669,11 +747,10 @@ class SafeHttpClient:
             )
         try:
             while True:
-                parts = check_url(
+                parts, pinned_ip = check_url_pinned(
                     current,
                     purpose=self.purpose,
                     allow_private=self.allow_private,
-                    resolve=True,
                 )
                 if redirects > 0 and was_https and parts.scheme == "http":
                     raise TLSValidationError(
@@ -683,13 +760,13 @@ class SafeHttpClient:
                 was_https = parts.scheme == "https"
 
                 opened = self._attempt(
-                    parts, base, method, sock_timeout, deadline, budget, body
+                    parts, pinned_ip, base, method, sock_timeout, deadline, budget, body
                 )
                 code = opened.status
 
                 if 300 <= code < 400:
                     location = opened.headers.get("location")
-                    _close(opened.fp)
+                    _close_opened(opened)
                     if not location:
                         raise NetworkError(
                             f"El servidor respondió una redirección sin destino "
@@ -708,7 +785,7 @@ class SafeHttpClient:
                     delay = _retry_delay(opened.headers, attempts, deadline)
                     if delay is not None:
                         attempts += 1
-                        _close(opened.fp)
+                        _close_opened(opened)
                         time.sleep(delay)
                         continue
 
@@ -720,6 +797,7 @@ class SafeHttpClient:
     def _attempt(
         self,
         parts: UrlParts,
+        pinned_ip: str,
         base: Mapping[str, str],
         method: str,
         sock_timeout: float,
@@ -727,22 +805,41 @@ class SafeHttpClient:
         budget: float,
         body: bytes | None,
     ) -> _Opened:
-        """Una sola conexión a un destino ya validado."""
+        """Una sola conexión a un destino ya validado, con IP fijada.
+
+        Usa ``http.client`` directamente (no urllib): la conexión se abre
+        contra ``pinned_ip`` —la IP validada en :func:`check_url_pinned``—
+        sin re-resolver el nombre, lo que cierra la ventana TOCTOU de
+        DNS rebinding (SDD §4.4). El hostname original se conserva para el
+        header ``Host:`` y para SNI/verificación TLS.
+        """
         _check_deadline(deadline, budget)
-        req = urllib.request.Request(
-            parts.normalized, data=body, headers=dict(base), method=method
-        )
+        path = parts.path or "/"
+        if parts.query:
+            path += f"?{parts.query}"
         try:
-            fp = self._opener.open(req, timeout=sock_timeout)
-        except urllib.error.HTTPError as exc:
-            return _Opened(
-                fp=exc,
-                status=int(exc.code),
-                reason=str(exc.reason or ""),
-                headers=_headers_of(exc.headers),
-                final_url=parts.normalized,
-            )
-        except urllib.error.URLError as exc:
+            if parts.is_https:
+                conn: http.client.HTTPConnection = _PinnedHTTPSConnection(
+                    parts.host,
+                    parts.port or 443,
+                    pinned_ip=pinned_ip,
+                    timeout=sock_timeout,
+                    context=_ssl_context(),
+                )
+            else:
+                conn = _PinnedHTTPConnection(
+                    parts.host,
+                    parts.port or 80,
+                    pinned_ip=pinned_ip,
+                    timeout=sock_timeout,
+                )
+            try:
+                conn.request(method, path, body=body, headers=dict(base))
+                resp = conn.getresponse()
+            except BaseException:
+                conn.close()
+                raise
+        except http.client.HTTPException as exc:
             raise _map_network_error(exc, sock_timeout) from exc
         except (TimeoutError, socket.timeout) as exc:
             raise _con_reason(
@@ -754,18 +851,13 @@ class SafeHttpClient:
         except OSError as exc:
             raise _map_network_error(exc, sock_timeout) from exc
 
-        status = getattr(fp, "status", None)
-        if status is None:  # pragma: no cover - http.client siempre lo trae
-            try:
-                status = fp.getcode()
-            except Exception:  # noqa: BLE001
-                status = 200
         return _Opened(
-            fp=fp,
-            status=int(status or 200),
-            reason=str(getattr(fp, "reason", "") or ""),
-            headers=_headers_of(getattr(fp, "headers", None)),
+            fp=resp,
+            status=int(resp.status or 200),
+            reason=str(resp.reason or ""),
+            headers=_headers_of(resp.getheaders()),
             final_url=parts.normalized,
+            conn=conn,
         )
 
     def _read_body(
@@ -832,6 +924,10 @@ def _consume(
             out += gz.flush()
     except NetworkError:
         raise
+    except http.client.IncompleteRead as exc:
+        raise NetworkError(
+            "El servidor envió una respuesta incompleta."
+        ) from exc
     except zlib.error as exc:
         raise NetworkError(
             "El servidor envió una respuesta comprimida dañada."
@@ -865,18 +961,21 @@ def _iter_body(
         else None
     )
     total = 0
-    while True:
-        _check_deadline(deadline, budget)
-        piece = fp.read(chunk_size)
-        if not piece:
-            break
-        if gz is not None:
-            piece = gz.decompress(piece)
-        total += len(piece)
-        if max_bytes is not None and total > max_bytes:
-            raise _too_large(max_bytes)
-        if piece:
-            yield piece
+    try:
+        while True:
+            _check_deadline(deadline, budget)
+            piece = fp.read(chunk_size)
+            if not piece:
+                break
+            if gz is not None:
+                piece = gz.decompress(piece)
+            total += len(piece)
+            if max_bytes is not None and total > max_bytes:
+                raise _too_large(max_bytes)
+            if piece:
+                yield piece
+    except http.client.IncompleteRead as exc:
+        raise NetworkError("El servidor envió una respuesta incompleta.") from exc
     if gz is not None and not gz.eof:
         raise NetworkError("El servidor envió una respuesta comprimida incompleta.")
 

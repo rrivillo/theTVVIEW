@@ -35,8 +35,10 @@ import atexit
 import http.server
 import secrets
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlsplit
+
+from ..security.limits import get_limits
 
 from ..tracks.labels import audio_label, subtitle_label
 from ..tracks.models import (
@@ -297,6 +299,15 @@ def _stream_line(
 # Servidor
 # ---------------------------------------------------------------------------
 
+#: Límite de requests simultáneos que acepta el proxy. Con el token de 128
+#: bits y el enlace a loopback ya es suficiente; esto es defensa en
+#: profundidad: ni siquiera un token filtrado justifica una ráfaga ilimitada.
+_MAX_CONCURRENT: int = 8
+#: Tope de bytes de la línea de request + cabeceras. Un master HLS no pesa
+#: más de unos cientos de KB, así que un request de varios MB es un intento
+#: de agotar memoria.
+_MAX_REQUEST_BYTES: int = 64 * 1024
+
 
 @dataclass
 class _Config:
@@ -304,6 +315,9 @@ class _Config:
     token: str
     server: http.server.ThreadingHTTPServer
     thread: threading.Thread | None = None
+    semaphore: threading.Semaphore = field(
+        default_factory=lambda: threading.Semaphore(_MAX_CONCURRENT)
+    )
 
     @property
     def port(self) -> int:
@@ -325,11 +339,41 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:  # noqa: N802
         self._serve()
 
+    def do_POST(self) -> None:  # noqa: N802 - el proxy no acepta POST
+        self._send(404, b"", "text/plain")
+
     def _serve(self) -> None:
         cfg = getattr(self.server, "pin_config", None)
         if cfg is None:  # pragma: no cover - defensivo
             self._send(404, b"", "text/plain")
             return
+        # Límite de concurrencia: un semáforo por servidor, no global (el
+        # proxy es loopback y efímero; un global sería una falsa compartición).
+        if not cfg.semaphore.acquire(blocking=False):
+            self._send(503, b"busy", "text/plain")
+            return
+        try:
+            self._dispatch(cfg)
+        finally:
+            cfg.semaphore.release()
+
+    def _dispatch(self, cfg: _Config) -> None:
+        # Tamaño del request: la línea + las cabeceras ya leídas no deben
+        # exceder un tope razonable. http.client ya limita el buffer, pero
+        # aquí lo hacemos explícito para no depender de eso.
+        try:
+            request_line = self.requestline
+            headers_size = (
+                sum(len(line) for line in self.headers.raw_items())
+                if self.headers
+                else 0
+            )
+            if len(request_line) + headers_size > _MAX_REQUEST_BYTES:
+                self._send(413, b"", "text/plain")
+                return
+        except Exception:  # noqa: BLE001
+            pass
+
         ruta = urlsplit(self.path).path
         permitidas = [f"/{cfg.token}/{_MASTER_NAME}"]
         permitidas += [f"/{cfg.token}/{nombre}" for nombre in _ALT_NAMES]

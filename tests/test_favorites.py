@@ -53,6 +53,14 @@ class TestFavoritesManager(unittest.TestCase):
         self.assertFalse(self.mgr.remove(self.chan))
 
     def test_json_corrupto_lanza_error_amigable(self) -> None:
+        # El store lanza StorageError; el módulo lo traduce a FavoritesError,
+        # que es el contrato que la TUI sabe presentar en un modal.
+        self.path.write_text("{no es json", encoding="utf-8")
+        with self.assertRaises(FavoritesError):
+            self.mgr.load()
+
+    def test_el_error_de_corrupcion_es_del_tipo_que_la_ui_maneja(self) -> None:
+        """La corrupción sale como ``FavoritesError``, que es lo que la TUI captura."""
         self.path.write_text("{no es json", encoding="utf-8")
         with self.assertRaises(FavoritesError):
             self.mgr.load()

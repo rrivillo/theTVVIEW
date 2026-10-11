@@ -209,6 +209,9 @@ class TrackSession:
                 cache_dir=None if self._cache_dir_forbidden() else _default_cache_dir(),
             )
             probe.channel = _channel_with_url(self.channel, url)
+            # El gestor de la app, si lo hay: el sondeo entra entonces en el
+            # cierre acotado en vez de ser un hilo que nadie puede parar.
+            probe._task_manager = getattr(self.app, "_tasks", None)
             self.probe = probe
             self.result = None
         probe.start(self._on_ready)

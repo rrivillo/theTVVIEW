@@ -162,10 +162,10 @@ class TestConexion(unittest.TestCase):
 
     def test_transporte_no_http_no_intenta_http(self) -> None:
         # Con `rtsp://` no tiene sentido un `HEAD`: lo negocia el reproductor
-        # y el informe tiene que decirlo en vez de fingir una prueba. Se usa un
-        # host numérico (127.0.0.1) para que el paso de DNS no separe al
-        # apakah el nombre no resuelve.
-        pasos = diagnose_connection(_canal("rtsp://127.0.0.1:554/stream"))
+        # y el informe tiene que decirlo en vez de fingir una prueba. Se usa
+        # una IP pública (example.com) para que el paso de DNS no se corte
+        # por la política anti-SSRF.
+        pasos = diagnose_connection(_canal("rtsp://93.184.216.34:554/stream"))
         nombres = [p.name for p in pasos]
         self.assertIn("DNS", nombres)
         http = next(p for p in pasos if p.name == "HTTP")

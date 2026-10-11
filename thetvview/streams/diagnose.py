@@ -46,7 +46,7 @@ from .. import config
 from ..models import Channel
 from ..player.protocols import PlayerProtocolSupport, support_for
 from ..player.router import Candidate, order_candidates
-from ..security.errors import IPTVError
+from ..security.errors import IPTVError, NetworkError, SSRFBlockedError
 from ..security.redaction import redact_text
 from ..security.url_policy import PURPOSE_STREAM, validate_url
 from .detector import Detection, detect_protocol
@@ -279,17 +279,22 @@ def diagnose_connection(
     url = channel.url or ""
     host = _host_of(url)
 
-    # 1. DNS
+    # 1. DNS (con validación anti-SSRF, igual que el resto de la app)
     if not host:
         pasos.append(Step("DNS", StepState.SKIP, "sin servidor en la dirección"))
         return pasos
+    from ..security.ssrf import resolve_and_check
+
     try:
-        socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-    except socket.gaierror as exc:
+        resolve_and_check(host, None, allow_private=allow_private)
+    except SSRFBlockedError as exc:
+        pasos.append(Step("DNS", StepState.FAIL, redact_text(str(exc))))
+        return pasos
+    except (NetworkError, OSError) as exc:
         pasos.append(
-            Step("DNS", StepState.FAIL, f"no se resuelve «{host}» ({exc.strerror or exc})")
+            Step("DNS", StepState.FAIL, f"no se resuelve «{host}» ({exc})")
         )
-        # Sin DNS no hay nada más que probar, y_each paso posterior daría un
+        # Sin DNS no hay nada más que probar, y cada paso posterior daría un
         # error que no es la causa real.
         return pasos
     pasos.append(Step("DNS", StepState.OK, f"«{host}» se resuelve"))
