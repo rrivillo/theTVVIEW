@@ -626,10 +626,16 @@ class TestEtiquetasDinamicas(BaseApp):
         accion = busca(screen, "C")
         self.assertIsNotNone(accion, "una Lista X sí puede cambiar la contraseña")
 
-    def test_catalogo_vacio_solo_anuncia_a_y_ayuda(self):
+    def test_catalogo_vacio_solo_anuncia_lo_que_hace(self):
+        """Catálogo vacío: sólo teclas ejecutables (nada de abrir, nada de borrar).
+
+        `T Tema` entra aquí porque abre el modal con los tres temas: es una
+        acción real en un catálogo vacío, a diferencia de `Enter Abrir` o
+        `d Borrar`, que no tienen sobre qué actuar (§8).
+        """
         screen = PlaylistsScreen(self.app)
         screen.entries = []
-        self.assertEqual({a.key for a in screen.actions()}, {"a", "?"})
+        self.assertEqual({a.key for a in screen.actions()}, {"a", "T", "?"})
 
     def test_epg_sin_catchup_no_anuncia_archivo(self):
         screen = EpgScreen(self.app, canal("La 1"))

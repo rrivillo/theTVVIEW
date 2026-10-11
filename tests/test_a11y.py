@@ -30,7 +30,6 @@ class TestHealthIconBackup(unittest.TestCase):
         from thetvview.ui.screens import NowPlayingScreen
         from thetvview.models import Channel
         from unittest.mock import Mock
-        import time
 
         ch = Channel(name="Test", url="http://x/test")
         proc = Mock()
@@ -47,6 +46,11 @@ class TestHealthIconBackup(unittest.TestCase):
             label="Buena",
             color_pair=colors.PAIR_SUCCESS,
             success_rate=0.9,
+            # Sin sondas declaradas el estado lógico sería DESCONOCIDO; con
+            # sondas, nivel 4 → ONLINE. El texto tiene que decir las dos
+            # cosas: la calidad (barra+etiqueta) y el estado (glifo+palabra).
+            probe_count=2,
+            medible=True,
         )
         screen.health = health_mock
 
@@ -60,6 +64,11 @@ class TestHealthIconBackup(unittest.TestCase):
         calls_str = [str(c) for c in stdscr.addstr.call_args_list]
         has_signal = any("Señal" in s or "●●●●○" in s or "Buena" in s for s in calls_str)
         self.assertTrue(has_signal, "La barra de salud debe incluir icono + bar + label")
+        # FR-STA-03: el estado va con palabra, no sólo con glifo ni color.
+        self.assertTrue(
+            any("En línea" in s for s in calls_str),
+            "El estado de salud debe nombrarse con palabras, no sólo con color/glifo",
+        )
 
 
 if __name__ == "__main__":

@@ -261,6 +261,10 @@ class TestUxJourney(unittest.TestCase):
         self.assertIsInstance(self.app.screen, ChannelsScreen)
 
     def test_journey_full_backstack(self):
+        # Usuario **con** lista configurada: la raíz es el catálogo. Sin
+        # listas la raíz es la bienvenida (D13), pero en ese caso tampoco
+        # debería quedar ninguna pantalla colgada al volver.
+        self.app.stack[0] = PlaylistsScreen(self.app)
         self.app.push(ChannelsScreen(self.app, self.playlist))
         self.app.push(GroupsScreen(self.app, self.playlist))
         self.app.epg = None
@@ -490,11 +494,15 @@ class TestUxThemeA11y(unittest.TestCase):
         self.app, self.fake = make_app(self)
 
     def test_toggle_theme_changes_name(self):
+        """`t` recorre los tres temas y vuelve al punto de partida (FR-THE-01)."""
         with mock.patch("curses.has_colors", return_value=False):
             original = self.app.theme_name
-            self.app.toggle_theme()
-            self.assertNotEqual(self.app.theme_name, original)
-            self.app.toggle_theme()
+            vistos = []
+            for _ in range(3):
+                self.app.toggle_theme()
+                vistos.append(self.app.theme_name)
+            self.assertEqual(len(set(vistos)), 3, f"no recorre los tres temas: {vistos}")
+            # Tres pulsaciones y vuelve al punto de partida: el ciclo cierra.
             self.assertEqual(self.app.theme_name, original)
 
     def test_toggle_theme_shows_footer(self):

@@ -23,6 +23,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Deque
 
 from urllib.error import HTTPError
@@ -65,6 +66,29 @@ class HealthStatus:
     jitter_ms: float | None
     probe_count: int
     success_count: int
+    #: False cuando el canal no se puede medir por red (rtmp://, udp://...):
+    #: el nivel que devuelva entonces es una conjetura, no una comprobación.
+    #: La capa de estados (`estado_de`) lo lee para no pintar como «offline»
+    #: o «online» lo que en realidad no se sabe (FR-STA-01/02).
+    medible: bool = True
+
+
+class Estado(str, Enum):
+    """Los cuatro estados lógicos que la UI sabe pintar (FR-STA-01).
+
+    Securities sobre el nivel 0..5 que usa el diagnóstico: el nivel es una
+    medida de calidad **cuando hay medición**, y `DESCONOCIDO` es el estado de
+    primera clase para cuando no la hay. Un canal recién añadido no está
+    «offline»: no se sabe nada de él, y decirlo sería inventar (FR-STA-02).
+    """
+
+    DESCONOCIDO = "desconocido"
+    ONLINE = "online"
+    AVISO = "aviso"
+    OFFLINE = "offline"
+
+    def __str__(self) -> str:  # pragma: no cover - conveniencia de depuración
+        return self.value
 
 
 # Mapeo nivel -> (label, bar, color_pair_name, detail_base)
@@ -97,6 +121,37 @@ def health_bar(level: int) -> str:
 def health_label(level: int) -> str:
     level = max(0, min(5, int(level)))
     return _LEVEL_META[level][0]
+
+
+def estado_de(status: HealthStatus | None) -> Estado:
+    """Traduce el nivel 0..5 a los cuatro estados lógicos de la UI.
+
+    Sólo **etiqueta**: no mide, no sondea y no decide disponibilidad. Lee el
+    `HealthStatus` que el monitor ya tiene en memoria, de modo que pintar el
+    estado no cuesta una red (FR-STA-04/05, T-STA-04).
+
+    - sin sondas, o un canal que no se puede medir → `DESCONOCIDO`;
+    - calidad buena → `ONLINE`; dudosa → `AVISO`; mala o reproductor parado
+      → `OFFLINE`.
+    """
+    if status is None:
+        return Estado.DESCONOCIDO
+    try:
+        sondas = int(getattr(status, "probe_count", 0) or 0)
+        nivel = int(getattr(status, "level", 0) or 0)
+    except (TypeError, ValueError):
+        # Un estado que no se puede leer no se pinta como ONLINE ni como
+        # OFFLINE: se dice que no se sabe (FR-STA-02).
+        return Estado.DESCONOCIDO
+    if sondas <= 0:
+        return Estado.DESCONOCIDO
+    if not bool(getattr(status, "medible", True)):
+        return Estado.DESCONOCIDO
+    if nivel >= 4:
+        return Estado.ONLINE
+    if nivel >= 2:
+        return Estado.AVISO
+    return Estado.OFFLINE
 
 
 # ---------------------------------------------------------------------------
@@ -292,13 +347,15 @@ def classify_health(
         )
 
     if n == 0:
+        # Sin sondas **todavía**. Decir "Sin señal" aquí afirmaría algo que no
+        # se sabe: el canal puede estar perfectamente (FR-STA-02).
         return HealthStatus(
             level=0,
-            label="Midiendo…",
+            label="Sin comprobar",
             bar="○○○○○",
             color_pair=_color_for(0),
-            summary="Midiendo salud…",
-            detail="Probando conexión del canal, un momento…",
+            summary="Sin comprobar todavía",
+            detail="Aún no se ha comprobado la conexión con este canal.",
             success_rate=0.0,
             avg_latency_ms=None,
             last_latency_ms=None,
@@ -323,6 +380,7 @@ def classify_health(
             jitter_ms=None,
             probe_count=n,
             success_count=n,
+            medible=False,
         )
 
     success_count = sum(1 for s in snaps if s.success is True)

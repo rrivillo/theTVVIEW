@@ -85,7 +85,7 @@ class V:
     HORARIO = "Horario"
     VOLVER = "Volver"
     AYUDA = "Ayuda"
-    # --- las que exigen las 10 pantallas (§9, §34, §36) ---
+    # --- las que exigen las pantallas (§9, §34, §36) ---
     ARCHIVO = "Archivo"  # catch-up: Enter Ver|Archivo
     GRUPO = "Grupos"
     EPG = "EPG"
@@ -100,6 +100,8 @@ class V:
     CONTRASENA_X = "Contraseña X"  # catálogo: C (sólo Listas X)
     LIMPIAR = "Limpiar"  # Recientes: r
     ELEGIR = "Elegir"  # Reproductor/Calidad/Pistas: ↑↓ / ←→
+    TEMA = "Tema"  # T: modal con los tres temas
+    SALIR = "Salir"  # q: confirmar la salida de la app
     SECCION = "Sección"  # Pistas: Tab
     MARCAR = "Marcar"  # Pistas: Espacio
     CONTINUAR = "Continuar"  # Calidad: Enter

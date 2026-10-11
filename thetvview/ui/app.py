@@ -32,11 +32,13 @@ from .screens import (
     EpgScreen,
     FavoritesScreen,
     GroupsScreen,
+    HomeScreen,
     NowPlayingScreen,
     PlaylistsScreen,
     PlayerScreen,
     RecentsScreen,
     ResolutionScreen,
+    Screen,
     _epg_channel_id,
     open_playlist,
     play_channel,
@@ -243,6 +245,10 @@ TRACK_LATE_WAIT_SECONDS: float = 4.0 if detect_os() == OS_WINDOWS else 2.5
 
 # Dónde está el usuario y qué hacer allí: nombre legible + frase guía.
 _HELP_WHERE: dict[str, tuple[str, str]] = {
+    "HomeScreen": (
+        "Bienvenida",
+        "Todavía no hay listas. Empieza añadiendo una; el resto llega después.",
+    ),
     "PlaylistsScreen": (
         "Listas (playlists)",
         "Aquí están tus listas de canales. Entra en una con Enter.",
@@ -288,6 +294,13 @@ _HELP_WHERE: dict[str, tuple[str, str]] = {
 
 # Qué se puede hacer en la pantalla actual, explicado con frases completas.
 _HELP_HERE: dict[str, list[tuple[str, str]]] = {
+    "HomeScreen": [
+        ("key", "a  añadir tu primera lista de canales."),
+        ("key", "q  salir de la app (pide confirmar)."),
+        ("key", "t  cambiar el tema (claro, oscuro o alto contraste)."),
+        ("tip", "Una lista puede ser un fichero o URL M3U/M3U8."),
+        ("tip", "También puedes dar de alta tu cuenta de Lists X."),
+    ],
     "PlaylistsScreen": [
         ("key", "Enter  abrir la lista seleccionada y ver sus canales."),
         ("key", "a  añadir una lista nueva (te pide nombre y ruta o URL)."),
@@ -407,7 +420,7 @@ def build_help_lines(screen) -> list[tuple[str, str]]:
         ("key", "q  salir de la app (pide confirmar)."),
         ("blank", ""),
         ("section", "Teclas que valen en todas partes"),
-        ("key", "t  cambiar entre tema claro y oscuro."),
+        ("key", "t  cambiar entre tema claro, oscuro y alto contraste."),
         ("key", "r  ver lo último reproducido (Recientes)."),
         ("key", "p  elegir reproductor para el canal actual."),
         ("key", "u  deshacer el último borrado de lista."),
@@ -420,7 +433,7 @@ def build_help_lines(screen) -> list[tuple[str, str]]:
     lines += [
         ("blank", ""),
         ("section", "Las demás pantallas (referencia rápida)"),
-        ("body", "Listas: a añadir · d borrar · Enter abrir · f favoritos."),
+        ("body", "Listas: a añadir · d borrar · Enter abrir · f favoritos · T tema."),
         ("body", "Canales: / buscar · R actualizar · g grupos · Enter ver."),
         ("body", "Grupos: / buscar · R actualizar · Enter abrir."),
         ("body", "Favoritos: f quitar · Enter ver."),
@@ -567,9 +580,26 @@ class App:
         # que el flujo "reproductor -> opciones de pistas -> reproducir" tenga
         # un único sitio donde mirar el estado. `None` = sin analysing.
         self.track_session = None
-        self.stack: list[PlaylistsScreen] = []
+        self.stack: list[Screen] = []
         self._undo_stack: list[dict] = []
-        self.stack.append(PlaylistsScreen(self))
+        # La **raíz** depende de si hay algo que ver (FR-HOM-01/06):
+        # con listas es el catálogo, como siempre; sin listas, la bienvenida,
+        # que sólo ofrece acciones que se pueden ejecutar. No se añaden
+        # pantallas intermedias a quien ya tiene su lista configurada.
+        self.stack.append(self._pantalla_raiz())
+
+    def _tiene_listas(self) -> bool:
+        """¿Hay al menos una lista en el catálogo? Degrada a False."""
+        cargar = getattr(getattr(self, "playlists", None), "load", None)
+        if not callable(cargar):
+            return False
+        try:
+            return bool(cargar())
+        except Exception:
+            return False
+
+    def _pantalla_raiz(self) -> Screen:
+        return PlaylistsScreen(self) if self._tiene_listas() else HomeScreen(self)
 
     # --- Stack --------------------------------------------------------------
 
@@ -839,15 +869,71 @@ class App:
             with self._warm_lock:
                 self._warm_thread = None
 
-    def toggle_theme(self) -> None:
-        self.theme_name = "light" if self.theme_name == "dark" else "dark"
+    def siguiente_tema(self) -> str:
+        """El tema que sigue al actual en el ciclo de los tres (puro)."""
+        try:
+            actuales = list(theme.nombres())
+        except Exception:
+            actuales = list(config.THEMES)
+        if not actuales:
+            return config.DEFAULT_THEME
+        actual = config.normalize_theme(self.theme_name)
+        return actuales[(actuales.index(actual) + 1) % len(actuales)]
+
+    def set_theme(self, name: str, *, avisar: bool = True) -> None:
+        """Aplica y persiste un tema; avisa **por modal** (no negociable #1).
+
+        La persistencia es doble y ya lo era: `prefs.json` y `theme.json`
+        guardan el mismo valor para que una app y otra coincidan.
+        """
+        nuevo = config.normalize_theme(name)
+        anterior = config.normalize_theme(self.theme_name)
+        self.theme_name = nuevo
         p = self.prefs.load()
-        p.theme = self.theme_name
+        p.theme = nuevo
         self.prefs.save(p)
-        config.save_theme(self.theme_name)
-        theme.init_colors(self.theme_name)
-        label = "oscuro" if self.theme_name == "dark" else "claro"
-        self.footer.show(f"Tema {label} activado.")
+        config.save_theme(nuevo)
+        theme.init_colors(nuevo)
+        if not avisar or nuevo == anterior:
+            return
+        # La barra también lo dice: el modal es el aviso y la barra el eco.
+        self.footer.show(f"Tema {theme.nombre_legible(nuevo)} activado.")
+        self.notify(
+            f"Ahora la app se ve en tema {theme.nombre_legible(nuevo)} "
+            f"(«{nuevo}»). Pulsa t para pasar al siguiente.",
+            title="Tema",
+        )
+
+    def toggle_theme(self) -> None:
+        """Alterna al siguiente tema. `t` en cualquier pantalla."""
+        self.set_theme(self.siguiente_tema())
+
+    def elegir_tema(self) -> None:
+        """Modal con los tres temas, para elegir sin dar vueltas (D12).
+
+        `t` alterna —rápido, sin decisiones— y esto es lo otro: un modal donde
+        se ve **qué tema es cada uno** antes de aplicarlo.
+        """
+        from .widgets import Modal
+
+        candidatos = [theme.nombre_legible(n) for n in theme.nombres()]
+        modal = Modal(
+            "Tema",
+            "Elige cómo se ve la app. El cambio se guarda para la próxima vez.",
+            candidatos,
+        )
+        actual = config.normalize_theme(self.theme_name)
+        nombres = list(theme.nombres())
+        if actual in nombres:
+            modal.selected_button = nombres.index(actual)
+        res = self._run_modal(modal)
+        if res is None:
+            return
+        elegido = str(res).strip().lower()
+        for nombre in nombres:
+            if theme.nombre_legible(nombre).lower() == elegido:
+                self.set_theme(nombre)
+                return
 
 
     # --- Acciones -----------------------------------------------------------
@@ -2138,6 +2224,13 @@ class App:
         match action.get("action"):
             case "add_playlist":
                 self.add_playlist()
+            case "choose_theme":
+                self.elegir_tema()
+            case "confirm_quit":
+                # La salida se confirma con el mismo modal de siempre; desde
+                # aquí sólo se marca para que el bucle pare, que es lo que hace
+                # la tecla global `q`.
+                self._salir_pendiente = self.confirm_quit()
             case "remove_playlist":
                 self.remove_playlist(action["name"])
             case "confirm_remove_playlist":

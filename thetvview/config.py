@@ -33,6 +33,24 @@ IPC_DIR: Path = DATA_DIR / "ipc"
 
 SUPPORTED_PLAYERS: tuple[str, ...] = ("mpv", "mplayer", "vlc")
 
+#: Los tres temas de la app, **en el orden del alterno** (`t`): de uno al
+#: siguiente y de vuelta al primero (FR-THE-01). Vive aquí, y no en el módulo de
+#: temas, porque `config` es lo que se puede importar sin `curses`: quien
+#: valida o persiste un nombre de tema no necesita una terminal.
+THEMES: tuple[str, ...] = ("light", "dark", "high_contrast")
+DEFAULT_THEME: str = "light"
+
+
+def normalize_theme(name: str | None) -> str:
+    """Nombre de tema válido, o el predeterminado.
+
+    Un `theme.json` con `"neon"` no es un error: es un tema que esta versión no
+    conoce, y lo honesto es seguir con el que sí (degradar en silencio, igual
+    que en el resto de la configuración).
+    """
+    limpio = str(name or "").strip().lower()
+    return limpio if limpio in THEMES else DEFAULT_THEME
+
 
 def anonymize_path(path: str) -> str:
     """Oculta el directorio home del usuario en un path para no exponerlo en UI/logs.
@@ -195,21 +213,20 @@ def load_theme() -> str:
     """Lee el tema persistente de theme.json. Devuelve 'light' si falla."""
     try:
         data = json.loads(THEME_JSON.read_text(encoding="utf-8"))
-        name = str(data.get("theme", "light")).strip().lower()
-        if name in ("light", "dark"):
-            return name
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return normalize_theme(data.get("theme"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, AttributeError):
         pass
-    return "light"
+    return DEFAULT_THEME
 
 
 def save_theme(name: str) -> None:
     """Persiste el tema en theme.json (atomic write mínimo)."""
-    if name not in ("light", "dark"):
-        return
+    limpio = str(name or "").strip().lower()
+    if limpio not in THEMES:
+        return  # nombre desconocido: no se escribe nada
     try:
         THEME_JSON.parent.mkdir(parents=True, exist_ok=True)
-        THEME_JSON.write_text(json.dumps({"theme": name}) + "\n", encoding="utf-8")
+        THEME_JSON.write_text(json.dumps({"theme": limpio}) + "\n", encoding="utf-8")
     except OSError:
         pass  # degrada silencioso
 

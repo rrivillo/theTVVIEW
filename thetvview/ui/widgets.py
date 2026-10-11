@@ -20,9 +20,13 @@ class ScrollableList:
     """Lista con scroll y selección; renderiza solo lo visible.
 
     Opcionalmente cada fila lleva un **texto secundario** paralelo (`subitems`):
-    la columna del programa en Favoritos. Es opt-in a propósito —sin
-    subelementos el render es exactamente el de siempre— porque el mismo widget
-    lo usan nueve pantallas más y ninguna de ellas necesita dos columnas.
+    la columna del programa en Favoritos y la fecha en Recientes. Y
+    opcionalmente un **resaltado** por fila (`ranges`): el fragmento que
+    coincidió con la búsqueda, en Canales.
+
+    Las dos cosas son opt-in a propósito —sin ellas el render es exactamente
+    el de siempre— porque el mismo widget lo usan muchas pantallas más y
+    ninguna de ellas necesita dos columnas ni resaltado.
     """
 
     #: Prefijos de la fila: el de selección y el de hueco. Ambos miden 3 celdas.
@@ -32,6 +36,12 @@ class ScrollableList:
     def __init__(self, items: list[str] | None = None, selected_pair: int | None = None) -> None:
         self.items: list[str] = items or []
         self.subitems: list[str] = []
+        #: Rangos a resaltar por fila, como índices **de carácter** sobre el
+        #: texto de la fila: `[[(ini, fin)], …]`, uno por fila. Opt-in y
+        #: vacío por defecto: sin rangos el `addstr` es byte a byte el de
+        #: siempre, que es lo que permite tocar este widget sin cambiar lo que
+        #: ven las otras pantallas (D7).
+        self.ranges: list[list[tuple[int, int]]] = []
         self.selected = 0
         self.top = 0
         self.selected_pair = selected_pair if selected_pair is not None else colors.PAIR_SELECTED
@@ -52,8 +62,14 @@ class ScrollableList:
         orden. Si no viene, o si no cuadra con el número de filas, la lista se
         dibuja a una columna: degradar es mejor que pintar la segunda columna
         descolocada o leer un índice que no existe.
+
+        Los rangos de resaltado se limpian aquí siempre: unas filas nuevas con
+        los resaltados de las anteriores resaltaban coincidencias que ya no
+        existen. Quien los necesite los vuelve a poner **después** del
+        `set_items` (ver `ChannelsScreen._apply_filter`).
         """
         self.items = items
+        self.ranges = []
         if subitems is not None and len(subitems) == len(items):
             self.subitems = list(subitems)
         else:
@@ -62,6 +78,19 @@ class ScrollableList:
             self.selected = 0
         self.top = 0
         self.clamp()
+
+    def set_ranges(self, ranges: list[list[tuple[int, int]]] | None) -> None:
+        """Fija los rangos a resaltar; `None` o un desajuste los desactiva.
+
+        Es la puerta única: el render sólo usa el resaltado si hay rangos y
+        son exactamente uno por fila. Cualquier otra forma (sobran, faltan,
+        no son listas) degrada al render de siempre en vez de inventarse índices
+        que no existen.
+        """
+        if not ranges or len(ranges) != len(self.items):
+            self.ranges = []
+            return
+        self.ranges = [list(r) for r in ranges]
 
     def clamp(self, height: int | None = None) -> None:
         if not self.items:
@@ -128,7 +157,7 @@ class ScrollableList:
         """True si esta lista se dibuja con su columna secundaria.
 
         Sólo con subelementos no vacíos **y** uno por fila: es la bandera que
-        deja intacto el render de las otras nueve pantallas.
+        deja intacto el render de las demás pantallas.
         """
         return bool(self.subitems) and len(self.subitems) == len(self.items)
 
@@ -205,6 +234,68 @@ class ScrollableList:
             except curses.error:
                 pass  # última celda de la esquina inferior derecha
 
+    def _rangos_de(self, idx: int, desplazamiento: int = 0) -> list[tuple[int, int]]:
+        """Rangos de la fila `idx` sobre la fila pintada, o `[]`.
+
+        `desplazamiento` son los caracteres del prefijo de selección: los
+        rangos los calcula quien llama sobre `items[idx]` (la etiqueta limpia,
+        sin `▸ `), pero el corte se hace sobre la fila que se pinta, que lo
+        lleva delante. Sin esto el resaltado se desplaza tres caracteres y
+        acaba marcando otra cosa —o el final de la fila—.
+
+        Recorta por el final porque la fila visible está recortada a lo que
+        cabe: un rango que se salga del texto no se pinta, y uno que empiece
+        después, tampoco. Un rango al revés o vacío tampoco.
+        """
+        if not self.ranges or len(self.ranges) != len(self.items):
+            return []
+        try:
+            rangos = self.ranges[idx]
+        except (IndexError, TypeError):
+            return []
+        if not isinstance(rangos, (list, tuple)):
+            return []
+        return [
+            (int(ini) + desplazamiento, int(fin) + desplazamiento)
+            for ini, fin in rangos
+            if isinstance(fin, (int, float)) and isinstance(ini, (int, float))
+            and int(fin) > int(ini)
+        ]
+
+    def _addstr_resaltado(self, stdscr: curses.window, line_y: int, x: int,  # noqa: ANN001
+                          fila: str, rangos: list[tuple[int, int]],
+                          content_w: int, attr: int, hl_attr: int) -> None:
+        """Pinta la fila por trozos: normal, resaltado, normal...
+
+        Los índices de `rangos` son de carácter sobre `fila`, y el corte se hace
+        con `fila[ini:fin]`: nunca se parte un carácter suelto, porque `rangos`
+        son índices devueltos por `str.find`. El relleno va **en el último
+        trozo**, así que la suma de celdas de la fila es la misma que con el
+        render de siempre y el scrollbar sigue cayendo donde cae.
+
+        El relleno del último trozo es lo que mantiene la fila midiendo
+        `content_w`: sin él, una fila resaltada mide lo que miden sus trozos y
+        deja el hueco en blanco —que en una lista es justo donde se lee como
+        que la fila terminó antes.
+        """
+        inicio = x
+        cursor = 0
+        for ini, fin in rangos:
+            if fin <= cursor:
+                continue
+            ini = min(max(ini, cursor), len(fila))
+            fin = min(fin, len(fila))
+            if ini > cursor:
+                trozo = fila[cursor:ini]
+                stdscr.addstr(line_y, x, trozo, attr)
+                x += cell_width(trozo)
+            trozo = fila[ini:fin]
+            stdscr.addstr(line_y, x, trozo, hl_attr)
+            x += cell_width(trozo)
+            cursor = fin
+        restante = max(0, content_w - (x - inicio))
+        stdscr.addstr(line_y, x, _pad_cells(fila[cursor:], restante), attr)
+
     def render(self, stdscr: curses.window, y: int, x: int, height: int, width: int) -> None:
         self.clamp(height)
         if self._two_columns():
@@ -230,8 +321,24 @@ class ScrollableList:
             # esquina inferior derecha, `curses.error`. Para texto de una celda
             # por carácter —todo lo que había antes— el resultado es idéntico.
             text = clip_cells(self.items[idx], max(0, content_w - cell_width(prefix)))
+            rangos = self._rangos_de(idx, len(prefix))
             try:
-                stdscr.addstr(line_y, x, _pad_cells(f"{prefix}{text}", content_w), attr)
+                if rangos:
+                    # Sobre la fila **seleccionada** el resaltado no puede ser el
+                    # color de siempre: la fila ya va pintada con el par de
+                    # selección y `PAIR_CURRENT` encima puede caer en el mismo
+                    # tono (amarillo sobre amarillo) y no verse nada. Ahí se
+                    # invierte, que funciona sobre cualquier par (FR-THE-06).
+                    hl_attr = (
+                        (attr | curses.A_REVERSE) if selected
+                        else (colors.pair(colors.PAIR_CURRENT) | curses.A_BOLD)
+                    )
+                    self._addstr_resaltado(
+                        stdscr, line_y, x, f"{prefix}{text}", rangos,
+                        content_w, attr, hl_attr,
+                    )
+                else:
+                    stdscr.addstr(line_y, x, _pad_cells(f"{prefix}{text}", content_w), attr)
                 if has_scroll:
                     self._render_scrollbar(stdscr, line_y, x + content_w, rows, i)
             except curses.error:
@@ -396,6 +503,10 @@ class HeaderBar:
     2. si no → cae el indicador de tema (es lo último en caer: es secundario);
     3. si no → se trunca el contexto por el final con `…`;
     4. si no → sólo la identidad, recortada por celdas y nunca partida.
+
+    El indicador de tema tiene **tres** estados, no dos: el tercer tema no es
+    «más claro» ni «más oscuro», y un glifo que lo distinga evita tener que
+    leer la palabra para saber en cuál se está.
     """
 
     def __init__(self, app: Any = None) -> None:
@@ -419,11 +530,11 @@ class HeaderBar:
             return
 
         theme_name = getattr(self.app, "theme_name", "light") if self.app else "light"
-        theme = (
-            f" {icons.ICON_THEME_DARK} "
-            if theme_name == "dark"
-            else f" {icons.ICON_THEME_LIGHT} "
-        )
+        glifo_tema = {
+            "dark": icons.ICON_THEME_DARK,
+            "light": icons.ICON_THEME_LIGHT,
+        }.get(theme_name, icons.ICON_THEME_CONTRAST)
+        theme = f" {glifo_tema} "
         logo = f" {icons.ICON_TV} theTVVIEW "
         ctx = (title or "").strip()
 
@@ -781,8 +892,22 @@ class SearchModal:
 
     @staticmethod
     def format_counter(matched: int, total: int) -> str:
-        """Texto del contador live (puro, testeable)."""
-        return f" {matched}/{total} "
+        """Texto del contador live (puro, testeable).
+
+        Dice **cuántos** hay, en palabras y con el singular correcto
+        (FR-SRC-04): "Sin coincidencias" no es "0/0" porque cero resultados y
+        cero canales son cosas distintas y el usuario tiene que distinguirlas.
+
+        `total` se conserva en la firma —la usan los llamadores y los tests—
+        pero no se mezcla aquí: el total de la lista ya está en su cabecera
+        (`ChannelsScreen.header_context()`), y repetirlo en el modal obliga a
+        leer dos sitios para el mismo dato.
+        """
+        if matched <= 0:
+            return "Sin coincidencias"
+        if matched == 1:
+            return "1 resultado"
+        return f"{matched} resultados"
 
     def calc_rect(self, max_y: int, max_x: int) -> tuple[int, int, int, int]:
         """Calcula (y, x, h, w) del modal centrado."""
@@ -865,8 +990,8 @@ class SearchModal:
         crow = y + 3
         if crow < y + h - 1:
             try:
-                stdscr.addstr(crow, x + max(2, w - len(counter) - 2),
-                              counter[:max(0, w - 4)],
+                stdscr.addstr(crow, x + max(2, w - cell_width(counter) - 2),
+                              clip_cells(counter, max(0, w - 4)),
                               colors.pair(colors.PAIR_STATUS))
             except curses.error:
                 pass
@@ -1688,6 +1813,67 @@ class Timeline:
             stdscr.addstr(y, x, line[:max(0, width)], attr)
         except curses.error:
             pass
+
+
+def estado_meta(estado) -> tuple[str, str, str, int, str]:  # noqa: ANN001
+    """`(glifo, glifo_ascii, palabra, par, palabra_sin_tilde)`.
+
+    Una función y no una constante de módulo porque `Estado` vive en
+    `thetvview.channel_health`, que importa la UI de forma perezosa: el
+    import se hace aquí, en el momento de pintar, y no al cargar los widgets.
+    """
+    from thetvview.channel_health import Estado
+
+    tabla = {
+        Estado.ONLINE: (icons.ESTADO_ONLINE, icons.ESTADO_ONLINE_ASCII, "En línea",
+                        colors.PAIR_SUCCESS, icons.ESTADO_ONLINE_ASCII_TXT),
+        Estado.AVISO: (icons.ESTADO_AVISO, icons.ESTADO_AVISO_ASCII, "Con avisos",
+                       colors.PAIR_WARNING, icons.ESTADO_AVISO_ASCII_TXT),
+        Estado.OFFLINE: (icons.ESTADO_OFFLINE, icons.ESTADO_OFFLINE_ASCII, "Sin conexión",
+                         colors.PAIR_DANGER, icons.ESTADO_OFFLINE_ASCII_TXT),
+        Estado.DESCONOCIDO: (icons.ESTADO_DESCONOCIDO, icons.ESTADO_DESCONOCIDO_ASCII,
+                             "Sin comprobar", colors.PAIR_MUTED,
+                             icons.ESTADO_DESCONOCIDO_ASCII_TXT),
+    }
+    return tabla.get(estado, tabla[Estado.DESCONOCIDO])
+
+
+def estado_badge_text(estado, *, ascii_only: bool = False) -> str:  # noqa: ANN001
+    """Texto del badge de estado: glifo **y** palabra (FR-STA-03).
+
+    Siempre los dos. Un estado comunicado sólo por color o sólo por glifo no
+    sobrevive a una terminal de dos colores, a un tema de alto contraste ni a
+    quien no distingue `⚠` de `✘` de un vistazo; la palabra es lo que lo dice
+    sin ambigüedad (NFR-06).
+    """
+    glifo, ascii_texto, palabra, _pair, palabra_ascii = estado_meta(estado)
+    if ascii_only:
+        return f"{ascii_texto} {palabra_ascii}"
+    return f"{glifo} {palabra}"
+
+
+def estado_attr(estado) -> int:  # noqa: ANN001
+    """Atributo curses del badge de estado."""
+    _glifo, _ascii_texto, _palabra, pair, _palabra_ascii = estado_meta(estado)
+    return colors.pair(pair) | curses.A_BOLD
+
+
+def estado_badge(stdscr: curses.window, y: int, x: int, estado, ancho: int,  # noqa: ANN001
+                 *, ascii_only: bool = False) -> None:
+    """Pinta el estado de un canal en `(y, x)`, recortado a `ancho` celdas.
+
+    El mismo widget en Reproduciendo y en cualquier sitio donde se pinte un
+    estado, para que el glifo y la palabra significen lo mismo allí donde
+    aparezcan (FR-STA-10). Nunca lanza: si no cabe, se recorta; si el ancho es
+    cero, no pinta nada.
+    """
+    texto = estado_badge_text(estado, ascii_only=ascii_only)
+    if ancho <= 0 or y >= stdscr.getmaxyx()[0]:
+        return
+    try:
+        stdscr.addstr(y, x, clip_cells(texto, ancho), estado_attr(estado))
+    except curses.error:
+        pass
 
 
 class TabBar:

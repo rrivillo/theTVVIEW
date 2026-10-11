@@ -1,8 +1,8 @@
 """Paleta de colores de la TUI, centralizada (solo curses stdlib).
 
 Define IDs estables de pares de colores. Los colores reales los inicializa
-theme.init_colors() según el tema activo (light/dark). Este módulo solo
-expone los IDs y el helper pair().
+theme.init_colors() según el tema activo (light/dark/high_contrast). Este
+módulo solo expone los IDs y el helper pair().
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ PAIR_CURRENT = 9
 PAIR_SEARCH = 10
 PAIR_EMPTY = 11
 
-# Pares extendidos (tema dual)
+# Pares extendidos (tres temas)
 PAIR_PRIMARY = 12
 PAIR_PRIMARY_HI = 13
 PAIR_SUCCESS = 14
@@ -38,6 +38,12 @@ PAIR_FOCUS = 22
 PAIR_SCROLLBAR = 23
 PAIR_SELECTED_M3U = 24  # amarillo para playlists M3U/html
 PAIR_SELECTED_XTREAM = 25  # púrpura para playlists Xtream
+PAIR_SECONDARY = 26  # texto de apoyo con color propio (token SECONDARY)
+
+#: Último par que la app necesita. Si la terminal da menos pares de los
+#: pedidos, `init_colors` se salta los que no quepan en vez de lanzar: hay
+#: terminales de 8 colores que sólo dan 8 pares y la app tiene que arrancar.
+MAX_PAIR = PAIR_SECONDARY
 
 
 def selection_pair_for_kind(kind: str | None) -> int:

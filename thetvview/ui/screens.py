@@ -13,18 +13,18 @@ from __future__ import annotations
 import curses
 import time
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 
 from thetvview import player, resolutions
 from thetvview import catchup
 from thetvview import config
-from thetvview.channel_health import ChannelHealthMonitor
+from thetvview.channel_health import ChannelHealthMonitor, estado_de
 from thetvview import epg_match
 from thetvview.epg_parser import Epg, parse_file
 from thetvview.groups import groups_of
 from thetvview.models import Channel, Playlist
 from thetvview.playlist_manager import PlaylistEntry, PlaylistError, PlaylistManager
-from thetvview.recents import RecentsManager
+from thetvview.recents import RecentsManager, relative_time
 from thetvview.cam_ref import MissingCamCredentialsError
 from thetvview.stream_ref import MissingCredentialsError, resolve_channel_url
 from thetvview.tracks.labels import audio_label, subtitle_label, video_label
@@ -44,7 +44,7 @@ from .errormsg import (
 )
 from .favorite_rows import FavoriteRow, build_rows, layout_columns, two_columns_fit
 from .textwidth import cell_width, clip_cells
-from .widgets import EmptyState, ScrollableList, render_separator
+from .widgets import EmptyState, ScrollableList, estado_badge_text, render_separator
 
 
 # Centinela: ChannelsScreen sin filtro de grupo (vs. filtro "sin grupo").
@@ -302,28 +302,30 @@ class PlaylistsScreen(Screen):
 
     def shortcuts(self) -> str:
         if not self.entries:
-            return "a Añadir · r Recientes · t Tema · ? Ayuda · q Salir"
+            return "a Añadir · T Tema · r Recientes · t Tema · ? Ayuda · q Salir"
         base = "↑/↓/←/→ · Enter · a Añadir · d Borrar"
         if self.can_change_password():
             base += " · C Contraseña Xtream"
-        return base + " · R Actualizar · r Recientes · f ★ · t Tema · ? Ayuda · q Salir"
+        return base + " · R Actualizar · T Tema · r Recientes · f ★ · t Tema · ? Ayuda · q Salir"
 
     def actions(self) -> list[Action]:
         """Catálogo del catálogo de listas (§3, Catálogo).
 
         Catálogo vacío: `shortcuts()` anuncia otras teclas, y la barra sólo
         puede declarar lo que la pantalla anuncia (§10). Por eso aquí sólo hay
-        «a Añadir» y «? Ayuda».
+        «a Añadir», «T Tema» y «? Ayuda».
         """
         if not self.entries:
             return [
                 Action("a", V.ANADIR, P.FRECUENTE),
+                Action("T", V.TEMA, P.ORGANIZACION),
                 Action("?", V.AYUDA, P.AYUDA, essential=True),
             ]
         acciones = [
             Action("Enter", V.ABRIR, P.PRIMARIA),
             Action("a", V.ANADIR, P.FRECUENTE),
             Action("d", V.BORRAR, P.ORGANIZACION),
+            Action("T", V.TEMA, P.ORGANIZACION),
         ]
         # `C` sólo existe para las Listas X: `shortcuts()` tampoco la anuncia
         # en el resto, y la barra no puede anunciar más que la pantalla (§10).
@@ -360,6 +362,8 @@ class PlaylistsScreen(Screen):
         if not self.entries:
             if key == ord("a"):
                 return {"action": "add_playlist"}
+            if key == ord("T"):
+                return {"action": "choose_theme"}
             return None
         if key == ord("R") or key == _KEY_F5:
             # El catálogo es un JSON local: relectura instantánea.
@@ -390,6 +394,9 @@ class PlaylistsScreen(Screen):
             self.selected = len(self.entries) - 1
         elif key == ord("a"):
             return {"action": "add_playlist"}
+        elif key == ord("T"):
+            # `T` elige el tema en un modal; `t` lo alterna (D12).
+            return {"action": "choose_theme"}
         elif key == ord("d"):
             entry = self.current_entry()
             if entry is None:
@@ -527,6 +534,104 @@ class PlaylistsScreen(Screen):
                 pass
 
 
+class HomeScreen(Screen):
+    """Bienvenida: lo primero que ve quien aún no tiene ninguna lista.
+
+    Es una pantalla de **una sola situación**: sin listas. Quien ya tiene
+    listas configuradas nunca la ve, porque la raíz sigue siendo el catálogo
+    (`App._pantalla_raiz`): meterla en medio del camino de quien ya sabe lo
+    que hace sería hacerle pulsar «Enter» de más para ver lo mismo
+    (FR-HOM-06, D13).
+
+    Todo lo que ofrece es ejecutable de verdad —«a» entra en el mismo modal de
+    alta que usa el catálogo— y nada de lo que enseña es un número de ejemplo:
+    si no hay listas, no hay cifras que inventar (FR-HOM-04).
+    """
+
+    title = "theTVVIEW"
+
+    #: Qué hace la app, en una frase. Sin cifras de ejemplo.
+    DESC = "Tu televisión en la terminal: listas de canales, guía y favoritos."
+
+    def header_context(self) -> str:
+        return f"{icons.ICON_TV} Bienvenida"
+
+    def shortcuts(self) -> str:
+        return "a Añadir · ? Ayuda · t Tema · q Salir"
+
+    def actions(self) -> list[Action]:
+        return [
+            Action("a", V.ANADIR, P.PRIMARIA),
+            Action("?", V.AYUDA, P.AYUDA, essential=True),
+            Action("q", V.SALIR, P.NAVEGACION),
+        ]
+
+    def handle_key(self, key: int) -> dict | None:
+        if key == ord("a"):
+            # El mismo camino que el catálogo: un único alta, no dos.
+            return {"action": "add_playlist"}
+        if key == ord("q"):
+            # `q` lo atiende la App antes que la pantalla; si algún día llegara
+            # aquí, la intención del usuario es la misma: la salida se confirma.
+            return {"action": "confirm_quit"}
+        return None
+
+    def reload(self) -> None:
+        """Reactiva el catálogo en cuanto hay su primera lista.
+
+        `add_playlist`, `remove_playlist` y `restore_playlist` recargan la
+        pantalla actual cuando terminan. Aquí eso significa algo concreto: si
+        ya hay listas, la bienvenida **deja de tener razón de ser** y la raíz
+        pasa a ser el catálogo —el sitio donde de verdad se abre un canal—, en
+        vez de dejar al usuario con un «vacío» que ya no lo es (FR-HOM-07).
+
+        Si sigue sin haber listas, no hace nada: recargar no inventa.
+        """
+        app = self.app
+        hay = getattr(getattr(app, "playlists", None), "load", None)
+        try:
+            entradas = hay() if callable(hay) else []
+        except Exception:
+            return
+        if not entradas:
+            return
+        stack = getattr(app, "stack", None)
+        if isinstance(stack, list) and stack and stack[0] is self:
+            stack[0] = PlaylistsScreen(app)
+            app.status.show("Listas añadidas. Elige una con Enter.")
+
+    def render(self, stdscr: curses.window) -> None:
+        max_y, max_x = stdscr.getmaxyx()
+        # Identidad primero (FR-HOM-09): el nombre y una frase. En terminal
+        # estrecha el bloque se recorta solo; nunca se lanza.
+        titulo = f"{icons.ICON_TV} theTVVIEW"
+        y = max(2, max_y // 2 - 4)
+        if max_y > 3 and max_x > len(titulo):
+            try:
+                stdscr.addstr(y, max(0, (max_x - cell_width(titulo)) // 2),
+                              clip_cells(titulo, max_x),
+                              colors.pair(colors.PAIR_TITLE) | curses.A_BOLD)
+            except curses.error:
+                pass
+            y += 1
+            desc = clip_cells(self.DESC, max(0, max_x - 2))
+            try:
+                stdscr.addstr(y, max(0, (max_x - cell_width(desc)) // 2), desc,
+                              colors.pair(colors.PAIR_DIM))
+            except curses.error:
+                pass
+            y += 2
+        # El bloque estándar explica qué pasa y qué hacer, y `EmptyState` ya
+        # sabe recortarse y degradarse en terminal estrecha (FR-HOM-08).
+        EmptyState.render(
+            stdscr, y, max_x,
+            icons.ICON_LIST,
+            "Todavía no hay ninguna lista",
+            "Añade una lista de canales M3U o tu cuenta de Lists X para empezar.",
+            "[A] Añadir lista",
+        )
+
+
 class ChannelsScreen(Screen):
     """Lista de canales de una playlist abierta.
 
@@ -645,6 +750,40 @@ class ChannelsScreen(Screen):
         self._search_src = channels
         return texts
 
+    #: Tope de coincidencias resaltadas por fila. Diez es de sobra para leer
+    #: de un vistazo y evita que un nombre kilométrico painted en 400 trozos
+    #: convierta el resaltado en ruido (y en trabajo de más por tecla).
+    MAX_RESALTADOS = 10
+
+    @classmethod
+    def _coincidencias(cls, texto: str, q: str) -> list[tuple[int, int]]:
+        """Rangos `(inicio, fin)` de cada aparición de `q` en `texto`.
+
+        Índices de **carácter**, que es lo que corta `ScrollableList`. Primero
+        se busca tal cual —caso normal, y un `find` en C— y sólo si eso falla
+        se cae a `casefold`, que es el caso caro: escribir en mayúsculas no
+        debe costarle un `casefold` a cada canal de la lista.
+
+        Si `casefold()` cambia la longitud del texto (`ß` → `ss`), los índices
+        ya no valen sobre el original: en ese caso no se resalta nada. Es
+        preferible a resaltar el trozo equivocado.
+        """
+        if not texto or not q:
+            return []
+        rango = max(1, cls.MAX_RESALTADOS)
+        bajo = texto.casefold()
+        if len(bajo) != len(texto):
+            bajo = q if q in texto else ""
+        if not bajo:
+            return []
+        salta = len(q)
+        rangos: list[tuple[int, int]] = []
+        pos = bajo.find(q)
+        while pos != -1 and len(rangos) < rango:
+            rangos.append((pos, pos + salta))
+            pos = bajo.find(q, pos + salta)
+        return rangos
+
     def _apply_filter(self, keep_selection: bool = False) -> None:
         prev_pos = self.list.selected if keep_selection else -1
         prev_idx = (
@@ -664,14 +803,25 @@ class ChannelsScreen(Screen):
             texts = self._search_texts_for(channels)
             visible: list[int] = []
             shown = []
+            rangos: list[list[tuple[int, int]]] = []
             append_v = visible.append
             append_l = shown.append
+            append_r = rangos.append
             for i, text in enumerate(texts):
                 if q in text:
                     append_v(i)
-                    append_l(all_labels[i])
+                    etiqueta = all_labels[i]
+                    append_l(etiqueta)
+                    # La coincidencia se resalta en **la etiqueta que se
+                    # ve**, no en el texto indexado (nombre + grupo): los
+                    # índices de aquél no valen sobre ésta (FR-SRC-06).
+                    append_r(self._coincidencias(etiqueta, q))
             self.visible_idx = visible
         self.list.set_items(shown, keep_selection=True)
+        if not q:
+            self.list.set_ranges(None)
+        else:
+            self.list.set_ranges(rangos)
         if prev_idx is not None:
             try:
                 # index() es C-level y evita el bucle Python por tecla.
@@ -1376,7 +1526,19 @@ class RecentsScreen(Screen):
         super().__init__(app)
         self.list = ScrollableList()
         self.items = app.recents.load()
-        self.list.set_items([f"{i.name} ({i.player})" for i in self.items])
+        self.list.set_items(self._filas(), self._fechas())
+
+    def _fechas(self) -> list[str]:
+        """Segunda columna: cuándo se reprodujo cada canal (FR-REC-03).
+
+        Es la columna de texto secundario que `ScrollableList` ya tenía para
+        Favoritos, así que aquí no hay widget nuevo ni ruta de render nueva.
+        """
+        ahora = datetime.now(timezone.utc)
+        return [relative_time(i.at_utc, ahora) for i in self.items]
+
+    def _filas(self) -> list[str]:
+        return [f"{i.name} ({i.player})" for i in self.items]
 
     def current_item(self):
         if not self.items:
@@ -2930,10 +3092,18 @@ class NowPlayingScreen(Screen):
                 hstat = hlth.status(player_alive=alive)  # type: ignore[attr-defined]
                 # Solo mostrar barra + etiqueta, sin jitter/ms técnicos
                 # Nivel 0-5 -> texto ya es humano ("Excelente" etc) y bar "●●●●○"
-                health_icon = icons.ICON_OK if hstat.level >= 4 else icons.ICON_WARN if hstat.level >= 2 else icons.ICON_ERR if hstat.level == 1 else icons.ICON_LIVE_OFF
+                # La barra dice **qué tan bien va**; el badge dice **qué se
+                # sabe de él**: sin sondas, un canal nunca comprobado sale
+                # "Sin comprobar" y no como online ni como caído (FR-STA-01).
+                # Glifo + palabra, nunca sólo color (FR-STA-03).
+                estado = estado_de(hstat)
                 hl_attr = colors.pair(hstat.color_pair)
-                # Frase ultra simple: "Señal: [●●●●○] Buena"
-                lines.append((f" Señal: [{hstat.bar}] {hstat.label} {health_icon}", hl_attr))
+                # Frase ultra simple: "Señal: [●●●●○] Buena ● En línea"
+                lines.append((
+                    f" Señal: [{hstat.bar}] {hstat.label} "
+                    f"{estado_badge_text(estado)}",
+                    hl_attr,
+                ))
                 # Solo si nivel <=2 y vivo, un tip corto accionable en lenguaje natural
                 if alive and hstat.level <= 2:
                     tip = "Consejo: si se corta, prueba otra resolución o revisa Wi-Fi."
@@ -3581,6 +3751,29 @@ def _almacen_de(app) -> object:  # noqa: ANN001
     return _ResolutorCredenciales(getattr(app, "playlists", None), get_store())
 
 
+def _recordar_reciente(app, channel, player_name: str) -> None:  # noqa: ANN001
+    """Deja el canal en Recientes. Es un historial, no un requisito (FR-REC-01).
+
+    Se llama con el canal **original** (sin credenciales resueltas) y con el
+    reproductor que acabó ABRiéndose de verdad, no con el pedido: así Recientes
+    dice la verdad aunque el router haya recurrido a otro motor.
+
+    Nunca propaga fallos: un disco lleno o un `recents.json` con permisos
+    raros no puede impedir que se vea el canal. Peor: el aviso iría por el
+    mismo camino que warn/error, así que avisar desde aquí exigiría abrir un
+    modal *encima* de la pantalla de reproducción. Se degrada en silencio, que
+    es la degradación honesta para un dato secundario.
+    """
+    manager = getattr(app, "recents", None)
+    push = getattr(manager, "push", None)
+    if not callable(push):
+        return
+    try:
+        push(channel, player_name)
+    except Exception:
+        pass
+
+
 def play_channel(  # noqa: ANN001
     app,
     channel,
@@ -3637,6 +3830,10 @@ def play_channel(  # noqa: ANN001
         )
         return
     es_camara = resolved != channel.url
+    # El canal **tal como entró**, sin la URL resuelta: es el único que se
+    # escribe en Recientes, porque `resolved` lleva las credenciales que se
+    # reconstruyeron (SDD §37). A disco nunca van credenciales (H7).
+    canal_original = channel
     if es_camara:
         channel = replace(channel, url=resolved)
 
@@ -3763,6 +3960,7 @@ def play_channel(  # noqa: ANN001
         intentos_maximos=reconnect_max_attempts,
     ))
     app.prefs.set_last_player(effective_name)
+    _recordar_reciente(app, canal_original, effective_name)
     for aviso in _avisos_sin_repetir(app, channel, effective_name, avisos):
         app.notify_warning(aviso)
     if catchup_playback is not None:

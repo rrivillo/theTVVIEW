@@ -54,9 +54,12 @@ Existe para terminar con una deriva concreta: la misma operación se llamaba
 `Ver` en un sitio, `Reproducir` en otro y `Play` en un tercero. Si necesitas una
 etiqueta nueva, se añade **una vez** en `V` y en ningún otro lugar.
 
-Etiquetas que existen y **no** están en la barra (`resolution`, `t Tema`,
-`u Deshacer`, `Ratón`, `q Salir`): son globales o de baja frecuencia, y la
-ayuda `?` es donde viven.
+Etiquetas que existen y **no** están en la barra (`resolution`, `u Deshacer`,
+`Ratón`): son globales o de baja frecuencia, y la ayuda `?` es donde viven.
+`t Tema` y `q Salir` también son globales, pero se declaran igual en las
+pantallas donde la tecla tiene un comportamiento propio (la bienvenida y el
+catálogo), porque el catálogo es la fuente de verdad de lo que la pantalla
+hace.
 
 ---
 
@@ -125,6 +128,7 @@ Se derivan del estado real **en el momento de construir la lista**:
 | Canales | `f` → `Favorito` / `Quitar` según el canal bajo el cursor |
 | Favoritos | `f` → siempre `Quitar` (todo lo que hay ahí es favorito) |
 | Catálogo | `C Contraseña X` sólo si la lista es Xtream |
+| Canales | la coincidencia de la búsqueda se resalta en la fila (opt-in) |
 | EPG | `Enter Ver` / `Enter Archivo` según `has_catchup` |
 | Pistas | `Enter Ver` / `Enter Reproductor` según si el player ya está elegido |
 | Reproduciendo | `i Info` sólo con sesión de pistas viva |
@@ -193,7 +197,10 @@ Un botón que se puede pulsar pero no hace nada es peor que un botón que no
 existe. `App._tecla_global()` decide el reparto:
 
 1. mientras se escribe (`searching`), las globales van al campo de texto;
-2. `q`, `t`, `?`, `p`, `u`, `!` y `Esc` son de la app;
+2. `q`, `t`, `?`, `p`, `u`, `!` y `Esc` son de la app. `t` **alterna** entre los
+   tres temas y avisa en un modal; `T` (mayúscula) es la de las pantallas que la
+   declaran, y abre un modal con los tres para elegir explícitamente. No es un
+   conflicto: dos teclas, dos intenciones;
 3. **`r` es global (Recientes) salvo que la pantalla la reclame** en su
    `actions()`.
 

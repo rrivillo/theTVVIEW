@@ -26,7 +26,8 @@ ver y con qué reproductor.
 | **Reproductor** | Elige mpv/mplayer/vlc (solo se ofrecen los instalados) y reproduce. |
 | **EPG** | XMLTV en ruta o URL, `.xml` o `.gz`, con cache y recarga (`r`); si la lista lo trae, se carga solo. |
 | **Archivo** | Catch-up solo si el proveedor lo declara (ver la sección dedicada). |
-| **Extras** | Recientes, salud del canal en vivo, tema claro/oscuro, ayuda contextual, ratón. |
+| **Extras** | Recientes con fecha, salud del canal en vivo, tres temas (claro, oscuro y alto contraste), ayuda contextual, ratón. |
+| **Bienvenida** | Sin listas configuradas, la app te recibe con lo único que hace falta: añadir la primera. |
 | **Cabecera** | Igual en todas las pantallas: la identidad a la izquierda y el contexto a la derecha. |
 | **Rendimiento** | Cachés en disco con TTL + carga en segundo plano: abrir listas grandes es instantáneo. |
 
@@ -157,7 +158,7 @@ elegido: nunca te hacen elegirlo dos veces.
 
 ### Cómo leer la cabecera
 
-La cabecera es siempre la misma, en las 11 pantallas:
+La cabecera es siempre la misma, en todas las pantallas:
 
 ```
  ◉ theTVVIEW ───────────────────────────── ◉ Canales · 1284 ☀
@@ -168,8 +169,9 @@ La cabecera es siempre la misma, en las 11 pantallas:
 - **La derecha es el contexto**: dónde estás y, en Canales, cuántos canales
   hay a la vista. El número cuenta los **canales visibles**, así que baja solo
   al escribir en la búsqueda (`/`) o al entrar en un grupo (`g`).
-- **El indicador de tema** (`☀` / `☽`) va al final de la cabecera. Es lo
-  primero que desaparece cuando falta ancho, porque es lo único prescindible.
+- **El indicador de tema** (`☀` claro · `☽` oscuro · `◐` alto contraste) va
+  al final de la cabecera. Es lo primero que desaparece cuando falta ancho,
+  porque es lo único prescindible.
 
 Los contextos que verás:
 
@@ -179,7 +181,8 @@ Los contextos que verás:
 | `◉ Canales · N` | Lista de canales, con los visibles a la vista. |
 | `▣ Grupos` | Grupos (categorías) de la lista. |
 | `★ Favoritos` | Canales marcados con `f`. |
-| `◷ Recientes` | Historial de reproducción. |
+| `◷ Recientes` | Historial de reproducción, con cuándo se vio cada canal. |
+| `◉ Bienvenida` | Primer arranque, sin ninguna lista todavía. |
 | `◈ Guía TV` | Programación del canal. |
 | `Calidad` | Selector de resolución. |
 | `Audio y calidad` | Selector de pistas. |
@@ -216,6 +219,27 @@ lista (`g` = primero, `G` = último) sí se cumple.
 En las búsquedas (`/`): `Enter` confirma el filtro, `Esc` lo limpia y
 `Ctrl-U` vacía lo escrito sin cerrar el campo.
 
+El buscador dice **cuántos** hay, con el singular correcto, y resalta la
+coincidencia en la propia fila:
+
+```text
+⌕ de                                                   3 resultados
+  ┌──────────────────────────────┐
+  │ ESPN                         │   ◉ En línea
+  │ ESPN 2                       │   ● En línea
+  └──────────────────────────────┘
+```
+
+- El contador dice `Sin coincidencias` cuando no hay ninguna: eso **no** es
+  lo mismo que "aquí no hay canales", y la pantalla lo distingue con su propio
+  mensaje.
+- En Canales, la parte que coincide con lo que escribiste sale resaltada
+  (negrita, o invertida en la fila seleccionada, para que se vea sobre
+  cualquier color). En Grupos no se resalta: allí se busca entre categorías.
+- Con listas de miles de canales la búsqueda no se ralentiza: las etiquetas y
+  los textos de búsqueda están cacheados, así que escribir una letra sólo
+  recorre lo que ya estaba en memoria.
+
 ### Listas (catálogo)
 
 | Tecla | Acción |
@@ -227,8 +251,56 @@ En las búsquedas (`/`): `Enter` confirma el filtro, `Esc` lo limpia y
 | `C` | Cambiar la contraseña guardada (solo Listas Especiales X). |
 | `R` / `F5` | Releer `playlists.json`. |
 | `f` | Ver favoritos. |
+| `T` | Elegir tema en un modal con los tres. |
 
 Las Listas Especiales X se resaltan en púrpura; las M3U en amarillo.
+
+`t` alterna entre los tres temas sin preguntar nada; `T` abre un modal con los
+tres para elegir a propósito. En un catálogo vacío, `T` funciona igual: es una
+acción real, no un adorno.
+
+### Temas
+
+La app tiene **tres** temas y se cambian con `t` (alterna) o `T` (modal con los
+tres para elegir). La elección se guarda y se recupera la próxima vez.
+
+| Tema | Cómo se ve |
+| --- | --- |
+| **Claro** | Fondo de la terminal, texto casi negro, acentos azules. |
+| **Oscuro** | Texto claro sobre fondo de la terminal, acentos violeta y ámbar. |
+| **Alto contraste** | Blanco sobre negro, selección invertida y colores de alta visibilidad. |
+
+El de **alto contraste** no es "más oscuro": es blanco sobre negro con la
+selección del revés y bordes claros. Pensado para terminales muy claras, para
+pantallas con poca visibilidad o para quien lee mejor así.
+
+La **selección se ve sin depender del color** en los tres temas: además del
+tono, la fila elegida lleva su prefijo `▸` y el resaltado de la búsqueda es
+negrita o inversión. En una terminal sin color (`NO_COLOR=1` o sólo 8 colores),
+la app funciona igual y degrada sola.
+
+### Bienvenida (primer arranque)
+
+Si todavía **no tienes ninguna lista**, la app arranca en una pantalla de
+bienvenida en vez de en el catálogo:
+
+```text
+◉ theTVVIEW
+Tu televisión en la terminal: listas de canales, guía y favoritos.
+
+Todavía no hay ninguna lista
+Añade una lista de canales M3U o tu cuenta de Listas Especiales X para empezar.
+
+              [A] Añadir lista
+```
+
+Sólo ofrece lo que se puede ejecutar de verdad: `a` añadir, `?` ayuda, `q`
+salir. En cuanto añades tu primera lista, la bienvenida da paso al catálogo
+—que es donde se abre un canal de verdad— sin dejarte pulsando `Enter` de más.
+
+Si ya tienes listas configuradas, **no verás esta pantalla**: el arranque es
+exactamente igual que siempre, con el catálogo como pantalla inicial. No se
+añaden pantallas intermedias a quien ya sabe lo que hace.
 
 ### Canales
 
@@ -266,6 +338,32 @@ si el EPG está cargado.
 
 En las tres vale `Esc` para volver, y también las globales `p` (elegir
 reproductor) y `?` (ayuda).
+
+#### Recientes
+
+Reproducir un canal lo deja en el historial, en `data/recents.json`. El más
+reciente va primero y cada entrada dice **cuándo** la viste:
+
+```text
+▸ La 1 (mpv)                                       hace 4 min
+  Deportes (vlc)                                     ayer
+  Radio Serra (mpv)                               hace 2 semanas
+```
+
+- El orden es por última reproducción, del más reciente al más antiguo. Si
+  borras o editas el fichero a mano, al abrirlo se ordena igualmente.
+- **Un canal es un canal, no un nombre.** Si dos canales se llaman igual pero
+  vienen de URLs distintas, siguen siendo dos entradas. La identidad es el
+  `tvg-id` cuando existe y, si no, la URL; es la misma que usan las
+  preferencias de pistas.
+- **Volver a ver el mismo canal no lo duplica**: actualiza su fecha y sube.
+- Si una entrada no tiene fecha válida —un fichero antiguo, una marca
+  editada— sale como `sin fecha` en vez de inventar una.
+- **Nunca se guardan credenciales.** Si el canal venía con contraseña dentro
+  (una cámara IP, por ejemplo), a disco sale la referencia opaca, no la URL
+  con la clave.
+- Los registros antiguos siguen valiendo: si tu `recents.json` ya existía, se
+  lee tal cual.
 
 Favoritos muestra cada canal en dos columnas: el nombre y, a la derecha, lo
 que están dando ahora mismo:
@@ -635,9 +733,24 @@ está en otra ventana) con:
 - La etiqueta `En vivo` (o `Archivo` si es catch-up) y el título del programa.
 - La **salud del stream**: se sondea en segundo plano cada 3 s (HEAD y, si el
   servidor lo rechaza, GET con `Range`), con 3 s de timeout y sin reintentos,
-  y se resume como `Señal: [●●●●○] Buena`. La escala va de `Sin señal` a
-  `Excelente` según latencia media, jitter y porcentaje de éxito. Si el canal
-  no es `http(s)` (rtmp, udp…) se indica que no es medible.
+  y se resume como `Señal: [●●●●○] Buena ● En línea`. La barra va de `Sin
+  señal` a `Excelente` según latencia media, jitter y porcentaje de éxito; al
+  lado, el **estado** dice lo que se sabe del canal, no lo bien que va:
+
+  | Estado | Cuándo sale |
+  | --- | --- |
+  | `◷ Sin comprobar` | Todavía no se ha comprobado, o el canal usa un protocolo que no se puede sondear (rtmp, udp…). **Nunca se pinta como online ni como caído.** |
+  | `● En línea` | La última comprobación salió bien. |
+  | `⚠ Con avisos` | El resultado es dudoso o parcial: cortes, latencia alta. |
+  | `✘ Sin conexión` | El fallo está confirmado (todas las sondas fallaron, o el reproductor se detuvo). |
+
+  El estado va **siempre con palabras**, no sólo con color ni con el glifo: en
+  una terminal de dos colores, o para quien no distingue `⚠` de `✘` de un
+  vistazo, la palabra es lo que no miente. En terminales que no representan
+  bien el Unicode hay una reserva ASCII (`[v]`, `[!]`, `[x]`, `[?]`).
+- Esto mide **conectividad HTTP**, no que se vea vídeo: no se comprueba la
+  reproducción, sólo que el servidor responde. Por eso la etiqueta habla de
+  señal y comprobación, y no de "funciona".
 - `q` detiene la reproducción y vuelve a la pantalla anterior.
 - `d` abre el diagnóstico del canal (ver arriba) sin tocar la red.
 - El estado del reproductor se refleja en el medidor: `Reproduciendo`,
@@ -718,7 +831,7 @@ Funcionan en cualquier pantalla salvo mientras escribes en una búsqueda.
 | `Esc` / `Retroceso` | Volver a la pantalla anterior. |
 | `q` | Salir de la app (pide confirmación; `s`/`y` sí, `n` no, `Esc` cancela). |
 | `?` | Abrir/cerrar la ayuda contextual (con scroll). |
-| `t` | Alternar tema claro/oscuro (se guarda en `data/theme.json`). |
+| `t` | Pasar al siguiente tema (claro → oscuro → alto contraste → claro). Avisa en un modal y se guarda en `data/theme.json`. |
 | `r` | Ver Recientes (en la pantalla EPG, en su lugar recarga). |
 | `p` | Elegir reproductor del canal actual. |
 | `u` | Deshacer el último borrado de lista. |
@@ -841,9 +954,9 @@ Todo lo persistido vive en `data/` (está en `.gitignore`):
 | --- | --- |
 | `playlists.json` | Catálogo de listas: nombre, origen, tipo y (en Listas Especiales X) servidor y usuario. **Nunca** incluye contraseñas; permisos `0600`. |
 | `favorites.json` | Canales favoritos (identidad = `url`). |
-| `recents.json` | Últimos 20 elementos reproducidos (con la URL redactada si traía credenciales). |
+| `recents.json` | Últimos 20 canales reproducidos, con la fecha de cada uno y su `tvg-id` (si lo hay) para no confundir dos canales con el mismo nombre. La URL va redactada si traía credenciales. Los ficheros anteriores a ese campo siguen leyéndose. |
 | `prefs.json` | Último reproductor usado, tema y preferencias de pistas (audio, subtítulos, calidad), con la precedencia canal → proveedor → global. También guarda `last_group_sort` y `ask_track_options`, que la TUI todavía no cambia desde los menús (los grupos salen siempre por nombre y `(sin grupo)` al final), y las de multi-stream: `preferred_backend`, `connect_timeout`, `startup_timeout`, `reconnect_max_attempts`, `playback_profile` y `diagnostics_enabled`. |
-| `theme.json` | Tema claro/oscuro. |
+| `theme.json` | Tema elegido: `light`, `dark` o `high_contrast`. |
 | `epg_cache/` | XMLTV descargados. |
 | `playlist_cache/` | Playlists M3U descargadas. |
 | `xtream_cache/` | Respuestas de la API de Listas Especiales X (categorías y canales). |
@@ -881,7 +994,7 @@ convertir la app en algo que no responde. Editables a mano:
 ## Tests
 
 ```bash
-# Suite completa (2108 tests, ~1,6 min)
+# Suite completa (2276 tests, ~2 min)
 python -m unittest -v
 
 # Solo tests de una parte

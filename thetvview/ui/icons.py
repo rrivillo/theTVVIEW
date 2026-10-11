@@ -102,6 +102,31 @@ ICON_HELP = "?"
 # --- Tema ------------------------------------------------------------------
 ICON_THEME_LIGHT = "☀"
 ICON_THEME_DARK = "☽"
+#: Disco medio lleno: el tercer tema no es «más claro» ni «más oscuro», es
+#: «más contraste», y un glifo que lo diga evita tener que leer la palabra.
+ICON_THEME_CONTRAST = "◐"
+
+# --- Estados de salud ------------------------------------------------------
+#: Glifos y su reserva ASCII. La reserva es lo que se pinta cuando la
+#: terminal no representa bien el Unicode (FR-STA-09): el estado nunca se
+#: comunica sólo con el glifo, siempre también con la palabra.
+ESTADO_ONLINE = "●"
+ESTADO_AVISO = "⚠"
+ESTADO_OFFLINE = "✘"
+ESTADO_DESCONOCIDO = "◷"
+ESTADO_ONLINE_ASCII = "[v]"
+ESTADO_AVISO_ASCII = "[!]"
+ESTADO_OFFLINE_ASCII = "[x]"
+ESTADO_DESCONOCIDO_ASCII = "[?]"
+
+#: Las mismas palabras, sin tilde: una terminal que sólo habla ASCII
+#: tampoco debe comerse la `í` de «En línea». El glifo ASCII ya no lleva
+#: información por sí solo, así que **todas** las reservas son de 3 caracteres
+#: (`[v]`, `[!]`, `[x]`, `[?]`) y ni una se confunde con otra de un vistazo.
+ESTADO_ONLINE_ASCII_TXT = "En linea"
+ESTADO_AVISO_ASCII_TXT = "Con avisos"
+ESTADO_OFFLINE_ASCII_TXT = "Sin conexion"
+ESTADO_DESCONOCIDO_ASCII_TXT = "Sin comprobar"
 
 # --- Toast / estado --------------------------------------------------------
 ICON_OK = "✔"
