@@ -81,13 +81,46 @@ class TestM3uLoadUrl(unittest.TestCase):
             old = time.time() - 7 * 3600
             os.utime(f, (old, old))
         self.served.write_text(OTHER, encoding="utf-8")
+        # `Last-Modified` va con granularidad de **segundo**, así que reescribir
+        # el fichero dentro del mismo segundo haría que el servidor respondiera
+        # 304 —que es lo correcto según el protocolo, no un fallo— y el test
+        # dependería del reloj. Se fija una marca posterior a la que el
+        # servidor ya-Пublizó para que la comparación sea determinista.
+        stamp = time.time() + 2
+        os.utime(self.served, (stamp, stamp))
+        self.addCleanup(os.utime, self.served, (stamp, stamp))
         pl = load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.assertEqual([c.name for c in pl.channels], ["Canal Nuevo"])
+
+    def test_una_respuesta_304_usa_la_cache(self) -> None:
+        """CHAN-004: si el servidor dice que no cambió, no se re-descarga."""
+        load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
+        # Segunda carga con TTL caducado: llega un 304 y se devuelve la cache.
+        for f in self.cache_dir.iterdir():
+            old = time.time() - 7 * 3600
+            os.utime(f, (old, old))
+        pl = load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
+        self.assertEqual([c.name for c in pl.channels], ["Canal Uno", "Canal Dos"])
 
     def test_force_refresh_ignora_cache(self) -> None:
         load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
         self.served.write_text(OTHER, encoding="utf-8")
         pl = load_url(self.url(), force_refresh=True, cache_dir=self.cache_dir, allow_private=True)
+        self.assertEqual([c.name for c in pl.channels], ["Canal Nuevo"])
+
+    def test_force_refresh_tambien_ignora_el_304(self) -> None:
+        """«quiero la lista de ahora» no puede acabar devolviendo la anterior."""
+        load_url(self.url(), cache_dir=self.cache_dir, allow_private=True)
+        for f in self.cache_dir.iterdir():
+            old = time.time() - 7 * 3600
+            os.utime(f, (old, old))
+        self.served.write_text(OTHER, encoding="utf-8")
+        pl = load_url(
+            self.url(),
+            force_refresh=True,
+            cache_dir=self.cache_dir,
+            allow_private=True,
+        )
         self.assertEqual([c.name for c in pl.channels], ["Canal Nuevo"])
 
     def test_servidor_caido_con_cache_expirada_devuelve_stale(self) -> None:

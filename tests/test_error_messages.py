@@ -293,7 +293,7 @@ class TestCadenaDeCausas(unittest.TestCase):
             raise original
 
         with mock.patch(
-            "thetvview.security.safe_http.SafeHttpClient.get_bytes",
+            "thetvview.security.safe_http.SafeHttpClient.get_conditional",
             side_effect=falla,
         ):
             with self.assertRaises(OSError) as ctx:
@@ -310,7 +310,7 @@ class TestCadenaDeCausas(unittest.TestCase):
             raise original
 
         with mock.patch(
-            "thetvview.security.safe_http.SafeHttpClient.get_bytes",
+            "thetvview.security.safe_http.SafeHttpClient.get_conditional",
             side_effect=falla,
         ):
             with self.assertRaises(OSError) as ctx:

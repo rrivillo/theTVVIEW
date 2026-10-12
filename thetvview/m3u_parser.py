@@ -31,12 +31,20 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
 from . import config
 from .cam_ref import registrar_camara
 from .epg_parser import SOURCE_ATTRS, resolve_source, split_sources
+from .channel_identity import ReconcileReport, reconcile
 from .models import Channel, Playlist
+from .storage.json_store import (
+    atomic_write_bytes,
+    atomic_write_json,
+    read_json_with_recovery,
+)
 from .security.errors import IPTVError, ParseError
 from .security.limits import get_limits
 from .security.local_files import gunzip_limited, read_limited_text
@@ -313,6 +321,202 @@ DEFAULT_TTL_HOURS: float = 6.0
 
 _GZIP_MAGIC = b"\x1f\x8b"
 
+#: Veredicto de la **última** validación de lista hecha por `load_url`.
+#:
+#: Es una variable de módulo a propósito y no un valor de retorno: cambiar la
+#: firma de `load_url` obligaría a tocar a todos los que ya la llaman, y quien
+#: carga una lista desde la UI necesita poder **mostrar** el motivo («se conservó
+#: la anterior») sin que `load_url` tenga que lanzar ni devolver dos cosas.
+#: Es el mismo patrón que `epg_parser` usa para su política de avisos.
+last_validation: "PlaylistValidation | None" = None
+
+
+#: Proporción mínima de entradas que debe traer una lista nueva respecto de la
+#: anterior para dar por hecho que es una lista **válida** (CHAN-003).
+#:
+#: Es un 30 %, no un 50 %: hay proveedores que reorganizan el catálogo y quitan
+#: de golpe todos los canales de una zona, así que un umbral alto rechazaría
+#: actualizaciones legítimas. Y no es 0: una lista que se queda en el 2 % de la
+#: que había no es una lista nueva, es una descarga cortada.
+MIN_RATIO: float = 0.3
+
+#: Sidecar con los encabezados de validación de la última descarga (CHAN-004).
+META_SUFFIX: str = ".meta.json"
+
+
+@dataclass
+class PlaylistValidation:
+    """Veredicto de una lista recién descargada, antes de sustituir a la buena.
+
+    Es un **valor**: dice si se puede aplicar y por qué, y quien llama decide.
+    Nada se aplica en silencio (FR-CHAN-007).
+    """
+
+    ok: bool = True
+    #: Motivo, en palabras, de por qué no se puede aplicar. Vacío si ``ok``.
+    motivo: str = ""
+    #: Cuántos canales trae la lista nueva.
+    canales: int = 0
+    #: Cuántos traía la lista anterior (0 si no había ninguna).
+    anteriores: int = 0
+    #: ``canales / anteriores``; 1.0 si no había anterior.
+    proporcion: float = 1.0
+    #: True si la lista llegó vacía.
+    vacia: bool = False
+    #: Resumen de cambios, si se calculó junto con la validación.
+    resumen_cambios: str = ""
+
+    def para_modal(self) -> str:
+        """Texto apto para un modal, con la explicación de siempre."""
+        if not self.ok:
+            return self.motivo
+        base = f"La lista nueva trae {self.canales} canales"
+        if self.anteriores:
+            base += f" (antes había {self.anteriores})"
+        if self.resumen_cambios:
+            base += f". {self.resumen_cambios}"
+        return base + "."
+
+
+def validate_playlist(
+    nueva: Playlist,
+    previa: Playlist | None = None,
+    *,
+    min_ratio: float = MIN_RATIO,
+) -> PlaylistValidation:
+    """¿Merece la pena sustituir la lista activa por esta? (FR-CHAN-006/007)
+
+    Dos rechazos, y sólo dos, porque son los que de verdad destruyen datos:
+
+    - **vacía**: una descarga que devuelve cero entradas es un panel caído, una
+      sesión caducada o un corte de conexión, no una lista sin canales;
+    - **truncada**: menos del ``min_ratio`` de lo que había. Una lista que pasa
+      de 20 000 a 400 canales es una lista a medio servir.
+
+    Lo que **no** se rechaza: una lista más corta por una caída real de canales,
+    con nombres duplicados o sin `tvg-id`. Rechazar eso sería inventar un
+    criterio que el usuario no pidió.
+
+    Devuelve el veredicto y **no** cambia nada por su cuenta. Si quien llama
+    decide aplicar una lista inválida, la aplica —pero porque lo decidió.
+    """
+    canales = len(nueva.channels)
+    anteriores = len(previa.channels) if previa is not None else 0
+    proporcion = 1.0 if anteriores <= 0 else canales / anteriores
+    if canales == 0:
+        return PlaylistValidation(
+            ok=False,
+            motivo=(
+                f"La lista llegó vacía (la anterior tenía {anteriores} "
+                "canales). Suele ser que el proveedor está saturado o que la "
+                "sesión caducó, así que se conserva la lista que ya tenías."
+            ),
+            canales=0,
+            anteriores=anteriores,
+            proporcion=proporcion,
+            vacia=True,
+        )
+    if anteriores > 0 and proporcion < min_ratio:
+        return PlaylistValidation(
+            ok=False,
+            motivo=(
+                f"La lista nueva trae {canales} canales y la anterior tenía "
+                f"{anteriores}: parece incompleta. Se conserva la lista que ya "
+                "tenías; si de verdad quieres cambiarla, dilo."
+            ),
+            canales=canales,
+            anteriores=anteriores,
+            proporcion=proporcion,
+        )
+    return PlaylistValidation(
+        ok=True, canales=canales, anteriores=anteriores, proporcion=proporcion
+    )
+
+
+def resumir_cambios(previa: Playlist | None, nueva: Playlist) -> ReconcileReport:
+    """Qué cambió entre la lista activa y la recién descargada (FR-CHAN-008).
+
+    No hace nada por su cuenta: devuelve el informe. Quien llama decide si lo
+    muestra y con qué texto.
+    """
+    return reconcile(
+    list(previa.channels) if previa is not None else [],
+    list(nueva.channels),
+)
+
+
+def _meta_path_for(cache: Path) -> Path:
+    """Ruta del sidecar de metadatos de `cache`."""
+    return cache.with_name(cache.name + META_SUFFIX)
+
+
+def _leer_meta(cache: Path) -> dict[str, str]:
+    """Encabezados guardados de la última descarga. Nunca lanza."""
+    try:
+        datos = read_json_with_recovery(_meta_path_for(cache))
+    except Exception:
+        return {}
+    if not isinstance(datos, dict):
+        return {}
+    return {
+        str(k): str(v)
+        for k, v in datos.items()
+        if isinstance(v, (str, int, float))
+    }
+
+
+def _escribir_meta(cache: Path, meta: dict[str, str]) -> None:
+    """Guarda los encabezados. Un fallo aquí no invalida la descarga."""
+    try:
+        atomic_write_json(
+            _meta_path_for(cache),
+            {str(k): str(v) for k, v in meta.items() if v},
+            schema_version=None,
+        )
+    except Exception:
+        pass  # el sidecar es una optimización, no un requisito
+
+
+def _borrar_meta(cache: Path) -> None:
+    """Olvida los encabezados: si la URL cambia, un `ETag` viejo miente."""
+    try:
+        _meta_path_for(cache).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _headers_condicionales(meta: dict[str, str]) -> dict[str, str]:
+    """`If-None-Match` / `If-Modified-Since` a partir del sidecar.
+
+    Sólo se envían si el valor está **presente**: mandarlos vacíos es peor que
+    no mandarlos, porque hay servidores que responden 304 a un
+    `If-Modified-Since` vacío en vez de 200, y entonces la app se quedaría con
+    la cache vieja para siempre.
+    """
+    headers: dict[str, str] = {}
+    etag = str(meta.get("etag") or "").strip()
+    modificado = str(meta.get("last_modified") or "").strip()
+    if etag:
+        headers["If-None-Match"] = etag
+    if modificado:
+        headers["If-Modified-Since"] = modificado
+    return headers
+
+
+def _meta_de_respuesta(url: str, headers: Mapping[str, str]) -> dict[str, str]:
+    """Encabezados de validación de una respuesta 200 (FR-CHAN-009).
+
+    **Nunca** se asume que esos encabezados garantizan que el contenido sea
+    válido: sólo permiten no volver a descargar algo que no ha cambiado. La
+    comprobación de integridad la sigue haciendo :func:`validate_playlist`, y
+    por eso se aplican las dos cosas (CHAN-004).
+    """
+    etag = str(headers.get("etag") or "").strip()
+    modificado = str(headers.get("last-modified") or "").strip()
+    if not etag and not modificado:
+        return {}
+    return {"url": url, "etag": etag, "last_modified": modificado}
+
 
 def _cache_path_for(url: str, cache_dir: Path) -> Path:
     """Nombre seguro y determinista para la entrada de cache de una URL."""
@@ -350,9 +554,14 @@ def _playlist_name_for(url: str) -> str:
     return name
 
 
-def fetch_bytes(url: str, timeout: float = DEFAULT_TIMEOUT,
-                max_bytes: int | None = None, *,
-                allow_private: bool = False) -> bytes:
+def fetch_bytes(
+    url: str,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_bytes: int | None = None,
+    *,
+    allow_private: bool = False,
+    condicional: dict[str, str] | None = None,
+) -> "FetchResult":
     """Descarga los bytes crudos de una playlist (solo http/https).
 
     Pasa por :class:`thetvview.security.safe_http.SafeHttpClient`, así que
@@ -363,6 +572,14 @@ def fetch_bytes(url: str, timeout: float = DEFAULT_TIMEOUT,
       ``limits.max_file_bytes`` (64 MB), el mismo que se aplica a un
       fichero local de playlist.
     - `max_bytes` permite afinar ese tope para una llamada concreta.
+    - `condicional` son las cabeceras de petición condicional ya calculadas
+      (``If-None-Match`` / ``If-Modified-Since``). Las calcula quien sabe dónde
+      está la cache —:func:`load_url`— y llegan vacías o ausentes cuando no hay
+      sidecar, que es el caso por defecto: no se manda nada que no se sepa
+      (FR-CHAN-009). Si el servidor responde 304, el resultado viene con
+      ``not_modified=True`` y el cuerpo vacío.
+    - Devuelve un :class:`FetchResult` con los encabezados de la respuesta, para
+      poder guardarlos después.
     - Lanza ValueError para URLs no soportadas u OSError amigable.
     """
     url = url.strip()
@@ -377,8 +594,11 @@ def fetch_bytes(url: str, timeout: float = DEFAULT_TIMEOUT,
         max_bytes=limit,
         purpose=PURPOSE_METADATA,
     )
+    headers: dict[str, str] = dict(condicional or {})
     try:
-        return client.get_bytes(url, timeout=timeout)
+        respuesta = client.get_conditional(
+            url, headers=headers, max_bytes=limit, timeout=timeout
+        )
     except (OSError, ValueError):
         raise
     except IPTVError as exc:
@@ -386,6 +606,24 @@ def fetch_bytes(url: str, timeout: float = DEFAULT_TIMEOUT,
         # contrato de esta función es "OSError amigable"; los mensajes ya
         # vienen redactados por safe_http.
         raise OSError(str(exc)) from exc
+    if respuesta.status == 304:
+        return FetchResult(b"", headers=dict(respuesta.headers), not_modified=True)
+    return FetchResult(respuesta.body, headers=dict(respuesta.headers))
+
+
+@dataclass
+class FetchResult:
+    """Cuerpo descargado y encabezados de la respuesta.
+
+    Existe para que la descarga condicional (CHAN-004) pueda **guardar** el
+    `ETag`/`Last-Modified` que recibió, sin que el llamante tenga que repetir
+    la petición.
+    """
+
+    body: bytes = b""
+    headers: dict[str, str] = field(default_factory=dict)
+    #: True cuando el servidor respondió 304 y el cuerpo está vacío.
+    not_modified: bool = False
 
 
 def parse_url(url: str, timeout: float = DEFAULT_TIMEOUT, *,
@@ -405,7 +643,7 @@ def parse_url(url: str, timeout: float = DEFAULT_TIMEOUT, *,
     que evita re-descargar listas grandes en cada apertura.
     """
     url = url.strip()
-    raw = fetch_bytes(url, timeout=timeout, allow_private=allow_private)
+    raw = fetch_bytes(url, timeout=timeout, allow_private=allow_private).body
     name = _playlist_name_for(url)
     return parse_text(_decompress_and_decode(raw, url), source=url, name=name)
 
@@ -418,22 +656,32 @@ def load_url(
     force_refresh: bool = False,
     cache_dir: Path | None = None,
     allow_private: bool = False,
+    confirmar=None,  # noqa: ANN001 - Callable[[PlaylistValidation], bool] | None
+    condicional: bool = True,
+    previa: Playlist | None = None,
 ) -> Playlist:
     """Descarga una playlist por URL usando cache local con TTL.
 
     - Si hay copia en cache con menos de `ttl_hours`, se usa sin red
       (apertura instantánea, ideal para get.php lentos).
-    - Si no, se descarga (con timeout), se guarda en cache y se parsea.
-    - Con `ttl_hours <= 0` o `force_refresh=True` siempre re-descarga.
-    - Si la descarga falla pero hay cache previa (aunque caducada),
-      se devuelve la cache como fallback en vez de romper ("a veces
-      no funciona" por paneles saturados).
-    - `cache_dir` permite tests; por defecto es config.PLAYLIST_CACHE_DIR.
+    - Con `ttl_hours <= 0` o `force_refresh=True` siempre se re-descarga.
+    - `condicional` (por defecto) manda ``If-None-Match``/``If-Modified-Since``
+      si hay sidecar, y un 304 usa la cache sin volver a descargar (CHAN-004).
+    - Si la descarga falla pero hay cache previa (aunque caducada), se devuelve
+      la cache en vez de romper: un panel saturado no puede dejar al usuario sin
+      lista.
+    - `cache_dir` permite tests; por defecto es `config.PLAYLIST_CACHE_DIR`.
     - `allow_private` es la excepción anti-SSRF declarada para esa fuente
-      (SDD §11): por defecto la red privada está bloqueada.
+      (SDD §11); por defecto la red privada está bloqueada.
 
-    Errores de red/HTTP sin cache disponible se propagan como OSError
-    con mensaje amigable; URLs no http(s) lanzan ValueError.
+    **La lista nueva no sustituye a la buena sin pasar la validación**
+    (CHAN-003): una descarga vacía o truncada deja la cache anterior intacta y
+    devuelve la anterior, con el motivo disponible en :attr:`last_validation`.
+    Si la validación falla pero `confirmar` está y devuelve True, se aplica
+    igual —porque el usuario lo pidió explícitamente— y se dice en el informe.
+
+    Errores de red/HTTP sin cache disponible se propagan como OSError con
+    mensaje amigable; URLs no http(s) lanzan ValueError.
     """
     url = url.strip()
     if not url.lower().startswith(("http://", "https://")):
@@ -444,33 +692,114 @@ def load_url(
     directory.mkdir(parents=True, exist_ok=True)
     path = _cache_path_for(url, directory)
     name = _playlist_name_for(url)
+    global last_validation  # noqa: PLW0603 - estado de diagnóstico del store
+    last_validation = None
 
-    fresh = ttl_hours > 0 and not force_refresh and _is_fresh(path, ttl_hours * 3600)
-    if fresh:
+    def desde_cache() -> Playlist | None:
         try:
             text = _decompress_and_decode(path.read_bytes(), url)
             return parse_text(text, source=url, name=name)
         except (OSError, ValueError):
-            pass  # cache corrupta: re-descargar
+            return None
+
+    fresh = ttl_hours > 0 and not force_refresh and _is_fresh(path, ttl_hours * 3600)
+    if fresh:
+        lista = desde_cache()
+        if lista is not None:
+            return lista
 
     try:
-        raw = fetch_bytes(url, timeout=timeout, allow_private=allow_private)
+        resultado = fetch_bytes(
+            url,
+            timeout=timeout,
+            allow_private=allow_private,
+            # `force_refresh` significa «quiero la lista de ahora», así que
+            # **no** se manda nada condicional: un 304 dejaría al usuario con la
+            # copia anterior, que es justo lo que pidió para no ver.
+            condicional=(
+                _headers_condicionales(_leer_meta(path))
+                if condicional and not force_refresh
+                else None
+            ),
+        )
     except (OSError, ValueError):
-        # Fallback stale: el panel a veces cae o tarda; mejor abrir
-        # la última copia conocida que no abrir nada.
-        if path.is_file():
-            try:
-                text = _decompress_and_decode(path.read_bytes(), url)
-                return parse_text(text, source=url, name=name)
-            except (OSError, ValueError):
-                pass
+        # Fallback stale: el panel a veces cae o tarda; mejor abrir la última
+        # copia conocida que no abrir nada.
+        lista = desde_cache()
+        if lista is not None:
+            return lista
         raise
 
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        tmp.write_bytes(raw)
-        tmp.replace(path)
-    except OSError:
-        pass  # si no se puede cachear, igual se parsea lo descargado
+    if resultado.not_modified:
+        # 304: el servidor dice que no cambió. La validación de integridad **no**
+        # se salta —ya se hizo al guardarla—, pero si no hay cache usable no hay
+        # nada que hacer y hay que decirlo en vez de devolver una lista vacía.
+        lista = desde_cache()
+        if lista is None:
+            raise OSError(
+                "El servidor dice que la lista no cambió, pero no hay copia "
+                "guardada para usar. Vuelve a intentarlo en un momento."
+            )
+        return lista
 
-    return parse_text(_decompress_and_decode(raw, url), source=url, name=name)
+    raw = resultado.body
+    try:
+        nueva = parse_text(_decompress_and_decode(raw, url), source=url, name=name)
+    except (OSError, ValueError):
+        # No se puede ni leer lo descargado: la cache anterior sigue siendo la
+        # mejor respuesta disponible.
+        lista = desde_cache()
+        if lista is not None:
+            return lista
+        raise
+
+    # La lista que el llamante tiene delante manda sobre la copia de disco: es
+    # la que el usuario está viendo y la que hay que proteger.
+    referencia = previa if previa is not None else desde_cache()
+    validacion = validate_playlist(nueva, referencia)
+    cambios = resumir_cambios(referencia if not fresh else None, nueva)
+    validacion.resumen_cambios = cambios.resumen()
+    last_validation = validacion
+
+    if not validacion.ok:
+        aplicar = False
+        if confirmar is not None:
+            try:
+                aplicar = bool(confirmar(validacion))
+            except Exception:
+                aplicar = False
+        if aplicar:
+            _guardar_cache(path, raw)
+            _escribir_meta(path, _meta_de_respuesta(url, resultado.headers))
+            return nueva
+        # Se conserva la anterior. Si no había, la nueva es lo único que hay:
+        # se usa, pero **sin** escribirla en cache, para no dejar fija una lista rota.
+        if referencia is not None:
+            return referencia
+        _borrar_meta(path)
+        return nueva
+
+    _guardar_cache(path, raw)
+    _escribir_meta(path, _meta_de_respuesta(url, resultado.headers))
+    return nueva
+
+
+def _guardar_cache(path: Path, raw: bytes) -> bool:
+    """Escribe la cache de forma atómica. True si se guardó.
+
+    El ``.bak`` va antes del ``os.replace``: el archivo principal queda siempre
+    completo (ver :func:`atomic_write_bytes`), y además queda una copia de la
+    versión anterior por si la nueva resultara ser inválida al parsearla más
+    tarde (FR-CHAN-010).
+    """
+    from .storage.json_store import make_backup
+
+    try:
+        make_backup(path)
+    except Exception:
+        pass
+    try:
+        atomic_write_bytes(path, raw)
+        return True
+    except Exception:
+        return False

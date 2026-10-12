@@ -30,6 +30,7 @@ from .errors import StorageError
 
 __all__ = [
     "atomic_write_json",
+    "atomic_write_bytes",
     "read_json_with_recovery",
     "cleanup_orphans",
     "corrupt_path",
@@ -239,6 +240,37 @@ def atomic_write_json(
         _fsync_dir(path)
     except OSError as exc:
         # Limpiar el temporal si quedó
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise StorageError(f"no se pudo escribir {path}: {exc}") from exc
+
+
+def atomic_write_bytes(path: Path | str, data: bytes) -> None:
+    """Escribe bytes de forma atómica, con el mismo protocolo que el JSON.
+
+    Existe para las cachés de red (playlist y EPG descargadas), que no son JSON
+    pero necesitan **exactamente** las mismas garantías: o el archivo entero es
+    el nuevo, o sigue siendo el viejo. `Path.replace()` a secas cumple la
+   atomicidad pero no el `fsync`, así que un corte de luz puede dejar un archivo
+    de tamaño cero: es exactamente el fallo que destroysa la lista activa sin
+    que nadie entienda por qué disappeared el catálogo (CHAN-003, FR-CHAN-010).
+
+    Raises:
+        StorageError: si no se pudo escribir.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _unique_tmp(path)
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path)
+    except OSError as exc:
         try:
             tmp.unlink(missing_ok=True)
         except OSError:

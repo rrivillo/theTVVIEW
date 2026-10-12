@@ -17,6 +17,7 @@ from thetvview import catchup
 from thetvview import config
 from thetvview import resolutions
 from thetvview.epg_parser import Epg, load_url, parse_file, resolve_source
+from thetvview.m3u_parser import PlaylistValidation
 from thetvview.favorites import FavoritesError, FavoritesManager
 from thetvview.models import Channel, Playlist, Program
 from thetvview.platform_check import OS_WINDOWS, detect_os
@@ -95,8 +96,14 @@ def load_epg_source(source: str, *, force_refresh: bool = False,
     return parse_file(source)
 
 
-def load_playlist_source(source: str, *, force_refresh: bool = False,
-                         allow_private: bool = False) -> Playlist:
+def load_playlist_source(
+    source: str,
+    *,
+    force_refresh: bool = False,
+    allow_private: bool = False,
+    confirmar=None,  # noqa: ANN001 - Callable[[PlaylistValidation], bool] | None
+    previa: Playlist | None = None,
+) -> Playlist:
     """Parsea una fuente IPTV (path local o URL http(s)).
 
     Acepta .m3u/.m3u8 y también .ts como lista válida (un solo stream),
@@ -115,7 +122,11 @@ def load_playlist_source(source: str, *, force_refresh: bool = False,
 
     if source.lower().startswith(("http://", "https://")):
         return m3u_parser.load_url(
-            source, force_refresh=force_refresh, allow_private=allow_private
+            source,
+            force_refresh=force_refresh,
+            allow_private=allow_private,
+            confirmar=confirmar,
+            previa=previa,
         )
     return m3u_parser.parse_file(source)
 
@@ -2122,12 +2133,33 @@ class App:
             self.status.show(msg, error=True)
             return
         name = getattr(playlist, "name", "lista") or "lista"
+        from thetvview import m3u_parser
+
+        # CHAN-003: la lista nueva **no** sustituye a la buena sin que pase la
+        # validación. `confirmar` pide permiso explícito antes de aplicar una
+        # lista vacía o truncada; sin ese permiso, `load_url` devuelve la que ya
+        # había y no toca un byte del disco.
+        decisiones: list[bool] = []
+
+        def _pedir_confirmacion(validacion) -> bool:  # noqa: ANN001
+            decisiones.append(
+                self._confirm(
+                    "La lista parece incompleta",
+                    validacion.para_modal()
+                    + "\n\nSi aceptas, se reemplaza la lista que ya tienes. "
+                    "Si cancelas, se conserva.",
+                )
+            )
+            return decisiones[-1]
+
         self.show_loading(f"Actualizando '{name}'…", sub=source)
         try:
             fresh = load_playlist_source(
                 source,
                 force_refresh=True,
                 allow_private=self._allow_private_for(source),
+                confirmar=_pedir_confirmacion,
+                previa=playlist,
             )
         except (OSError, ValueError) as exc:
             # El retry es esta misma operación (F4, decisión de §1): no hay un
@@ -2142,6 +2174,13 @@ class App:
             return
         old_n = len(playlist.channels)
         new_n = len(fresh.channels)
+        # Si se pidió confirmación y se Rechazó, la lista devuelta es la
+        # anterior: decirlo es mejor que «actualizada: sin cambios», que
+        # parecería que el servidor no cambió nada.
+        if decisiones and not decisiones[-1]:
+            # El usuario dijo que no: `load_url` ya devolvió la lista anterior.
+            fresh = playlist
+            new_n = old_n
         try:
             fresh.kind = getattr(playlist, "kind", "m3u") or "m3u"
         except Exception:
@@ -2163,6 +2202,18 @@ class App:
                     refresher(fresh)
                 except Exception:
                     pass
+        # CHAN-008: el resumen dice **qué** cambió, no sólo cuántos canales hay
+        # ahora. Con identidad por `tvg-id`, un proveedor que renombra o rota
+        # URLs no produce «20 000 modificados», sino los que realmente cambió.
+        resumen = ""
+        if fresh is not playlist:
+            try:
+                from thetvview.channel_identity import resumen_para_ui
+
+                cambios = m3u_parser.resumir_cambios(playlist, fresh)
+                resumen = cambios.resumen()
+            except Exception:
+                resumen = ""
         diff = new_n - old_n
         if diff == 0:
             msg = f"Lista actualizada: {new_n} canales (sin cambios)."
@@ -2170,6 +2221,8 @@ class App:
             msg = f"Lista actualizada: {new_n} canales (+{diff})."
         else:
             msg = f"Lista actualizada: {new_n} canales ({diff})."
+        if resumen:
+            msg = f"{msg} · {resumen}"
         self.status.show(msg)
         try:
             self.footer.show(msg)

@@ -624,6 +624,39 @@ class SafeHttpClient:
             elapsed=time.monotonic() - started,
         )
 
+    def get_conditional(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        max_bytes: int | None = None,
+        timeout: float | None = None,
+    ) -> SafeResponse:
+        """GET que devuelve la respuesta completa **incluido un 304**.
+
+        :meth:`get_bytes` tira la respuesta y se queda con el cuerpo, y para una
+        descarga condicional eso tira justo lo que se vino a buscar: si el
+        servidor responde 304, el cuerpo está vacío y hay que mirar el status y
+        las cabeceras. Además devuelve la `ETag`/`Last-Modified` para poder
+        guardarlas en el sidecar de la cache (CHAN-004).
+
+        Se comporta como :meth:`get_bytes` en todo lo demás, incluida la
+        excepción por status: un 4xx o 5xx lanza :class:`NetworkError` con
+        ``.status`` puesto, exactamente igual que antes.
+        """
+        extra = dict(headers or {})
+        resp = self.request(
+            url,
+            method="GET",
+            headers=extra,
+            max_bytes=max_bytes,
+            timeout=timeout,
+        )
+        if resp.status == 304:
+            return resp
+        _raise_for_status(resp)
+        return resp
+
     def head(self, url: str, **kwargs: Any) -> SafeResponse:
         """``HEAD``: no lee cuerpo y no lanza por el código HTTP."""
         kwargs.pop("method", None)
