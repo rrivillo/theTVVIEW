@@ -20,6 +20,7 @@ from thetvview.epg_parser import Epg, load_url, parse_file, resolve_source
 from thetvview.favorites import FavoritesError, FavoritesManager
 from thetvview.models import Channel, Playlist, Program
 from thetvview.platform_check import OS_WINDOWS, detect_os
+from thetvview.player.session import SessionRegistry
 from thetvview.playlist_manager import PlaylistError, PlaylistManager
 from thetvview.prefs import PrefsManager
 from thetvview.recents import RecentsManager
@@ -589,6 +590,12 @@ class App:
         # (generación, cancelación, límites y publicación por cola). El worker
         # no toca la interfaz; el hilo principal drena en _drain_tasks().
         self._tasks = TaskManager(max_global=4, max_per_category=2)
+        # Registro de sesiones de reproducción (SDD §4, PLAY-001/004). Es el
+        # guard de obsolescencia de la reproducción: una tarea tardía del canal
+        # A consulta `is_current` antes de tocar nada y, si el usuario ya abrió
+        # el B, se descarta. Vive aquí —y no como global del módulo— para que dos
+        # instancias de la app en el mismo proceso no compartan vigencia.
+        self._sessions = SessionRegistry()
         self._epg_failed: dict[str, float] = {}
         self.theme_name: str = self.prefs.load().theme or config.load_theme()
         self.playlist_cache: dict[str, Playlist] = {}
@@ -2766,6 +2773,15 @@ class App:
         #    entre fuentes; el gestor se encarga de la espera con plazo.
         try:
             self._warm_stop.set()
+        except Exception:
+            pass
+
+        # 2-bis. Sesión de reproducción viva: se sella con `app_shutdown` y
+        #      sueltan sus recursos. Va antes de parar las tareas para que un
+        #      worker que mira la sesión la encuentre ya terminal y no intente
+        #      relanzar nada mientras cerramos (FR-PLAY-006).
+        try:
+            self._sessions.shutdown()
         except Exception:
             pass
 

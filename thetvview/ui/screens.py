@@ -11,6 +11,7 @@ favoritos ('f') y parrilla EPG por canal ('e').
 from __future__ import annotations
 
 import curses
+import os
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ from thetvview.tracks.manager import QUICK_AUTO, SelectTrackError
 from thetvview.tracks.models import MediaCapabilities, PlaybackSelection
 from thetvview.player.capabilities import KIND_SUBTITLES
 from thetvview.player.router import NoCompatibleBackend
+from thetvview.player.session import EndReason, SessionRegistry
 
 from .tracks import SECTION_LABELS
 
@@ -2642,6 +2644,8 @@ class NowPlayingScreen(Screen):
         failures=None,  # noqa: ANN001 - set[str] | None
         relanzar=None,  # noqa: ANN001 - Callable[[], Popen] | None
         intentos_maximos: int = 5,
+        session=None,  # noqa: ANN001 - PlaybackSession | None
+        es_vigente=None,  # noqa: ANN001 - Callable[[], bool] | None
     ) -> None:
         super().__init__(app)
         self.channel = channel
@@ -2683,6 +2687,15 @@ class NowPlayingScreen(Screen):
         # comportamiento dependería de si hay alguien mirando la pantalla.
         self._failures: set[str] = set(failures or ())
         self.supervisor = None
+        # Sesión de reproducción (SDD §4). Es **opcional**: sin ella, todo lo
+        # que hay debajo es exactamente lo de siempre. Con ella, esta pantalla
+        # deja de ser dueña a medias de lo que abrió: el proxy, la sesión de
+        # pistas y el socket de control quedan registrados en su ResourceScope
+        # y se liberan en bloque, una sola vez y en orden (PLAY-003).
+        self.session = session
+        if self.session is not None:
+            self.session.launched()
+            self._registrar_recursos()
         if relanzar is not None:
             try:
                 from thetvview.player.supervisor import (
@@ -2693,6 +2706,8 @@ class NowPlayingScreen(Screen):
                 self.supervisor = ReconnectSupervisor(
                     relanzar=relanzar,
                     policy=ReconnectPolicy(max_attempts=intentos_maximos),
+                    session=self.session,
+                    is_vigente=es_vigente,
                 )
                 self.supervisor.start(proc)
             except Exception:
@@ -2788,6 +2803,9 @@ class NowPlayingScreen(Screen):
                 f"'{self.channel.name}' se cortó y se reconectó {intentos} "
                 f"{plural} sin llegar a reproducirse del todo."
             )
+        sesion = getattr(self, "session", None)
+        if sesion is not None and sesion.ended:
+            return self._resumen_con_motivo(sesion)
         try:
             returncode = self.proc.poll()
         except Exception:
@@ -2799,6 +2817,53 @@ class NowPlayingScreen(Screen):
         if hint:
             return f"'{self.channel.name}' no abrió. {hint}"
         return f"'{self.channel.name}' finalizado."
+
+    def _resumen_con_motivo(self, sesion) -> str:  # noqa: ANN001 - PlaybackSession
+        """Resumen de salida construido desde el ``end_reason`` de la sesión.
+
+        El motivo de la sesión manda sobre el texto genérico porque sabe cosas
+        que el código de salida no dice: si fue el usuario, si la app se cerró,
+        si se agotaron los reintentos. Y cuando el proceso murió al instante se
+        conserva el texto de `explain_early_exit`, que es el que el usuario ya
+        conoce.
+        """
+        from thetvview.player.session import EndReason
+
+        motivo = sesion.end_reason
+        nombre = self.channel.name
+        if motivo in (EndReason.USER_STOPPED, EndReason.CANCELLED):
+            return f"'{nombre}' detenido."
+        if motivo is EndReason.APP_SHUTDOWN:
+            return f"'{nombre}' se detuvo al cerrar la aplicación."
+        try:
+            returncode = self.proc.poll()
+        except Exception:
+            returncode = None
+        try:
+            hint = player.explain_early_exit(returncode, self.elapsed_seconds())
+        except Exception:
+            hint = None
+        if hint:
+            return f"'{nombre}' no abrió. {hint}"
+        if motivo is EndReason.RETRIES_EXHAUSTED:
+            return (
+                f"'{nombre}' se cortó y no volvió tras varios intentos. "
+                "Prueba otro canal o revisa tu conexión."
+            )
+        if motivo is EndReason.INIT_FAILED:
+            return f"'{nombre}' no se pudo abrir."
+        if sesion.first_media_at is None:
+            # Proceso abierto, ninguna evidencia de medios: decirlo es el punto
+            # de todo el modelo de evidencia (FR-REC-001). Va **antes** que el
+            # motivo genérico de «falló»: decir «falló» cuando no llegó a haber
+            # imagen es exactamente la mentira que este modelo elimina.
+            return (
+                f"'{nombre}' se abrió pero no llegó a reproducir nada "
+                "antes de terminar."
+            )
+        if motivo is EndReason.PLAYBACK_ERROR:
+            return f"'{nombre}' falló mientras se veía."
+        return f"'{nombre}' finalizado."
 
     def stop_health(self) -> None:
         """Detiene el hilo de sonda de salud (idempotente, no bloquea)."""
@@ -2833,6 +2898,11 @@ class NowPlayingScreen(Screen):
 
         Se llama al parar la reproducción, al saltar hacia atrás y al salir
         de la app. Es idempotente y nunca lanza.
+
+        **Con sesión**, la liberación pasa por su :class:`ResourceScope`: una sola
+        vez, en orden inverso al de adquisición y aunque un recurso falle. **Sin
+        sesión**, se hace exactamente lo de siempre, que es lo que garantiza que
+        un stream sin extras no cambie de camino.
         """
         supervisor = getattr(self, "supervisor", None)
         if supervisor is not None:
@@ -2841,10 +2911,16 @@ class NowPlayingScreen(Screen):
             except Exception:
                 pass
             self.supervisor = None
-        sesion = getattr(self, "tracks", None)
+        sesion = getattr(self, "session", None)
         if sesion is not None:
+            # Los recursos se registraron en el `__init__`; aquí sólo se sueltan.
+            sesion.close_resources()
+            self.pin_proxy = None
+            return
+        sesion_pistas = getattr(self, "tracks", None)
+        if sesion_pistas is not None:
             try:
-                sesion.stop()
+                sesion_pistas.stop()
             except Exception:
                 pass
         proxy = getattr(self, "pin_proxy", None)
@@ -2855,6 +2931,26 @@ class NowPlayingScreen(Screen):
                 pass
             self.pin_proxy = None
         self._remove_ipc_socket()
+
+    def _registrar_recursos(self) -> None:
+        """Da dueño a todo lo que esta pantalla abrió (FR-PLAY-007).
+
+        Sólo se llama cuando hay sesión. El orden de alta es el inverso del de
+        liberación, que es el correcto para recursos anidados: el socket de
+        control se abre **después** del proxy, así que se suelta **antes**.
+        """
+        sesion = getattr(self, "session", None)
+        if sesion is None:  # pragma: no cover - el caller ya lo comprobó
+            return
+        if self.pin_proxy is not None:
+            proxy = self.pin_proxy
+            sesion.add_resource("proxy-calidad", lambda: _parar(proxy))
+        pistas = getattr(self, "tracks", None)
+        if pistas is not None:
+            sesion.add_resource("pistas", lambda: _parar(pistas))
+        ruta = getattr(pistas, "ipc_path", None) if pistas is not None else None
+        if ruta:
+            sesion.add_resource("socket-control", lambda: _borrar_socket(ruta))
 
     def _remove_ipc_socket(self) -> None:
         """Borra el socket del IPC si sigue ahí.
@@ -2867,12 +2963,8 @@ class NowPlayingScreen(Screen):
         ruta = getattr(sesion, "ipc_path", None) if sesion is not None else None
         if not ruta:
             return
-        try:
-            import os
+        _borrar_socket(ruta)
 
-            os.unlink(ruta)
-        except (OSError, TypeError, ValueError):
-            pass
 
     def _current_program(self):  # type: ignore[no-untyped-def]
         """Programa que se está viendo.
@@ -3226,6 +3318,33 @@ class NowPlayingScreen(Screen):
                 pass
 
 
+
+
+
+def _borrar_socket(ruta: str) -> None:
+    """Borra el fichero del socket de control. Nunca lanza.
+
+    mpv crea el socket al arrancar y no lo borra al salir. Vive en un directorio
+    0700, así que no es un problema de seguridad, pero dejarlo puesto acumula
+    basura en ``data/ipc/``.
+    """
+    try:
+        os.unlink(ruta)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _parar(objeto) -> None:  # noqa: ANN001 - PinProxy | TrackSession | None
+    """Llama a ``objeto.stop()`` tragándose el fallo.
+
+    Es una función suelta, y no un ``lambda`` que capture ``self``, por una
+    razón concreta: el liberador que se registra en el
+    :class:`~thetvview.player.session.ResourceScope` viviría más que la sesión, y
+    retener la pantalla entera impide que se recolecte.
+    """
+    parar = getattr(objeto, "stop", None)
+    if callable(parar):
+        parar()
 
 
 class EpgScreen(Screen):
@@ -3724,6 +3843,36 @@ class _ResolutorCredenciales:
         return getter(key) if callable(getter) else None
 
 
+def _clave_canal(channel) -> str:  # noqa: ANN001 - Channel
+    """Identidad legible del canal para la sesión (sin URL ni secretos).
+
+    Es la **clave**, no la identidad: el `tvg-id` si existe, y si no el nombre.
+    No se pone la URL a propósito —el informe de la sesión puede acabar en un
+    archivo que el usuario comparte— y con esto basta para saber de qué canal
+    se trata.
+    """
+    return str(
+        getattr(channel, "tvg_id", "") or getattr(channel, "name", "") or ""
+    ).strip()
+
+
+def _registro_sesiones(app) -> SessionRegistry:  # noqa: ANN001
+    """Registro de sesiones de `app`, o uno propio si el doble no lo tiene.
+
+    Los tests montan la pantalla con dobles que no son `App`; en vez de exigir el
+    atributo (y romperlos), se crea un registro local. La app real **sí** lo
+    tiene, y es el que importa: es el que sabe si la sesión sigue vigente.
+    """
+    registro = getattr(app, "_sessions", None)
+    if isinstance(registro, SessionRegistry):
+        return registro
+    try:
+        app._sessions = SessionRegistry()
+        return app._sessions
+    except Exception:  # pragma: no cover - doble que no admite atributos
+        return SessionRegistry()
+
+
 def _nada():  # noqa: ANN201 - context manager vacío, para el `with` condicional
     """Context manager que no hace nada.
 
@@ -3908,6 +4057,12 @@ def play_channel(  # noqa: ANN001
         # eso viaja en `prefs.preferred_backend` y no aquí.
         extra["preferred"] = preferred_backend
     fallos: set[str] = set()
+    # Sesión de reproducción (SDD §4). Se abre **antes** del lanzamiento: si el
+    # lanzamiento falla, la sesión termina con `init_failed` y su motivo queda
+    # registrado, en vez de ser un `return` sin rastro (FR-PLAY-010).
+    registro = _registro_sesiones(app)
+    sesion = registro.start(_clave_canal(channel), player_name or "")
+    sesion.start()
     try:
         # Si el canal venía como referencia opaca de cámara, `resolved` lleva
         # la credencial que se reconstruyó desde el keyring. Se marca como
@@ -3920,8 +4075,23 @@ def play_channel(  # noqa: ANN001
                 channel, player_name, preferred_backend, fallos, extra
             )
     except player.PlayerError as exc:
+        # La sesión se sella **antes** de tocar el proxy a mano: el motivo real
+        # es `init_failed`, y un fallo al apagar el proxy no puede pisarlo.
+        sesion.end(
+            EndReason.INIT_FAILED,
+            "" if isinstance(exc, NoCompatibleBackend) else str(exc),
+        )
+        registro.finish(sesion, EndReason.INIT_FAILED)
         if proxy is not None:
             proxy.stop()
+        # El socket de control se reservó **antes** del lanzamiento; si el
+        # lanzamiento falla, el fichero existe aunque mpv nunca llegara a
+        # abrirlo, así que se limpia aquí (FR-PLAY-010: la ruta de limpieza se
+        # ejecuta aunque el lanzamiento no tuviera éxito).
+        if ipc_path:
+            _borrar_socket(ipc_path)
+            if track_session is not None:
+                track_session.ipc_path = ""
         # Un `NoCompatibleBackend` no es «falló la reproducción» sino «este
         # canal no se puede abrir aquí» (§14 del SDD-M). Se preserva tal cual,
         # con su modal de un botón y sin capa de presentación encima: el
@@ -3968,6 +4138,8 @@ def play_channel(  # noqa: ANN001
             else None
         ),
         intentos_maximos=reconnect_max_attempts,
+        session=sesion,
+        es_vigente=lambda: registro.is_current(sesion.session_id),
     ))
     app.prefs.set_last_player(effective_name)
     _recordar_reciente(app, canal_original, effective_name)

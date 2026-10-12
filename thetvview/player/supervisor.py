@@ -32,6 +32,11 @@ Tres reglas que gobiernan el módulo
 3. **Nada de buffering en Python** (§19). Los perfiles ``LOW_LATENCY`` /
    ``BALANCED`` / ``STABLE`` se mapean a banderas **reales** del reproductor,
    medidas en :mod:`player.protocols`, no a una cola en este proceso.
+4. **La sesión es opcional.** Sin ``session`` el comportamiento es byte a byte
+   el de siempre —:mod:`tests.test_stream_supervisor` no se modifica—; con
+   sesión, el supervisor además registra los intentos y respeta el guard de
+   obsolescencia, para que una tarea de un canal ya sustituido no pueda
+   relanzar nada (PLAY-004, FR-PLAY-005).
 """
 
 from __future__ import annotations
@@ -41,6 +46,8 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
+
+from .session import EndReason, PlaybackSession
 
 __all__ = [
     "PlaybackState",
@@ -179,6 +186,12 @@ class ReconnectSupervisor:
         proc: el proceso ya lanzado, con ``poll()``.
         relanzar: ``() -> proceso_nuevo``. Se llama en cada reintento.
         policy: topes y esperas.
+        session: sesión de reproducción **opcional**. Sin ella, este supervisor
+            se comporta exactamente como antes. Con ella:
+            - cada reintento queda registrado como :class:`AttemptRecord`;
+            - ``det``/``stop`` sellan la sesión con su motivo;
+            - y se consulta su ``is_current`` antes de relanzar, de modo que una
+              tarea de una sesión ya sustituida no abre nada (FR-PLAY-005).
         al_cambiar: callback opcional ``(estado, intento)`` para que la UI se
             entere. Se invoca en el hilo del supervisor, así que **no** puede
             dibujar: sólo puede encolar o poner una bandera.
@@ -189,6 +202,11 @@ class ReconnectSupervisor:
     #: sin llegar a ser un busy-loop.
     poll_seconds: float = 1.0
     relanzar: Callable[[], object] | None = None
+    #: `:func:`is_vigente`` del registro de sesiones, si lo hay. Se consulta
+    #: **antes de cada relanzamiento**: sin esta comprobación, la tarea tardía
+    #: del canal A reabre el canal que el usuario ya sustituyó por el B.
+    is_vigente: Callable[[], bool] | None = None
+    session: PlaybackSession | None = None
     al_cambiar: Callable[[PlaybackState, int], None] | None = None
 
     def __post_init__(self) -> None:
@@ -220,6 +238,10 @@ class ReconnectSupervisor:
                 target=self._bucle, name="thetvview-reconexion", daemon=True
             )
             self._hilo.start()
+        # El primer intento es el que ya está corriendo: se registra para que la
+        # sesión sepa cuánto duró y con qué espera arrancó.
+        if self.session is not None:
+            self.session.nuevo_intento()
         self._avisar(self.estado, 0)
 
     def stop(self) -> None:
@@ -230,6 +252,11 @@ class ReconnectSupervisor:
             hilo.join(timeout=2.0)
         self._hilo = None
         self.estado = PlaybackState.STOPPED
+        # `stop()` es «dejo de mirar», no «el canal terminó»: la sesión **no** se
+        # sella aquí. Quien sabe por qué terminó es quien la cierra
+        # (`NowPlayingScreen.stop_tracks` / `App._cerrar_recursos`), y sellarla
+        # aquí pondría `PROCESS_EXITED` aunque el usuario la hubiera parado.
+        return None
 
     def detach(self) -> None:
         """Olvida el proceso y **no** reconecta (lo paró el usuario).
@@ -242,6 +269,8 @@ class ReconnectSupervisor:
         """
         self._desvinculado = True
         self._stop.set()
+        if self.session is not None:
+            self.session.end(EndReason.USER_STOPPED, "el usuario detuvo el canal")
 
     # --- Interno ----------------------------------------------------------
 
@@ -250,34 +279,93 @@ class ReconnectSupervisor:
 
         Nunca lanza. Un fallo aquí se traduce a ``ERROR`` y se publica, no a una
         excepción en un hilo que nadie ve.
+
+        Todo lo que toca la sesión pasa por :meth:`_nota` y por la comprobación
+        ``self.session is not None``, y **no hace nada** sin sesión: es lo que
+        mantiene el comportamiento sin ``session`` byte a byte igual al de antes.
         """
         try:
             while not self._stop.is_set():
                 if self._proceso_vivo():
                     if self.estado is not PlaybackState.PLAYING:
                         self._cambiar(PlaybackState.PLAYING)
+                        self._nota("reproduciendo")
                     self._stop.wait(self.poll_seconds)
                     continue
                 # El proceso se fue. ¿Fue el usuario o se murió?
                 if self._stop.is_set() or self._desvinculado:
                     return
+                # Guard de obsolescencia: si el usuario ya abrió otro canal, esta
+                # sesión dejó de ser la vigente y **no** se relanza nada.
+                if self.session is not None and not self._es_vigente():
+                    self._cambiar(PlaybackState.STOPPED)
+                    return
                 if not self._puede_reintentar():
                     self._cambiar(PlaybackState.ERROR)
+                    self._nota("agotado")
                     return
                 self.intentos += 1
                 self._cambiar(PlaybackState.RECONNECTING)
                 espera = self.policy.espera_para(self.intentos)
                 if self._stop.wait(espera):
                     return
+                # La obsolescencia se comprueba **también después** de la
+                # espera: el usuario pudo cambiar de canal mientras esperábamos,
+                # y relanzar entonces volvería a abrir el canal viejo.
+                if self.session is not None and not self._es_vigente():
+                    self._cambiar(PlaybackState.STOPPED)
+                    return
                 nuevo = self._relanzar()
                 if nuevo is None:
                     self._cambiar(PlaybackState.ERROR)
+                    self._nota("reintento_fallido")
                     return
                 with self._candado:
                     self.proceso = nuevo
                 self._cambiar(PlaybackState.CONNECTING)
+                self._nota("reintentado")
         except Exception:  # noqa: BLE001 - un hilo supervisor nunca tumba la app
             self._cambiar(PlaybackState.ERROR)
+            self._nota("error_interno")
+
+    def _es_vigente(self) -> bool:
+        """¿Sigue vigente la sesión que observa este supervisor?
+
+        Con ``is_vigente`` se delega en el guard del registro, que sabe de la
+        **generación** (canal A → canal B aunque la A siga viva). Sin él, basta
+        con que la sesión no haya terminado.
+        """
+        if self.is_vigente is not None:
+            try:
+                return bool(self.is_vigente())
+            except Exception:  # noqa: BLE001 - un guard roto no relanza
+                return False
+        if self.session is None:  # pragma: no cover - nunca se llama sin sesión
+            return True
+        return not self.session.ended
+
+    def _nota(self, evento: str) -> None:
+        """Anota un hito del bucle en la sesión. Sin sesión, no hace nada.
+
+        Los fallos de la anotación **se tragan**: un registro que revienta no
+        puede tumbar el hilo del supervisor ni cambiar la recuperación.
+        """
+        sesion = self.session
+        if sesion is None:
+            return
+        try:
+            if evento == "reproduciendo":
+                sesion.playing()
+            elif evento == "reintentado":
+                sesion.nuevo_intento()
+            elif evento == "agotado":
+                sesion.end(EndReason.RETRIES_EXHAUSTED, "se agotaron los reintentos")
+            elif evento == "reintento_fallido":
+                sesion.end(EndReason.PLAYBACK_ERROR, "el relanzamiento falló")
+            elif evento == "error_interno":
+                sesion.end(EndReason.INTERNAL_ERROR, "fallo en el supervisor")
+        except Exception:  # noqa: BLE001 - anotar nunca rompe la recuperación
+            pass
 
     def _proceso_vivo(self) -> bool:
         proc = self.proceso

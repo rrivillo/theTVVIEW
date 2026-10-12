@@ -62,3 +62,36 @@ SDD/
 
 # Capturas de pantalla
 Capturas/
+
+# ============================================================================
+# Gentle-AI (Gentleman-Programming/gentle-ai) + Engram
+# Sus datos de uso, memoria y estado son locales: NUNCA se versionan.
+# ============================================================================
+
+# Estado/config interna de gentle-ai en el proyecto
+.gentle-ai/
+.gentle-ai-*/
+.gentle/
+
+# Workspace scope de gentle-ai: escribe aquí sus skills, comandos,
+# plugins y AGENTS.md gestionado. Local, nunca versionar.
+.config/
+
+# Memoria de Engram (base local + export para compartir)
+.engram/
+engram.db
+*.engram.db
+
+# Registro/huella de skills (.atl/skill-registry.md y su cache)
+.atl/
+
+# Datos de uso, receipts, revisiones y evidencia RDD de gentle-ai
+.gentle-ai/review/
+gentle-ai-review/
+*.gentle-receipt.json
+review-receipts/
+.receipts/
+
+# Backups que gentle-ai crea antes de cada escritura
+*.gentle-ai.bak
+.gentle-backups/
