@@ -15,8 +15,16 @@ from pathlib import Path
 
 from thetvview import catchup
 from thetvview import config
+from thetvview import epg_match
 from thetvview import resolutions
-from thetvview.epg_parser import Epg, load_url, parse_file, resolve_source
+from thetvview.epg_parser import (
+    Epg,
+    EpgValidation,
+    aviso_zona_pendiente,
+    load_url,
+    parse_file,
+    resolve_source,
+)
 from thetvview.m3u_parser import PlaylistValidation
 from thetvview.favorites import FavoritesError, FavoritesManager
 from thetvview.models import Channel, Playlist, Program
@@ -595,6 +603,9 @@ class App:
         # Fuente que cargó self.epg automáticamente desde una playlist
         # (None si la cargó el usuario a mano: eso nunca se pisa solo).
         self._epg_auto_source: str | None = None
+        # Claves EPG ambiguas ya avisadas (una vez por clave y por proceso:
+        # FR-EPG-003). Ver `_avisar_epg_ambiguo`.
+        self._avisos_epg_ambiguos: set[str] = set()
         # Carga en segundo plano del EPG que declara la playlist abierta.
         self._epg_load_thread: threading.Thread | None = None
         # Gestor común de tareas: toda la carga en segundo plano pasa por aquí
@@ -1741,6 +1752,24 @@ class App:
                 if salida.cancelled:
                     continue
                 if salida.epg is not None and salida.source:
+                    # FR-EPG-009/010: la guía activa **no** se sustituye por una
+                    # que no supere la validación. Una descarga truncada dejaba
+                    # la pantalla de Favoritos sin programas y el usuario no
+                    # tenía forma de saber si era un fallo o que no había guía.
+                    anterior_canales = (
+                        len(self.epg.programs) if self.epg is not None else 0
+                    )
+                    anterior_programas = (
+                        self.epg.total_programas if self.epg is not None else 0
+                    )
+                    veredicto = EpgValidation.contra_creciente(
+                        salida.epg.validar(), anterior_canales, anterior_programas
+                    )
+                    if not veredicto.ok:
+                        self._epg_failed[salida.source] = time.monotonic()
+                        self.status.show(veredicto.motivo, error=True)
+                        self._mostrar_modal("La guía no se cargó", veredicto.motivo)
+                        continue
                     self.epg = salida.epg
                     self.epg_source = salida.source
                     self._epg_auto_source = salida.source
@@ -1749,6 +1778,7 @@ class App:
                         f"EPG cargado de la lista "
                         f"({len(salida.epg.programs)} canales)."
                     )
+                    self._avisar_epg(veredicto, salida.source)
                 else:
                     self.status.show(
                         "No se pudo cargar el EPG de la lista: "
@@ -1813,34 +1843,145 @@ class App:
             if not path:
                 return []
             try:
-                self.epg = load_epg_source(
+                nuevo_epg = load_epg_source(
                     path, allow_private=self._allow_private_for(path)
                 )
             except (OSError, ValueError) as exc:
                 self.status.show(str(exc), error=True)
                 return []
+            # FR-EPG-009: la guía activa no se sustituye por una que no supere
+            # la validación. Aquí **no** hay confirmación: cargar una guía
+            # vacía a propósito no tiene sentido, y el botón «Recargar» con
+            # `force_refresh` tampoco.
+            veredicto = EpgValidation.contra_creciente(
+                nuevo_epg.validar(),
+                len(self.epg.programs) if self.epg is not None else 0,
+                self.epg.total_programas if self.epg is not None else 0,
+            )
+            if not veredicto.ok:
+                self.status.show(veredicto.motivo, error=True)
+                self._mostrar_modal("La guía no se cargó", veredicto.motivo)
+                return self._programas_de_la_guia_actual(channel)
+            self.epg = nuevo_epg
             self.epg_source = path
             self._epg_auto_source = None  # elección manual: no la pisa el auto-carga
             self.status.show(f"EPG cargado ({len(self.epg.programs)} canales).")
+            self._avisar_epg(veredicto, path)
         elif force_refresh and self.epg_source:
             try:
-                self.epg = load_epg_source(
+                nuevo_epg = load_epg_source(
                     self.epg_source,
                     force_refresh=True,
                     allow_private=self._allow_private_for(self.epg_source),
                 )
+                veredicto = EpgValidation.contra_creciente(
+                    nuevo_epg.validar(),
+                    len(self.epg.programs) if self.epg is not None else 0,
+                    self.epg.total_programas if self.epg is not None else 0,
+                )
+                if not veredicto.ok:
+                    self.status.show(veredicto.motivo, error=True)
+                    self._mostrar_modal("La guía no se recargó", veredicto.motivo)
+                    return self._programas_de_la_guia_actual(channel)
+                self.epg = nuevo_epg
                 self.status.show(f"EPG recargado ({len(self.epg.programs)} canales).")
+                self._avisar_epg(veredicto, self.epg_source)
             except (OSError, ValueError) as exc:
                 self.status.show(str(exc), error=True)
-        cid = _epg_channel_id(self.epg, channel)
-        if cid is None:
+        # FR-EPG-004: además del id se mira **por qué** casó, para poder avisar
+        # si la clave era ambigua (FR-EPG-003). `resolve` es un envoltorio de
+        # `resolve_match`, así que la asociación sigue siendo exactamente la
+        # misma que en Favoritos y en el resto de pantallas.
+        indice = epg_match.for_epg(self.epg)
+        coincidencia = indice.resolve_match(channel) if indice else None
+        if coincidencia is None or coincidencia.channel_id is None:
             self.status.show(
                 f"No hay correspondencia EPG para '{channel.name}'.", error=True
             )
             return []
-        return self.epg.programmes_for(cid)
+        self._avisar_epg_ambiguo(channel, coincidencia)
+        return self.epg.programmes_for(coincidencia.channel_id)
 
     # --- Avisos al usuario (modal) ------------------------------------------
+
+    def _programas_de_la_guia_actual(self, channel: Channel) -> list[Program]:
+        """Programas del canal con la guía **activa**, sin tocar la barra.
+
+        Se usa cuando una guía nueva se rechaza: el usuario pidió recargar
+        y lo que hay que devolverle son los programas de la guía que **sigue**
+        activa, no un «no hay correspondencia» que contradice el mensaje que
+        acaba de ver.
+        """
+        if self.epg is None:
+            return []
+        cid = _epg_channel_id(self.epg, channel)
+        return self.epg.programmes_for(cid) if cid else []
+
+    def _mostrar_modal(self, titulo: str, mensaje: str) -> None:
+        """Modal informativo que **nunca** lanza (regla de `AGENTS.md`).
+
+        Se degrada a la barra de estado cuando no hay interfaz (tests, modo sin
+        pantalla): el mensaje se ve igualmente, que es lo que importa.
+        """
+        try:
+            self._show_notice(titulo, mensaje)
+        except Exception:
+            pass
+
+    def _avisar_epg(self, veredicto, fuente: str) -> None:  # noqa: ANN001 - EpgValidation
+        """Enseña los avisos de una guía que **sí** se aplicó (FR-EPG-006).
+
+        Dos condiciones, y las dos hacen falta:
+
+        - que la guía traiga **de verdad** horas sin zona
+          (``con_zona_asumida``); sin eso no hay nada que contar y un aviso
+          sería mentira para una guía bien formada;
+        - que esta fuente **aún no** haya sido avisada, que es lo que
+          recuerda :func:`thetvview.epg_parser.aviso_zona_pendiente`. Un
+          aviso que se repite en cada recarga deja de leerse.
+        """
+        if not getattr(veredicto, "con_zona_asumida", 0):
+            return
+        if not aviso_zona_pendiente(fuente):
+            return  # ya se le dijo al usuario de esta fuente
+        for texto in getattr(veredicto, "avisos", []) or []:
+            self._mostrar_modal("Sobre los horarios de la guía", texto)
+
+    def _avisar_epg_ambiguo(
+        self, channel: Channel, coincidencia: epg_match.Match
+    ) -> None:
+        """Modal breve cuando el nombre del canal casa con varios de la guía.
+
+        Es la parte visible del registro de ambigüedad (FR-EPG-003): no se
+        fusionan canales y quien mira el ``Match`` sabe que hubo que elegir.
+        Una vez por clave y por proceso, como el aviso de zona: la ambigüedad
+        es una propiedad del par canal↔guía, no del momento, y repetirlo en
+        cada apertura deja de leerse. No hay nada que resolver —el canal
+        funciona— pero conviene saber que el horario que se ve puede ser el de
+        un homónimo, y que el arreglo es el `tvg-id` del canal.
+        """
+        if not getattr(coincidencia, "ambiguo", False):
+            return
+        avisos = getattr(self, "_avisos_epg_ambiguos", None)
+        if avisos is None:  # App construida sin __init__ (tests con dobles)
+            avisos = self._avisos_epg_ambiguos = set()
+        clave = getattr(coincidencia, "clave", "") or ""
+        if clave in avisos:
+            return
+        avisos.add(clave)
+        nombres = [
+            (self.epg.channel_name(cid) if self.epg is not None else None) or cid
+            for cid in coincidencia.candidatos
+        ]
+        vistos = ", ".join(f"«{n}»" for n in nombres[:3])
+        if len(nombres) > 3:
+            vistos += f" y {len(nombres) - 3} más"
+        self._mostrar_modal(
+            "Varios canales se llaman igual",
+            f"«{channel.name}» coincide con {len(nombres)} canales de la guía: "
+            f"{vistos}. Se está usando el primero. Si los horarios no encajan "
+            f"con este canal, revisa su tvg-id en la lista.",
+        )
 
     def notify_error(self, message: str) -> None:
         """Error bloqueante: barra de estado + modal de confirmación."""

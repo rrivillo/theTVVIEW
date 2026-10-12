@@ -39,6 +39,13 @@ class Program:
     desc: str | None = None
     sub_title: str | None = None  # <sub-title> (episodio, sección...)
     categories: list[str] = field(default_factory=list)  # <category>, en orden del feed
+    #: El feed **no** traía zona horaria y se asumió UTC (FR-EPG-006).
+    #:
+    #: Antes, esa suposición se hacía en silencio y las horas se
+    #: interpretaban como si fueran verdad. El valor por defecto es `False`
+    #: para que un `Program(...)` construido a mano no afirme nada que no
+    #: sabe.
+    tz_assumed: bool = False
 
 
 @dataclass

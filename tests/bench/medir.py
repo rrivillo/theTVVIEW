@@ -24,6 +24,9 @@ Qué mide
   la lista de canales.
 - **Búsqueda**: tiempo de una búsqueda lineal sobre todos los canales, que es
   lo que hace la TUI en cada tecla.
+- **Consultas EPG** (EPG-004): latencia de ``now_playing`` sobre una guía de
+  20 000 canales y 7 días, medida contra el escaneo lineal que hacía antes.
+  El «antes/después» del ticket es la diferencia entre esas dos filas.
 
 Por qué datos sintéticos y no reales
 ------------------------------------
@@ -44,9 +47,12 @@ import sys
 import time
 import tracemalloc
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from thetvview.epg_parser import Epg
 from thetvview.m3u_parser import parse_text
+from thetvview.models import Program
 from thetvview.storage.json_store import atomic_write_json, read_json_with_recovery
 
 #: Tamaños de los tres perfiles. El «mediano» está por debajo de lo que se ve
@@ -205,6 +211,93 @@ def medir_busqueda(entradas: int) -> Medida:
     return _medir("busqueda", entradas, buscar)
 
 
+# ---------------------------------------------------------------------------
+# EPG (EPG-004): consultas con índice contra el escaneo lineal de antes
+# ---------------------------------------------------------------------------
+
+#: Perfil de la guía sintética: 20 000 canales y 7 días, el tamaño que pedía
+#: el ticket y el que duele de verdad. Bloques de 2 h (84 programas por
+#: canal a la semana): lo que decide el coste por consulta es la longitud de
+#: la parrilla de cada canal, no el total de canales de la guía, y una guía
+#: real de 7 días trae parrillas de ese orden de magnitud.
+EPG_CANALES = 20_000
+EPG_DIAS = 7
+EPG_AL_DIA = 12
+#: Instante del que nacen todos los programas de la guía sintética (en UTC).
+EPG_BASE = datetime(2026, 3, 1, tzinfo=timezone.utc)
+
+
+def generar_guia() -> Epg:
+    """Una guía con la forma de una real: `EPG_CANALES` canales × `EPG_DIAS` días.
+
+    Se construye con los **mismos objetos** que deja `parse_text` (`Program` y
+    `Epg`, que se construye sus índices al nacer). El parseo queda fuera de
+    la medición de consultas a propósito: el ticket es la latencia de
+    `now_playing`, y medir parseo dentro daría el mismo número dos veces.
+    Los datos son sintéticos por lo mismo que en el resto del script: una
+    guía real trae los horarios (y los canales) de alguien.
+    """
+    dur = timedelta(hours=24 // EPG_AL_DIA)
+    bloques = EPG_DIAS * EPG_AL_DIA
+    channels: dict[str, str] = {}
+    programs: dict[str, list[Program]] = {}
+    for i in range(EPG_CANALES):
+        cid = f"canal.{i}.es"
+        channels[cid] = f"Canal {i}"
+        programs[cid] = [
+            Program(
+                channel_id=cid,
+                title=f"Programa {i}-{p}",
+                start=EPG_BASE + dur * p,
+                stop=EPG_BASE + dur * (p + 1),
+            )
+            for p in range(bloques)
+        ]
+    return Epg(channels_by_id=channels, programs=programs)
+
+
+def _ahora_lineal(epg: Epg, cid: str, cuando: datetime) -> Program | None:
+    """La consulta de antes, palabra por palabra: recorrer la parrilla entera.
+
+    Vive aquí a propósito, igual que en `tests/test_epg_precision.py`: sin
+    esta referencia no hay «antes/después» que comparar, y el número que
+    importa es la diferencia entre las dos consultas, no el de una sola.
+    """
+    for prog in epg.programmes_for(cid):
+        if prog.start <= cuando and (prog.stop is None or cuando < prog.stop):
+            return prog
+    return None
+
+
+def medir_epg() -> list[Medida]:
+    """Carga, consulta indexada y consulta lineal sobre la misma guía (EPG-004).
+
+    Los tres barridos barren los mismos `EPG_CANALES` canales en instantes
+    distintos de la misma guía de 7 días, así que las columnas son
+    comparables entre sí y entre ejecuciones.
+    """
+    guia = generar_guia()
+    cids = sorted(guia.programs)
+    momentos = {
+        cid: EPG_BASE + timedelta(hours=n % (EPG_DIAS * 24))
+        for n, cid in enumerate(cids)
+    }
+
+    def barrido() -> None:
+        for cid in cids:
+            guia.now_playing(cid, momentos[cid])
+
+    def barrido_lineal() -> None:
+        for cid in cids:
+            _ahora_lineal(guia, cid, momentos[cid])
+
+    return [
+        _medir("epg_carga", EPG_CANALES, generar_guia),
+        _medir("epg_now", EPG_CANALES, barrido),
+        _medir("epg_lineal", EPG_CANALES, barrido_lineal),
+    ]
+
+
 def entorno() -> dict:
     """Lo necesario para saber si dos números son comparables."""
     return {
@@ -233,6 +326,14 @@ def medir_todo() -> dict:
                         "ms_por_1000": round(medida.ms_por_1000, 3),
                     }
                 )
+    for medida in medir_epg():
+        medidas.append(
+            {
+                "perfil": "epg",
+                **asdict(medida),
+                "ms_por_1000": round(medida.ms_por_1000, 3),
+            }
+        )
     return {"entorno": entorno(), "medidas": medidas}
 
 
@@ -252,13 +353,47 @@ def formatear(datos: dict) -> str:
         f"  {'-' * 8} {'-' * 10} {'-' * 9} {'-' * 10} {'-' * 9} {'-' * 9}",
     ]
     for m in datos["medidas"]:
+        if m["perfil"] == "epg":
+            continue  # el EPG tiene su bloque, con ms por consulta
         lineas.append(
             f"  {m['perfil']:<8} {m['operation']:<10} {m['entradas']:>9,} "
             f"{m['segundos']:>9.3f}s {m['pico_mb']:>8.2f} {m['ms_por_1000']:>8.2f}"
         )
+    lineas += _formatear_epg(datos["medidas"])
     lineas.append("")
     lineas.append("Los datos son sintéticos: misma forma que una lista real, sin credenciales.")
     return "\n".join(lineas)
+
+
+def _formatear_epg(medidas: list[dict]) -> list[str]:
+    """Bloque EPG (EPG-004): milisegundos por consulta y el «antes/después».
+
+    En consultas la cifra que se lee es la por consulta, no la por mil
+    entradas: una consulta tarda microsegundos y el dato útil es poder decir
+    «tarda X ms», no multiplicarlo mil veces para que se vea.
+    """
+    epg = [m for m in medidas if m["perfil"] == "epg"]
+    if not epg:
+        return []
+    lineas = [
+        "",
+        f"Consultas EPG sobre {EPG_CANALES:,} canales × {EPG_DIAS} días (EPG-004)",
+        f"  {'operación':<10} {'tiempo':>10} {'pico MB':>9} {'ms/consulta':>13}",
+        f"  {'-' * 10} {'-' * 10} {'-' * 9} {'-' * 13}",
+    ]
+    for m in epg:
+        ms = m["segundos"] * 1000.0 / m["entradas"] if m["entradas"] else 0.0
+        lineas.append(
+            f"  {m['operation']:<10} {m['segundos']:>9.3f}s {m['pico_mb']:>8.2f} {ms:>12.4f}"
+        )
+    ahora = next((m for m in epg if m["operation"] == "epg_now"), None)
+    antes = next((m for m in epg if m["operation"] == "epg_lineal"), None)
+    if ahora and antes and ahora["segundos"]:
+        lineas.append(
+            f"  el escaneo lineal tarda {antes['segundos'] / ahora['segundos']:.1f}× "
+            "más por consulta que el índice"
+        )
+    return lineas
 
 
 def main(argv: list[str] | None = None) -> int:

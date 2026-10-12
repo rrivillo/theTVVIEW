@@ -6,11 +6,12 @@ reciclaje del EPG ya cargado en App.ensure_epg.
 
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
 from thetvview.epg_parser import Epg
-from thetvview.models import Channel
+from thetvview.models import Channel, Program
 from thetvview.ui import app as ui_app
 
 
@@ -64,11 +65,14 @@ class TestEnsureEpgRecycle(unittest.TestCase):
             self.addCleanup(p.stop)
         self.app = ui_app.App(None)  # noqa: ANN001 - no se renderiza
 
-        # EPG falso ya cargado con correspondencia para 'canalx'.
-        self.fake_epg = mock.Mock(spec=Epg)
-        self.fake_epg.programs = {"canalx": []}
-        self.fake_epg.channels_by_id = {"canalx": "Canal X"}
-        self.fake_epg.programmes_for.return_value = []
+        # Guía previa ya cargada, con correspondencia para 'canalx'. Es un
+        # `Epg` de verdad y no un doble: desde la Fase 4 `ensure_epg` **compara
+        # la nueva contra la activa** (FR-EPG-009) y un doble no sabe cuántos
+        # programas tiene.
+        self.fake_epg = Epg(
+            channels_by_id={"canalx": "Canal X"},
+            programs={"canalx": []},
+        )
         self.app.epg = self.fake_epg
 
     def tearDown(self):
@@ -94,10 +98,22 @@ class TestEnsureEpgRecycle(unittest.TestCase):
 
     def test_force_refresh_recarga_con_la_misma_fuente(self):
         self.app.epg_source = "https://epg.example.com/guia.xml"
-        recargado = mock.Mock(spec=Epg)
-        recargado.programs = {"canalx": []}
-        recargado.channels_by_id = {"canalx": "Canal X"}
-        recargado.programmes_for.return_value = []
+        # Un `Epg` de verdad, no un doble: desde la Fase 4 la app **valida** la
+        # guía antes de sustituir a la activa (FR-EPG-009), y un doble no puede
+        # contestar eso con sentido.
+        recargado = Epg(
+            channels_by_id={"canalx": "Canal X"},
+            programs={
+                "canalx": [
+                    Program(
+                        channel_id="canalx",
+                        title="Algo",
+                        start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                        stop=datetime(2026, 1, 1, 1, tzinfo=timezone.utc),
+                    )
+                ]
+            },
+        )
         with mock.patch(
             "thetvview.ui.app.load_epg_source", return_value=recargado
         ) as loader:
@@ -121,6 +137,71 @@ class TestEnsureEpgRecycle(unittest.TestCase):
         progs = self.app.ensure_epg(ch())
         self.assertEqual(progs, [])
         self.assertTrue(self.app.status.is_error)
+
+
+class TestAvisoDeAmbiguedad(unittest.TestCase):
+    """FR-EPG-003: si un nombre casa con varios canales, se avisa una vez.
+
+    No se fusiona nada —el canal funciona y se resuelve el primero—, pero el
+    usuario merece saber que el horario que ve puede ser el de un homónimo.
+    El aviso es un modal (regla de `AGENTS.md`) y se emite **una vez por
+    clave**: repetirlo en cada apertura deja de leerse.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        for target in ("PLAYLISTS_JSON", "FAVORITES_JSON"):
+            p = mock.patch.object(ui_app.config, target, base / target.lower())
+            p.start()
+            self.addCleanup(p.stop)
+        self.app = ui_app.App(None)  # noqa: ANN001 - no se renderiza
+        cuando = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        luego = datetime(2026, 1, 1, 1, tzinfo=timezone.utc)
+
+        def prog(cid):
+            return [Program(channel_id=cid, title="Algo", start=cuando, stop=luego)]
+
+        self.app.epg = Epg(
+            channels_by_id={
+                "canal.sd": "Canal X",
+                "canal.hd": "Canal X",
+                "otro.a": "Alfa",
+                "otro.b": "Alfa",
+            },
+            programs={cid: prog(cid) for cid in ("canal.sd", "canal.hd", "otro.a", "otro.b")},
+        )
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_un_nombre_ambiguo_avisa_una_sola_vez(self):
+        with mock.patch.object(self.app, "_show_notice") as notice:
+            progs = self.app.ensure_epg(ch())
+            # El canal se sirve igual: la ambigüedad informa, no bloquea.
+            self.assertEqual(len(progs), 1)
+            self.assertEqual(notice.call_count, 1)
+            titulo, mensaje = notice.call_args.args
+            self.assertIn("llaman igual", titulo)
+            self.assertIn("Canal X", mensaje)
+            self.assertIn("tvg-id", mensaje)
+            self.app.ensure_epg(ch())
+            self.assertEqual(notice.call_count, 1)  # una vez por clave
+
+    def test_un_canal_sin_ambiguedad_no_abre_modal(self):
+        self.app.epg = Epg(
+            channels_by_id={"canalx": "Canal X"},
+            programs={"canalx": []},
+        )
+        with mock.patch.object(self.app, "_show_notice") as notice:
+            self.app.ensure_epg(ch())
+        notice.assert_not_called()
+
+    def test_dos_nombres_ambiguos_avisan_cada_uno(self):
+        with mock.patch.object(self.app, "_show_notice") as notice:
+            self.app.ensure_epg(ch())
+            self.app.ensure_epg(Channel(name="Alfa", url="http/x/alfa"))
+            self.assertEqual(notice.call_count, 2)
 
 
 if __name__ == "__main__":

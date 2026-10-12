@@ -3,10 +3,17 @@
 Contrato v1.1:
 - parse_file acepta .xml/.xmltv y variantes .gz (se descomprimen con gzip).
 - start/stop con offset tz se convierten a datetime consciente; sin offset,
-  se asume UTC.
+  se toma como UTC **pero marcado** (FR-EPG-006): el programa lleva
+  `tz_assumed=True`, `validar()` lo cuenta y la UI avisa una vez por fuente
+  con `aviso_zona_pendiente`. La política no es «asumir en silencio»: es
+  «asumir sin mentir» — se sigue haciendo para no cambiar el comportamiento
+  de la app de un día para otro, pero el usuario se entera.
 - programme sin stop: se rellena con el start del siguiente programa del
-  mismo canal; el último queda con stop=None.
-- Canales indexados por id con su primer display-name y primer icon (<icon src>).
+  mismo canal; el último queda con stop=None. Un stop imposible (anterior o
+  igual al start) se descarta y entra en ese mismo relleno (FR-EPG-007).
+- Canales indexados por id con su primer display-name (el canónico), el resto
+  de display-name en aliases_by_id como alias de búsqueda (FR-EPG-002), y el
+  primer icon (<icon src>).
 - Programas con sub-title y categorías (en orden del feed).
 - now_playing trata el último programa (sin stop) como abierto; next_programme
   da el fallback "a continuación" en consulta.
@@ -24,6 +31,7 @@ import hashlib
 import os
 import re
 import time
+from bisect import bisect_right
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -45,26 +53,196 @@ _FMT = "%Y%m%d%H%M%S %z"
 _FMT_NO_TZ = "%Y%m%d%H%M%S"
 
 
-def _parse_ts(raw: str | None) -> datetime | None:
-    """Convierte 'YYYYMMDDHHMMSS ±ZZZZ' a datetime aware (UTC si no hay tz)."""
+#: Fuentes cuya guía ya se leyó y a las que ya se avisó de que sus horas
+#: venía sin zona. Un aviso por fuente y por proceso (EPG-001): el aviso sirve
+#: para que el usuario sepa que las horas pueden estar desplazadas, no para
+#: repetirlo en cada refresco, que es como se deja de leer un aviso.
+_AVISOS_TZ: set[str] = set()
+
+
+def aviso_zona_pendiente(fuente: str = "") -> str:
+    """Texto del aviso de zona horaria asumida, o "" si ya se avisó.
+
+    Devolver el texto (y no abrir el modal aquí) es lo que mantiene este módulo
+    **puro**: el aviso lo presenta la UI, que es quien sabe cómo hacerlo.
+    """
+    clave = str(fuente or "").strip() or "(sin fuente)"
+    if clave in _AVISOS_TZ:
+        return ""
+    _AVISOS_TZ.add(clave)
+    return (
+        "Esta guía viene sin zona horaria, así que sus horas se están "
+        "tomando como si fueran UTC. Si el proveedor usa la hora local, las "
+        "horas se verán desplazadas."
+    )
+
+
+def reinicia_avisos_tz() -> None:
+    """Olvida los avisos ya mostrados. Para tests y recargas completas."""
+    _AVISOS_TZ.clear()
+
+
+def _parse_ts(raw: str | None) -> tuple[datetime | None, bool]:
+    """'YYYYMMDDHHMMSS ±ZZZZ' → datetime aware. Indica si hubo que asumir UTC.
+
+    Política temporal (§10.2 del SDD de P1, FR-EPG-005/006)
+    ------------------------------------------------------
+
+    XMLTV admite dos formas y **no** son la misma cosa:
+
+    1. ``20260825080000 +0200`` — el feed declara el desfase. Se respeta tal
+       cual y se normaliza a UTC para comparar.
+    2. ``20260825080000`` — el feed **no dice** nada.
+
+    Antes, el caso 2 se convertía a UTC en silencio, lo que es afirmar que el
+    proveedor publica en UTC sin ningún dato que lo sostenga. Ahora se sigue
+    haciendo —para no cambiar el comportamiento de toda la app de un día para
+    otro— pero **se marca**: el segundo valor de retorno dice que la zona se
+    asumió y el :class:`~thetvview.models.Program` lo lleva en ``tz_assumed``.
+
+    Aquí **no** se registra ningún aviso: hacerlo consumiría la única
+    oportunidad de :func:`aviso_zona_pendiente` justo antes de que la UI pueda
+    enseñarlo, y el usuario nunca vería el aviso. El registro lo hace la UI
+    cuando lo muestra, una vez por fuente.
+
+    Devolver un par en lugar de un `datetime` es lo que hace posible esa marca
+    sin tener que volver a recorrer el XML.
+    """
     if not raw:
-        return None
+        return None, False
     raw = raw.strip()
     try:
         if " " in raw:
-            return datetime.strptime(raw, _FMT)
-        return datetime.strptime(raw[:14], _FMT_NO_TZ).replace(tzinfo=timezone.utc)
+            momento = datetime.strptime(raw, _FMT)
+            return momento.astimezone(timezone.utc), False
+        momento = datetime.strptime(raw[:14], _FMT_NO_TZ)
     except ValueError:
-        return None
+        return None, False
+    return momento.replace(tzinfo=timezone.utc), True
+
+
+def _normaliza_para_indice(momento: datetime) -> datetime:
+    """Un instante comparable: siempre en UTC y siempre consciente.
+
+    Dos motivos, y los dos importan:
+
+    - un `Program` de un feed **con** offsets lleva su propia zona, y otro de un
+      feed **sin** offsets llega como UTC. Compararlos con `<` lanzaría
+      `TypeError`, así que todo pasa por aquí antes de compararse;
+    - un reloj **naive** —el que llegue de la UI o de un test— se toma como UTC,
+      que es exactamente la política de :func:`_parse_ts`. Tratarlo como
+      «hora local» sería inventar una zona que nadie declaró.
+
+    Normalizar en la frontera y no en el bucle es lo que mantiene el índice
+    comparáble sin comprobaciones por comparación.
+    """
+    if momento.tzinfo is None:
+        return momento.replace(tzinfo=timezone.utc)
+    return momento.astimezone(timezone.utc)
+
+
+#: Sentinel de «más infinito» para el prefijo de paradas: un programa sin
+#: `stop` sigue abierto, luego cubre cualquier instante posterior a su arranque.
+_PARADA_ABIERTA = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _stops_max_index(programs: dict[str, list[Program]]) -> dict[str, list[datetime]]:
+    """Prefijo de paradas máximas por canal: `max[i]` = mayor `stop` de [0..i].
+
+    Es lo que permite saber en O(1) si **algún** programa anterior al de la
+    posición `i` sigue cubriendo un instante, sin recorrer el prefijo. Sin
+    esta estructura, comprobar sólo el programa inmediatamente anterior —como
+    hacía el primer intento— se equivoca en parrillas anidadas: un programa
+    largo con dos cortos dentro hace que la bisección devuelva el corto
+    equivocado **sin avisar**, que es justo el fallo silencioso que el plan
+    marca como el más dañino (§5, «Equivalencia del índice EPG»).
+
+    Un `stop is None` es un infinito: quien lo lleva nunca «termina antes».
+    """
+    indice: dict[str, list[datetime]] = {}
+    for cid, programas in programs.items():
+        maximos: list[datetime] = []
+        actual: datetime | None = None
+        for prog in programas:
+            fin = (
+                _PARADA_ABIERTA
+                if prog.stop is None
+                else _normaliza_para_indice(prog.stop)
+            )
+            actual = fin if actual is None else max(actual, fin)
+            maximos.append(actual)
+        indice[cid] = maximos
+    return indice
+
+
+def build_index(programs: dict[str, list[Program]]) -> dict[str, list[datetime]]:
+    """Índice `channel_id` → inicios ordenados, para buscar por bisección.
+
+    Es la estructura que convierte `now_playing` y `next_programme` de O(n) en
+    O(log n) **por consulta** (FR-EPG-008/012). Se construye **una vez** en la
+    carga, no en cada consulta: construirlo por consulta sería peor que el
+    escaneo que sustituye.
+
+    Los inicios van **ordenados**, porque `bisect_right` sólo sirve sobre una
+    secuencia ordenada.
+
+    Cuando la lista de programas **no** está ordenada por inicio, la bisección
+    daría la posición equivocada, así que ese canal queda marcado en
+    :attr:`Epg.unordered_channels` y sus consultas usan el escaneo lineal.
+    :func:`parse_text` siempre ordena, así que en la práctica ese conjunto está
+    vacío; el caso existe porque `Epg` es un dataclass público y alguien puede
+    construirlo a mano. Lo detecta :meth:`Epg.__post_init__`, que es quien
+    decide: esta función **no** guarda estado.
+    """
+    indice: dict[str, list[datetime]] = {}
+    for cid, programas in programs.items():
+        inicios = [_normaliza_para_indice(p.start) for p in programas]
+        inicios.sort()
+        indice[cid] = inicios
+    return indice
 
 
 @dataclass
 class Epg:
-    """EPG indexado por channel_id."""
+    """EPG indexado por channel_id.
+
+    Lleva dos índices: el de programas por canal (el de siempre) y el de
+    inicios ordenados, que es lo que hace que buscar el programa actual sea
+    una bisección en vez de un recorrido.
+    """
 
     channels_by_id: dict[str, str]  # id -> display-name
     programs: dict[str, list[Program]]
     icons_by_id: dict[str, str] = field(default_factory=dict)  # id -> icon src
+    #: id → etiquetas alternativas del mismo canal: los `<display-name>` que
+    #: van **después** del primero (idomas, abreviaturas, HD/SD). Son los alias
+    #: del fallback de FR-EPG-002; sólo los canales que traen más de uno
+    #: aparecen aquí. El primer display-name es el canónico y vive en
+    #: `channels_by_id`, que es la etiqueta que se **muestra**.
+    aliases_by_id: dict[str, list[str]] = field(default_factory=dict)
+    #: `channel_id` → inicios normalizados y ordenados. Ver :func:`build_index`.
+    starts_by_channel: dict[str, list[datetime]] = field(default_factory=dict)
+    #: `channel_id` → parada máxima acumulada por posición. Ver
+    #: :func:`_stops_max_index`: es lo que hace que detectar un solape en el
+    #: camino rápido sea O(1) y no un recorrido del prefijo.
+    stops_max_by_channel: dict[str, list[datetime]] = field(default_factory=dict)
+    #: Canales cuya lista de programas **no** está ordenada por inicio. Para
+    #: ellos la búsqueda lineal sigue siendo la correcta: `parse_text` ordena
+    #: siempre, así que en la práctica está vacío.
+    unordered_channels: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if not self.starts_by_channel:
+            desordenados: set[str] = set()
+            for cid, programas in self.programs.items():
+                inicios = [_normaliza_para_indice(p.start) for p in programas]
+                if inicios != sorted(inicios):
+                    desordenados.add(cid)
+                inicios.sort()
+                self.starts_by_channel[cid] = inicios
+            self.unordered_channels |= frozenset(desordenados)
+        if not self.stops_max_by_channel:
+            self.stops_max_by_channel = _stops_max_index(self.programs)
 
     def channel_name(self, channel_id: str) -> str | None:
         return self.channels_by_id.get(channel_id)
@@ -77,8 +255,52 @@ class Epg:
         return self.programs.get(channel_id, [])
 
     def now_playing(self, channel_id: str, when: datetime) -> Program | None:
-        for prog in self.programmes_for(channel_id):
-            if prog.start <= when and (prog.stop is None or when < prog.stop):
+        """Programa en emisión en `when`, o None.
+
+        Búsqueda por bisección: se localiza el último programa que **ya**
+        empezó y, si el prefijo de paradas máximas dice que ninguno de los
+        anteriores lo tapa, se comprueba sólo ese. El escaneo lineal haría lo
+        mismo pero recorriendo la parrilla entera en cada consulta, y esa
+        consulta se hace una vez por favorito y por reconstrucción de la
+        lista (FR-EPG-008).
+        """
+        programas = self.programs.get(channel_id)
+        if not programas:
+            return None
+        instante = _normaliza_para_indice(when)
+        if channel_id in self.unordered_channels:
+            for prog in programas:
+                if _normaliza_para_indice(prog.start) <= instante and (
+                    prog.stop is None
+                    or instante < _normaliza_para_indice(prog.stop)
+                ):
+                    return prog
+            return None
+        inicios = self.starts_by_channel.get(channel_id)
+        if inicios is None:  # Epg construido a mano sin pasar por __post_init__
+            inicios = build_index({channel_id: programas})[channel_id]
+        posicion = bisect_right(inicios, instante) - 1
+        if posicion < 0:
+            return None  # todavía no empezaba nada de este canal
+        maximos = self.stops_max_by_channel.get(channel_id)
+        if maximos is None:
+            maximos = _stops_max_index({channel_id: programas})[channel_id]
+        if posicion == 0 or maximos[posicion - 1] <= instante:
+            # Camino rápido: ninguno de los anteriores seguía cubriendo el
+            # instante, así que no hay solape y el último que empezó es **el**.
+            candidato = programas[posicion]
+            if candidato.stop is None or instante < _normaliza_para_indice(candidato.stop):
+                return candidato
+            return None
+        # Camino de la **equivalencia exacta**: hay solapes, y el escaneo lineal
+        # devolvía el primer programa de la lista que cumplía el intervalo, que
+        # en una lista ordenada por inicio es el de arranque más temprano. Se
+        # recorre el prefijo entero para devolver exactamente el mismo.
+        #
+        # Ocurre sólo con parrillas solapadas —un feed roto—; en una guía
+        # correcta el camino de arriba siempre gana y la consulta es O(log n).
+        for prog in programas[: posicion + 1]:
+            if prog.stop is None or instante < _normaliza_para_indice(prog.stop):
                 return prog
         return None
 
@@ -88,10 +310,161 @@ class Epg:
         Fallback "a continuación" en consulta: también sirve para acotar un
         programa cuyo stop es None (el último de la parrilla).
         """
-        for prog in self.programmes_for(channel_id):
-            if prog.start > when:
+        programas = self.programs.get(channel_id)
+        if not programas:
+            return None
+        instante = _normaliza_para_indice(when)
+        if channel_id in self.unordered_channels:
+            candidato: Program | None = None
+            for prog in programas:
+                inicio = _normaliza_para_indice(prog.start)
+                if inicio <= instante:
+                    continue
+                if candidato is None or inicio < _normaliza_para_indice(candidato.start):
+                    candidato = prog
+            return candidato
+        inicios = self.starts_by_channel.get(channel_id)
+        if inicios is None:
+            inicios = build_index({channel_id: programas})[channel_id]
+        posicion = bisect_right(inicios, instante)
+        if posicion >= len(inicios):
+            return None
+        # Lista ordenada por inicio: en esta posición vive el primer programa
+        # que aún no ha empezado. Los inicios van normalizados, así que se
+        # compara el normalizado del programa, no el crudo.
+        objetivo = inicios[posicion]
+        for prog in programas:
+            if _normaliza_para_indice(prog.start) == objetivo:
                 return prog
-        return None
+        return None  # pragma: no cover - el índice y la lista no pueden divergir
+
+    @property
+    def total_programas(self) -> int:
+        """Cuántos programas hay en total. Para la validación de integridad."""
+        return sum(len(v) for v in self.programs.values())
+
+    def validar(self, *, min_canales: int = 1, min_programas: int = 1):
+        """¿Esta guía sirve para sustituir a la activa? (FR-EPG-009/010)
+
+        Devuelve una :class:`~thetvview.epg_parser.EpgValidation` con el
+        veredicto y el motivo. **No** cambia nada: decidir es de quien llama.
+
+        Dos rechazos y sólo dos, porque son los que hacen que una pantalla de
+        Favoritos pase de mostrar programas a no mostrar nada:
+
+        - **0 canales** o **0 programas**: una guía vacía no es una guía;
+        - **muchos menos que la anterior** (por debajo de ``min_ratio``): una
+          descarga a medio servir.
+
+        Y una condición que **no** es un rechazo pero sí se informa: que alguna
+        fuente trajera horas sin zona. La app las sigue usando —cambiar eso de
+        golpe sería peor—, pero el usuario tiene que saberlo (FR-EPG-006).
+        """
+        canales = len(self.channels_by_id)
+        programas = self.total_programas
+        if canales < min_canales or programas < min_programas:
+            return EpgValidation(
+                ok=False,
+                motivo=(
+                    f"La guía descargada viene vacía ({canales} canales, "
+                    f"{programas} programas). Se conserva la guía que ya tenías."
+                ),
+                canales=canales,
+                programas=programas,
+                vacia=True,
+            )
+        con_zona_asumida = sum(
+            1
+            for lista in self.programs.values()
+            for prog in lista
+            if prog.tz_assumed
+        )
+        avisos: list[str] = []
+        if con_zona_asumida:
+            avisos.append(
+                "Una parte de la guía viene sin zona horaria y se está tomando "
+                "como UTC; si el proveedor usa otra zona, esas horas se verán "
+                "desplazadas."
+            )
+        return EpgValidation(
+            ok=True,
+            canales=canales,
+            programas=programas,
+            con_zona_asumida=con_zona_asumida,
+            avisos=avisos,
+        )
+
+
+@dataclass
+class EpgValidation:
+    """Veredicto de una guía recién descargada, antes de sustituir a la activa."""
+
+    ok: bool = True
+    motivo: str = ""
+    canales: int = 0
+    programas: int = 0
+    #: True si la guía no trae nada utilizable.
+    vacia: bool = False
+    #: Programas cuyo instante se tomó como UTC sin que el feed lo dijera.
+    con_zona_asumida: int = 0
+    #: Avisos que la UI debe enseñar aunque la guía sea válida.
+    avisos: list[str] = field(default_factory=list)
+
+    def para_modal(self) -> str:
+        if not self.ok:
+            return self.motivo
+        base = f"La guía trae {self.programas} programas de {self.canales} canales."
+        return base + ("\n\n" + "\n".join(self.avisos) if self.avisos else "")
+
+    @staticmethod
+    def contra_creciente(
+        nueva: "EpgValidation",
+        anterior_canales: int,
+        anterior_programas: int = 0,
+        min_ratio: float = 0.3,
+    ) -> "EpgValidation":
+        """Segunda vuelta de la validación: contra la guía que ya está activa.
+
+        Una guía «no vacía» puede estar igual de rota: 30 programas de 20 000
+        canales es una descarga cortada que **sí** pasa el primer filtro. Por eso
+        se compara con la anterior, que es la que hay que proteger.
+
+        Se comparan **las dos magnitudes**, canales y programas, y basta con que
+        una caiga por debajo del umbral para rechazar. Mirar sólo los canales no
+        detecta el caso real: un proveedor que sigue mandando los 20 000 canales
+        pero con la parrilla vacía para la mitad.
+        """
+        if not nueva.ok or (anterior_canales <= 0 and anterior_programas <= 0):
+            return nueva
+        falta_canales = (
+            anterior_canales > 0 and nueva.canales < anterior_canales * min_ratio
+        )
+        falta_programas = (
+            anterior_programas > 0
+            and nueva.programas < anterior_programas * min_ratio
+        )
+        if not falta_canales and not falta_programas:
+            return nueva
+        detalle = []
+        if falta_canales:
+            detalle.append(
+                f"{nueva.canales} canales de los {anterior_canales} que había"
+            )
+        if falta_programas:
+            detalle.append(
+                f"{nueva.programas} programas de los {anterior_programas} que había"
+            )
+        return EpgValidation(
+            ok=False,
+            motivo=(
+                f"La guía nueva trae {' y '.join(detalle)}: parece incompleta. "
+                "Se conserva la guía que ya tenías; si de verdad quieres "
+                "cambiarla, dilo."
+            ),
+            canales=nueva.canales,
+            programas=nueva.programas,
+            avisos=nueva.avisos,
+        )
 
 
 def _text_of(el: ET.Element | None) -> str | None:
@@ -108,6 +481,12 @@ def parse_text(text: str) -> Epg:
     ``<!DOCTYPE>``/``<!ENTITY>`` y acota profundidad y número de nodos
     (gap B6). Un XML mal formado sigue lanzando ``ValueError`` con el
     mensaje de siempre.
+
+    De cada canal se guardan **todos** los ``<display-name>``: el primero es
+    el canónico (la etiqueta que se muestra) y el resto van a
+    ``Epg.aliases_by_id`` como alias de búsqueda (FR-EPG-002). El tratamiento
+    de intervalos —stops ausentes, imposibles o de duración cero— queda
+    documentado en el bloque de relleno de más abajo (FR-EPG-007).
     """
     try:
         root = parse_xml(text)
@@ -116,13 +495,25 @@ def parse_text(text: str) -> Epg:
 
     channels: dict[str, str] = {}
     icons: dict[str, str] = {}
+    aliasines: dict[str, list[str]] = {}
     for ch in root.iter("channel"):
         cid = ch.get("id")
         if not cid:
             continue
-        display = _text_of(ch.find("display-name"))
-        if display and cid not in channels:
-            channels[cid] = display
+        nombres = [n for n in (_text_of(el) for el in ch.findall("display-name")) if n]
+        if cid not in channels and nombres:
+            channels[cid] = nombres.pop(0)  # el primero es el canónico
+        if nombres:
+            # El resto son alias (FR-EPG-002): se guardan sin repetir y sin
+            # repetir el canónico, porque un feed que repite `<channel id>`
+            # con el mismo texto no está aportando nada. Si al final no queda
+            # ninguno, el canal no entra en el dict.
+            actuales = aliasines.get(cid, [])
+            for nombre in nombres:
+                if nombre != channels.get(cid) and nombre not in actuales:
+                    actuales.append(nombre)
+            if actuales:
+                aliasines[cid] = actuales
         if cid not in icons:
             icon_el = ch.find("icon")
             src = icon_el.get("src", "").strip() if icon_el is not None else ""
@@ -132,33 +523,57 @@ def parse_text(text: str) -> Epg:
     by_channel: dict[str, list[Program]] = {}
     for node in root.iter("programme"):
         cid = node.get("channel") or ""
-        start = _parse_ts(node.get("start"))
+        start, asumido = _parse_ts(node.get("start"))
         if not cid or start is None:
             continue  # sin canal o sin fecha válida: entrada inservible
         title = _text_of(node.find("title")) or "(sin título)"
         categories = [
             cat for cat in (_text_of(el) for el in node.findall("category")) if cat
         ]
+        stop, _ = _parse_ts(node.get("stop"))
         by_channel.setdefault(cid, []).append(
             Program(
                 channel_id=cid,
                 title=title,
                 start=start,
-                stop=_parse_ts(node.get("stop")),
+                stop=stop,
                 desc=_text_of(node.find("desc")),
                 sub_title=_text_of(node.find("sub-title")),
                 categories=categories,
+                tz_assumed=asumido,
             )
         )
 
-    # Rellenar stops ausentes con el start del siguiente programa del canal.
+    # Tratamiento de intervalos (FR-EPG-007), en un solo sitio:
+    #
+    # - `stop` ausente → se acota con el arranque del siguiente programa (de
+    #   siempre; es lo que hace que un feed sin stops no deje huecos);
+    # - `stop` **anterior o igual** al arranque → intervalo imposible, feed
+    #   corrupto. Se descarta el stop —el programa queda «abierto»— y el mismo
+    #   relleno de abajo le asigna el arranque del siguiente. Así la parrilla
+    #   sigue contigua y en pantalla nunca aparece un fin anterior al inicio.
+    #   Si es el último del canal, queda abierto: la política de «último sin
+    #   stop» que ya existía.
+    # - duración cero **con** siguiente → se acota igual que un stop ausente.
+    #
+    # Los solapes no se tocan: dos programas pueden convivir (§10.2) y quien
+    # decide cuál está en el aire es la consulta, que devuelve el primero de
+    # la lista —el de arranque más temprano—, igual que el escaneo lineal.
     for progs in by_channel.values():
         progs.sort(key=lambda p: p.start)
+        for prog in progs:
+            if prog.stop is not None and prog.stop <= prog.start:
+                prog.stop = None
         for prev, nxt in zip(progs, progs[1:]):
             if prev.stop is None:
                 prev.stop = nxt.start
 
-    return Epg(channels_by_id=channels, programs=by_channel, icons_by_id=icons)
+    return Epg(
+        channels_by_id=channels,
+        programs=by_channel,
+        icons_by_id=icons,
+        aliases_by_id=aliasines,
+    )
 
 
 def parse_file(path: str | Path) -> Epg:
