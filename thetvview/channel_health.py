@@ -29,6 +29,7 @@ from typing import Deque
 from urllib.error import HTTPError
 
 from thetvview.models import Channel
+from thetvview.player.evidence import EvidenceLevel
 from thetvview.security.safe_http import SafeHttpClient
 from thetvview.security.url_policy import PURPOSE_STREAM
 from thetvview.streams.headers import build_headers as _build_headers
@@ -76,6 +77,10 @@ class HealthStatus:
     #: La capa de estados (`estado_de`) lo lee para no pintar como «offline»
     #: o «online» lo que en realidad no se sabe (FR-STA-01/02).
     medible: bool = True
+    #: Evidencia de reproducción que se usó para calcular esto (FR-REC-002).
+    #: La barra lo muestra para no decir «funciona» cuando sólo se sabe que el
+    #: proceso existe.
+    evidencia: EvidenceLevel = EvidenceLevel.NONE
 
 
 class Estado(str, Enum):
@@ -317,10 +322,45 @@ def _jitter(values: list[float]) -> float | None:
         return None
 
 
+def _normalizar_evidencia(
+    evidencia: EvidenceLevel | None,
+    player_alive: bool | None,
+) -> EvidenceLevel:
+    """Traduce los dos parámetros públicos a un único nivel de evidencia.
+
+    Acepta las dos formas a propósito: la nueva (``evidencia``) y la vieja
+    (``player_alive``), para que cambiar el criterio no rompa a quien llama.
+    Con los dos, manda ``evidencia``: es más específico.
+    """
+    if evidencia is not None:
+        return evidencia
+    return EvidenceLevel.PROCESS_ALIVE if player_alive else EvidenceLevel.NONE
+
+
+def _proceso_vivo(
+    evidencia: EvidenceLevel,
+    player_alive: bool | None,
+) -> bool:
+    """¿Está vivo el reproductor, según lo que sabemos?
+
+    ``UNKNOWN`` **no** significa «parado»: significa «no lo sé de los medios».
+    Quien llama a :func:`classify_health` lo hace porque hay una reproducción en
+    marcha, así que con evidencia desconocida se asume el proceso vivo y lo que
+    se dice es «no comprobado», no «detenido» —que sería afirmar algo que nadie
+    sabe (FR-STA-02).
+    """
+    if evidencia is EvidenceLevel.UNKNOWN:
+        return True if player_alive is None else bool(player_alive)
+    if evidencia is EvidenceLevel.NONE:
+        return False
+    return evidencia.rank >= EvidenceLevel.PROCESS_ALIVE.rank
+
+
 def classify_health(
     snapshots: list[HealthSnapshot] | Deque[HealthSnapshot],
     *,
-    player_alive: bool,
+    player_alive: bool | None = None,
+    evidencia: EvidenceLevel | None = None,
 ) -> HealthStatus:
     """Agrega snapshots y produce HealthStatus 0..5.
 
@@ -331,11 +371,26 @@ def classify_health(
       "No medible: ver reproductor".
     - Sin no: success_rate y latencia mediana determinan nivel; jitter alto
       baja un escalón.
+
+    ``evidencia`` (FR-REC-002)
+    ---------------------------
+
+    El criterio de «está vivo» pasó de un ``bool`` a un
+    :class:`~thetvview.player.evidence.EvidenceLevel`, porque ``poll() is None``
+    sólo dice que el proceso existe. El parámetro ``player_alive`` **se sigue
+    aceptando** y se traduce a ``PROCESS_ALIVE``/``NONE``: es lo que permite
+   phrasing este cambio sin tocar a quien ya llama.
+
+    Con evidencia declarada, la etiqueta dice lo que sabe y lo que no:
+    ``Reproduciendo (sin comprobar)`` cuando el motor no expone señal, que es
+    una información real y no un adorno.
     """
     snaps = list(snapshots)
     n = len(snaps)
+    nivel_evidencia = _normalizar_evidencia(evidencia, player_alive)
+    vivo = _proceso_vivo(nivel_evidencia, player_alive)
 
-    if not player_alive:
+    if not vivo:
         return HealthStatus(
             level=0,
             label=health_label(0),
@@ -479,6 +534,21 @@ def classify_health(
 
     summary = " · ".join(parts)
 
+    # La barra de red y la de reproducción son cosas distintas: que el servidor
+    # responda rápido no dice que haya imagen. Cuando la evidencia no llega a
+    # ``MEDIA_SEEN`` se lo dice al usuario en vez de dejar «Excelente» solo
+    # (FR-REC-002, §11.1 del SDD de P1).
+    #
+    # Sólo se añade el matiz si el llamante pasó `evidencia`: quien sigue
+    # llamando con `player_alive` recibe exactamente el texto de siempre, que es
+    # lo que permite cambiar el criterio sin cambiar lo que el usuario ve.
+    if evidencia is not None and not _evidencia_de_medios(nivel_evidencia):
+        summary = f"{summary} · {nivel_evidencia.texto()}"
+        detail = (
+            f"{detail}. {nivel_evidencia.texto()}: la conexión está bien, pero "
+            "no hay confirmación de que esté llegando imagen."
+        )
+
     return HealthStatus(
         level=level,
         label=label,
@@ -492,7 +562,13 @@ def classify_health(
         jitter_ms=jitter_val,
         probe_count=n,
         success_count=success_count,
+        evidencia=nivel_evidencia,
     )
+
+
+def _evidencia_de_medios(nivel: EvidenceLevel) -> bool:
+    """True si hay evidencia de que están llegando medios."""
+    return nivel.rank >= EvidenceLevel.MEDIA_SEEN.rank
 
 
 # ---------------------------------------------------------------------------
@@ -626,10 +702,17 @@ class ChannelHealthMonitor:
         with self._lock:
             return list(self.history)
 
-    def status(self, *, player_alive: bool) -> HealthStatus:
+    def status(
+        self,
+        *,
+        player_alive: bool | None = None,
+        evidencia: EvidenceLevel | None = None,
+    ) -> HealthStatus:
         with self._lock:
             snaps = list(self.history)
-        return classify_health(snaps, player_alive=player_alive)
+        return classify_health(
+            snaps, player_alive=player_alive, evidencia=evidencia
+        )
 
     def latest(self) -> HealthSnapshot | None:
         with self._lock:

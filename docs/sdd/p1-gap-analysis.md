@@ -100,7 +100,7 @@ Leyenda: **S** = `SATISFECHO` · **P** = `PARCIAL` · **A** = `AUSENTE` ·
 |-----|--------|-----------|--------------|
 | FR-REC-001 niveles de evidencia | **A** | No existe `EvidenceLevel`. `supervisor.py:256` decide `PLAYING` con `poll() is None` | REC-001/002 |
 | FR-REC-002 evidencia por motor | **A** | `mpv_ipc.MpvIpc` existe (`get_property`, `is_alive`) pero **nadie** lo consulta para saber si hay medios. VLC/mplayer no tienen adaptador de señal | REC-001 |
-| FR-REC-003 modelo común | **P** | `player/errors.StreamErrorCode` tiene 16 códigos; faltan `DNS`, `HTTP_RATE_LIMIT`, `MANIFEST_INVALID`, `MEDIA_DEMUX`, `CODEC_UNSUPPORTED`, `TRACK_SELECTION`, `PLAYER_STARTUP`, `PLAYER_EXIT`, `TIMEOUT`, `CANCELLED` | REC-003 |
+| FR-REC-003 modelo común | **P** | `player/errors.StreamErrorCode` tiene 14 códigos; faltan `DNS`, `HTTP_RATE_LIMIT`, `MANIFEST_INVALID`, `MEDIA_DEMUX`, `CODEC_UNSUPPORTED`, `TRACK_SELECTION`, `PLAYER_STARTUP`, `PLAYER_EXIT`, `TIMEOUT`, `CANCELLED` | REC-003 |
 | FR-REC-004 error vs causa | **A** | `classify_returncode` (línea 193) devuelve `UNKNOWN` sin texto, pero **no** separa «error observado» de «causa inferida» en la estructura | REC-005 |
 | FR-REC-005 reintentable | **A** | `ReconnectPolicy` no sabe qué error es; `_bucle` reintenta igual un 401 que un corte de red (5 veces) | REC-004 |
 | FR-REC-006 backoff + jitter | **P** | `ReconnectPolicy.espera_para` (línea 150) tiene tabla y tope, **sin jitter** y sin `max_wait` explícito | REC-004 |

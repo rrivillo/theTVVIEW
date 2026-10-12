@@ -2696,6 +2696,12 @@ class NowPlayingScreen(Screen):
         if self.session is not None:
             self.session.launched()
             self._registrar_recursos()
+        # Fuente de evidencia de reproducción (FR-REC-001/002). Sólo se crea
+        # para mpv **con** canal de control abierto, que es el único caso en que
+        # hay algo que mirar. En los demás, la fuente dice `UNKNOWN` y la barra
+        # lo enseña: es preferible «sin comprobar» a un «reproduciendo» que no
+        # nadie ha comprobado.
+        self.evidencia = self._crear_evidencia(player_name, track_session)
         if relanzar is not None:
             try:
                 from thetvview.player.supervisor import (
@@ -2708,6 +2714,7 @@ class NowPlayingScreen(Screen):
                     policy=ReconnectPolicy(max_attempts=intentos_maximos),
                     session=self.session,
                     is_vigente=es_vigente,
+                    evidencia=self.evidencia,
                 )
                 self.supervisor.start(proc)
             except Exception:
@@ -2931,6 +2938,33 @@ class NowPlayingScreen(Screen):
                 pass
             self.pin_proxy = None
         self._remove_ipc_socket()
+
+    def _crear_evidencia(self, player_name: str, track_session) -> object:  # noqa: ANN001
+        """Fuente de señal de reproducción para este motor (FR-REC-002).
+
+        mpv es el único con canal de control, así que es el único del que se
+        puede sacar una respuesta real. Para los demás se devuelve
+        :class:`~thetvview.player.evidence.UnknownSignalSource`, que **siempre**
+        dice ``UNKNOWN``: un ``PROCESS_ALIVE`` ahí sería el éxito ficticio que
+        el requisito prohíbe.
+
+        Sin canal de control tampoco hay nada que mirar en mpv, y por eso
+        ``track_session`` se mira: sin sesión de pistas, `play_channel` no abre el
+        socket.
+        """
+        from thetvview.player.evidence import signal_source_for
+
+        ipc = None
+        if str(player_name or "").strip().lower() == "mpv" and track_session is not None:
+            ruta = getattr(track_session, "ipc_path", "") or ""
+            if ruta:
+                try:
+                    from thetvview.player.mpv_ipc import MpvIpc
+
+                    ipc = MpvIpc(ruta)
+                except Exception:
+                    ipc = None
+        return signal_source_for(player_name, ipc=ipc)
 
     def _registrar_recursos(self) -> None:
         """Da dueño a todo lo que esta pantalla abrió (FR-PLAY-007).
