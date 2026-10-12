@@ -17,12 +17,13 @@ pruebas se ejecutaron y qué limitaciones tiene lo entregado.
 
 | Comando | Resultado |
 |---|---|
-| `python -m unittest` | **2386 pruebas, OK** (1 omitida, registrada abajo) |
+| `python -m unittest` | **2390 pruebas, OK** (1 omitida, registrada abajo) |
 | `python -m thetvview.security.check` | **15/15 checks OK** |
 | `python -m tests.bench.medir` | Informe de rendimiento de los tres perfiles |
 
-La suite creció desde 2276 hasta 2386 pruebas: **+110**, todas nuevas de este
-trabajo, todas sobre código escrito en las fases 1 a 5.
+La suite creció desde 2276 hasta 2390 pruebas: **+114**, todas nuevas de este
+trabajo, todas sobre código escrito en las fases 1 a 5 (las 4 últimas son las
+que vigilan que la CI no vuelva, ver §6.1).
 
 ### 1.1 La omisión, registrada (TEST-005)
 
@@ -30,8 +31,8 @@ Hay **una** prueba omitida. No es una dependencia ausente callada: es una
 prueba que exige un reproductor externo real. Se omite con `skipTest` y su
 motivo queda en el propio test, que es lo que el SDD exige: *«no marcar como
 aprobada una prueba que se haya omitido por una dependencia ausente sin
-registrar la omisión»*. En CI no se instalan reproductores, y el job deja
-constancia de ello en un comentario del propio workflow.
+registrar la omisión»*. En un equipo sin reproductores instalados el resultado
+es el mismo, y el motivo queda a la vista en la propia salida de `unittest`.
 
 ---
 
@@ -306,26 +307,33 @@ porque ocurre en segundo plano y con cancelación cooperative.
 | TEST-001 pruebas por defecto | **cumple** | +101 pruebas, cada una sobre código escrito en las fases 1–5 |
 | TEST-002 determinismo | **cumple** | servidores locales, fixtures en memoria, sin Internet |
 | TEST-003 recursos | **cumple** | cierre verificado; pruebas de temporal abandonado y proceso externo |
-| **TEST-004 CI** | **cumple — no existía `.github/`** | `.github/workflows/ci.yml` |
+| **TEST-004 varios sistemas** | **parcial** | suite ejecutada a mano en Linux; el proyecto **no usa ningún servicio de CI en la nube** |
 | TEST-005 calidad de la suite | **cumple** | la única omisión está registrada con su motivo |
 
-### 6.1 CI en los tres sistemas
+### 6.1 Verificación sin servicios de CI
 
-```yaml
-os: [ubuntu-latest, macos-latest, windows-latest]
-python-version: ["3.13"]
+Este proyecto **no usa GitHub Actions ni ningún otro servicio de integración
+continua**: no hay `.github/workflows/`, y `tests/test_sin_ci.py` falla si ese
+directorio vuelve a aparecer.
+
+La consecuencia honesta es que la suite ya no se dispara sola. Se ejecuta a
+mano, en el sistema donde se esté desarrollando:
+
+```bash
+python -m unittest                          # 2390 pruebas
+python -m thetvview.security.check          # 15 checks
 ```
 
-La matriz es de tres sistemas **a propósito**, no por ceremonia: `os.replace`,
-el `fsync` de directorio y los permisos `0600` no se comportan igual en cada
-plataforma, y la escritura atómica es justamente la garantía que no se puede
-comprobar en un solo sistema. Con `fail-fast: false`, un fallo en uno no
-esconde el estado de los otros dos.
+Eso **rebaja** la cobertura por plataformas respecto a la que había antes:
+`os.replace`, el `fsync` de directorio y los permisos `0600` no se comprueban en
+macOS ni en Windows, y ya no hay nada que las compruebe automáticamente. Es una
+decisión consciente del proyecto, no un descuido, y por eso el punto queda
+abierto abajo en «Limitaciones de la verificación».
 
-`mypy` va en un **job aparte** y como `continue-on-error`. El proyecto tiene
-cero dependencias pip como restricción dura; instalar mypy en el job de la
-suite habría contradicho eso y, además, un error de tipos no debería bloquear
-la suite que sí importa.
+Se conserva la disciplina que hacía útil al job de `mypy`: el proyecto tiene
+cero dependencias pip como restricción dura, así que `mypy` (o `ruff`) se
+ejecuta aparte, en su propio entorno virtual, y **nunca** se añade a
+`requirements.txt`.
 
 ### 6.2 El check ejecutable con una tecla (`!`)
 
@@ -369,10 +377,10 @@ documentado en vez de esconder.
 
 ## 9. Limitaciones de la verificación
 
-- La verificación se ejecutó en **Linux**. El workflow de CI corre la suite en
-  los tres sistemas, pero **los resultados de macOS y Windows aún no están**
-  observados: eso requiere que se ejecute el workflow, y aquí no hay acceso a
-  esa infraestructura.
+- La verificación se ejecutó en **Linux**, a mano. Este proyecto no usa ningún
+  servicio de integración continua, así que **no existen resultados de macOS ni
+  de Windows**: quien lo use en esos sistemas debe ejecutar allí
+  `python -m unittest` y anotar el resultado.
 - No se ha probado con reproductores externos instalados. La única prueba
   omitida es la que los necesita, y su omisión está registrada.
 - Los números del bench son de esta máquina (LMDE 7, x86_64). Cumplen para
@@ -397,13 +405,13 @@ documentado en vez de esconder.
 ## 11. Cómo volver a verificarlo
 
 ```bash
-python -m unittest                          # 2386 pruebas
+python -m unittest                          # 2390 pruebas
 python -m thetvview.security.check          # 15 checks
 python -m tests.bench.medir                 # medición de rendimiento
 ```
 
-En CI, los tres se ejecutan automáticamente en Linux, macOS y Windows con
-Python 3.13.
+Los tres se ejecutan a mano, en el sistema donde se desarrolla. No hay ningún
+servicio que los dispare solo, y ése es el precio de no depender de ninguno.
 
 ---
 
@@ -415,8 +423,8 @@ Python 3.13.
 | P0.2 persistencia | cerrado | store atómico común, versionado, migraciones, recuperación sin pérdida silenciosa, candados, referencias |
 | P0.3 tareas | cerrado | gestor con generaciones y cancelación; los 7 hilos migrados; la UI deja de escribirse desde un hilo; cierre acotado |
 | P0.4 recursos | cerrado | política única de cachés con topes, medición reproducible |
-| P0.5 regresión | cerrado | CI en tres sistemas, suite separada, check de persistencia, este informe |
+| P0.5 regresión | cerrado | suite separada, check de persistencia, este informe |
 
-**Cerrado con evidencia ejecutable:** 2386 pruebas en verde, 15/15 checks de
+**Cerrado con evidencia ejecutable:** 2390 pruebas en verde, 15/15 checks de
 seguridad, y un bench que además encontró un error de medición y un tope de
 bytes mal puesto antes de poder servir para nada.

@@ -993,9 +993,18 @@ convertir la app en algo que no responde. Editables a mano:
 
 ## Tests
 
+Este proyecto **no usa ningún servicio de CI en la nube**. Nada de GitHub
+Actions ni de ningún otro: no hay workflows que se disparen solos, así que la
+suite se ejecuta **a mano, en el equipo donde estés**. Eso también significa
+que `macOS` y `Windows` no se comprueban solos: si usas esos sistemas,
+ejecuta los comandos de abajo allí también.
+
 ```bash
-# Suite completa (2276 tests, ~2 min)
+# Suite completa (2390 tests, ~2 min)
 python -m unittest -v
+
+# Comprobaciones de seguridad (15 checks; dentro de la TUI, tecla `!`)
+python -m thetvview.security.check
 
 # Solo tests de una parte
 python -m unittest tests.test_m3u_parser -v
@@ -1006,6 +1015,9 @@ python -m tests.ux_report            # tarjeta con barras de progreso
 python -m tests.ux_report --verbose  # con tracebacks
 ```
 
+Si alguna vez alguien deja un workflow en `.github/workflows/`, la propia suite
+lo detecta y falla: es `tests/test_sin_ci.py`.
+
 Cobertura mínima exigida por el proyecto: parser M3U (archivo y URL),
 parser XMLTV (incluye `.gz`), persistencia JSON de playlists, arranque
 multiplataforma (detección del SO + preflight de curses) y dominio
@@ -1015,7 +1027,8 @@ Especiales X, reproductores, layout, tema, recorridos UX completos,
 selección de pistas (modelo, parsers HLS/DASH, sondeo, política de
 selección, preferencias, argv, IPC y proxy de calidad) y el multi-stream
 (transporte, detector, router, errores, cámara IP, supervisor, diagnóstico,
-preferencias e integración).
+preferencias e integración). Una parte comprueba, además, que la CI no
+regrese: `tests/test_sin_ci.py`.
 
 La cabecera tiene su propia suite, `tests/test_header_consistente.py`, que
 además de comprobar el contexto de cada pantalla verifica dos cosas que son
