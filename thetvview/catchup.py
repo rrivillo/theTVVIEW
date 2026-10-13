@@ -52,6 +52,7 @@ __all__ = [
     "CatchupError",
     "CatchupNotAvailableError",
     "CatchupOutsideArchiveWindowError",
+    "CatchupInvalidIntervalError",
     "CatchupRequest",
     "PlaybackRequest",
     "CatchupAdapter",
@@ -60,6 +61,8 @@ __all__ = [
     "GenericCatchupAdapter",
     "CatchupRef",
     "TS_PREFIX",
+    "MAX_REQUEST_SECONDS",
+    "MAX_REQUEST_SECONDS_DOC",
     "from_xtream_stream",
     "from_m3u_attrs",
     "capability_for",
@@ -75,6 +78,9 @@ __all__ = [
     "render_source_template",
     "template_values",
     "playback_channel",
+    "validar_intervalo",
+    "MAX_TEMPLATE_LENGTH",
+    "MAX_TEMPLATE_VALUE_LENGTH",
 ]
 
 
@@ -101,6 +107,45 @@ _CATCHUP_DISABLED_VALUES: frozenset[str] = frozenset(
 #: declarado en el plan §6.4).
 _TEMPLATE_PLACEHOLDERS: tuple[str, ...] = ("start", "end", "duration", "utc")
 
+#: Tope de longitud de la plantilla ``catchup-source`` declarada, en
+#: caracteres. Es texto de un tercero y entra en una URL: 2 000 es de sobra para
+#: cualquier plantilla real (las publicadas rondan los 100) y corta de raíz el
+#: abuso de pegar megabytes de query en un ``#EXTINF``.
+MAX_TEMPLATE_LENGTH: int = 2000
+
+#: Tope de longitud de **cada** valor renderizado, en caracteres. Los valores
+#: que producimos son un epoch (10 dígitos) o un sello de 19; 64 deja margen de
+#: sobra y sigue impidiendo que un dato enorme acabe en la query.
+MAX_TEMPLATE_VALUE_LENGTH: int = 64
+
+#: Caracteres que un marcador renderizado **jamás** debe poder emitir. No están
+#: ahí hoy porque todos los valores son numéricos o un sello, pero son la
+#: razón por la que la comprobación existe: si mañana alguien añade un marcador
+#: con texto, esta lista lo frena.
+_RESERVED_IN_VALUE: frozenset[str] = frozenset("&#\r\n\t \"'<>\\")
+
+#: Caracteres de control que pueden aparecer en una plantilla y romper la
+#: cabecera de una petición HTTP si la URL acaba en una cabecera.
+_CONTROL_IN_TEMPLATE: frozenset[str] = frozenset("\r\n\t\x00")
+
+#: Tope propio de duración para **una** petición histórica, en segundos.
+#:
+#: El estándar de los reproductores IPTV no define un máximo por petición y
+#: los paneles no lo publican: cada uno impone el suyo y no hay forma de
+#: consultarlo sin red. Inventar un límite interno sin dato sería la suposición
+#: que el SDD prohíbe, pero dejar la duración sin tope permite que un dato
+#: corrupto (un EPG con `stop` en el año 3000) genere una petición absurda.
+#:
+#: Por eso el tope es **nuestro y declarado**: 12 horas, que cubre de sobra un
+#: programa largo o una mirarada de tarde, y corta cualquier cosa que no sea
+#: una entrada de guía. Está justificado en ``docs/sdd/catchup-temporal.md`` §5.3.
+MAX_REQUEST_SECONDS: int = 12 * 3600
+
+#: Dónde se justifica el tope. Va en el propio módulo para que el número y su
+#: razónviajen juntos: si algún día cambia el valor, el docstring obliga a
+#: actualizar la referencia.
+MAX_REQUEST_SECONDS_DOC: str = "docs/sdd/catchup-temporal.md"
+
 
 # ---------------------------------------------------------------------------
 # Errores
@@ -117,6 +162,17 @@ class CatchupNotAvailableError(CatchupError):
 
 class CatchupOutsideArchiveWindowError(CatchupError):
     """§13: el programa ya no está dentro de la ventana declarada."""
+
+
+class CatchupInvalidIntervalError(CatchupError):
+    """CU-02: el intervalo pedido no tiene sentido y se rechaza.
+
+    Nace en la Fase 1 para separar un problema **nuestro** (el intervalo es
+    imposible o excesivo) de un problema **del proveedor** (fuera de ventana,
+    sin archivo declarado). Antes no existía porque el intervalo inválido se
+    normalizaba en silencio a un segundo: un error que está en el dato de
+    entrada no se convertía en ningún mensaje.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -170,14 +226,20 @@ class CatchupState(Enum):
     """Estados de catch-up (§12).
 
     ``LOADING``, ``PLAYING`` y ``ERROR`` son estados de la sesión de
-    reproducción y los posee la UI; :func:`classify` sólo devuelve los tres
-    estables, que dependen únicamente de lo que declaró el proveedor.
+    reproducción y los posee la UI; :func:`classify` sólo devuelve los cuatro
+    estables, que dependen únicamente de lo que declaró el proveedor y de si el
+    intervalo pedido tiene sentido.
     """
 
     DISABLED_BY_PROVIDER = "disabled_by_provider"
     ENABLED = "enabled"
     OUTSIDE_ARCHIVE_WINDOW = "outside_archive_window"
     AVAILABLE = "available"
+    #: CU-02: el intervalo pedido es imposible o excesivo. Es un problema del
+    #: dato de la guía, no del proveedor: se distingue de
+    #: ``OUTSIDE_ARCHIVE_WINDOW`` porque la reacción es otra (informar del dato,
+    #: no esperar a que vuelva la copia).
+    INVALID_INTERVAL = "invalid_interval"
     LOADING = "loading"
     PLAYING = "playing"
     ERROR = "error"
@@ -413,9 +475,19 @@ def classify_request(
 
     Existe para que la validación de §10 use **el mismo** criterio que la
     de la guía: si aquí sale ``AVAILABLE``, allí también.
+
+    **Nunca lanza por datos**: es una consulta, y una consulta que lanza deja al
+    llamante sin estado que mostrar. Un intervalo imposible devuelve
+    :attr:`CatchupState.INVALID_INTERVAL` (CU-02), que es «este dato no sirve»
+    y no «el proveedor no lo tiene».
+
+    Para construir la URL hay que pasar por :func:`validar_intervalo`, que sí
+    lanza con el motivo apto para modal.
     """
     if not can_use_catchup(capability):
         return CatchupState.DISABLED_BY_PROVIDER
+    if not request.intervalo_valido():
+        return CatchupState.INVALID_INTERVAL
     if is_within_archive_window(request.to_program(), capability, now):
         return CatchupState.AVAILABLE
     return CatchupState.OUTSIDE_ARCHIVE_WINDOW
@@ -444,6 +516,12 @@ def describe_state(
             else "No hay ventana de archivo declarada."
         )
         return f"Este contenido ya no está disponible en el archivo. {ventana}"
+    if state is CatchupState.INVALID_INTERVAL:
+        return (
+            "El horario de este programa no sirve para pedir el archivo: la "
+            "guía dice que termina antes de empezar, o dura demasiado. Es un "
+            "dato de la guía, no un problema del proveedor."
+        )
     if state is CatchupState.ERROR:
         return (
             "El proveedor ofrece archivo y la petición se construyó, pero la "
@@ -482,9 +560,30 @@ class CatchupRequest:
 
     @property
     def duration_seconds(self) -> int:
-        """Duración solicitada en segundos (mínimo 1)."""
+        """Duración solicitada en segundos (mínimo 1).
+
+        **No lanza, aunque el intervalo sea imposible** (``end`` anterior a
+        ``start``): este valor es diagnóstico y alimenta el texto del modal y
+        el informe. Lo que impide construir una URL es
+        :func:`validar_intervalo`, que se llama en :func:`build_playback_request`.
+
+        El mínimo de 1 s se conserva por compatibilidad de la referencia opaca
+        (``CatchupRef.parse`` usa el mismo mínimo al leer). Lo que ya **no**
+        ocurre es que ese mínimo decida el resultado por sí solo.
+        """
         delta = (_aware(self.end) - _aware(self.start)).total_seconds()
         return max(1, int(round(delta)))
+
+    def intervalo_valido(self) -> bool:
+        """True si el intervalo tiene sentido: ``end`` posterior a ``start``.
+
+        Comprobación pura, sin topes: responde sólo a la pregunta mínima
+        "¿está esto al revés?". El resto de las reglas vive en
+        :func:`validar_intervalo`.
+        """
+        if self.start is None or self.end is None:
+            return False
+        return _aware(self.end) > _aware(self.start)
 
     def to_program(self) -> "Program":
         """El intervalo de la petición, como si fuera un programa EPG.
@@ -722,6 +821,11 @@ def build_playback_request(
             "no se genera ninguna petición histórica."
         )
     moment = _aware(now) if now is not None else _aware(datetime.now())
+    # CU-02: el intervalo se comprueba **antes** de la ventana. Un intervalo
+    # imposible es un problema nuestro y no del proveedor: si se comprobara
+    # después, un intervalo invertido dentro de la ventana se clasificaría
+    # AVAILABLE y llegaría al reproductor.
+    validar_intervalo(request)
     if not is_within_archive_window(request.to_program(), capability, moment):
         raise CatchupOutsideArchiveWindowError(
             describe_state(CatchupState.OUTSIDE_ARCHIVE_WINDOW, capability)
@@ -747,24 +851,58 @@ def template_values(request: CatchupRequest) -> dict[str, object]:
     ``{start}``    epoch UTC, segundos (admite seek)
     ``{end}``      epoch UTC, segundos
     ``{duration}`` duración pedida, en segundos
-    ``{utc}``      sello ``YYYY-MM-DD:HH-MM-SS`` en hora local
+    ``{utc}``      sello ``YYYY-MM-DD:HH-MM-SS`` del instante en **UTC**
     ============== ==================================================
 
     Se calculan aquí, no se interpolan desde fuera: un valor crudo del
     proveedor no llega nunca al texto de la URL. Y todos son seguros en una
     query: nada de espacios ni de caracteres que la política de URL
     (``validate_url(purpose="stream")``) pueda rechazar.
+
+    ``{utc}`` es **UTC** y no hora local (CU-03). Antes se hacía
+    ``start.astimezone()``, que deshacía la conversión a UTC y devolvía la hora
+    del proceso: en un equipo en Madrid el proveedor recibía una hora de más y
+    devolvía otro momento del día. El nombre del marcador no es una convención
+    de este proyecto: es el del estándar de los reproductores IPTV, donde
+    ``{utc}``, ``{Y}``, ``{m}``, ``{d}``, ``{H}``, ``{M}`` y ``{S}`` son todos
+    UTC. Ver ``docs/sdd/catchup-temporal.md`` §3.
     """
-    start = _aware(request.start).astimezone(timezone.utc)
-    end = _aware(request.end).astimezone(timezone.utc)
+    inicio_utc = _aware(request.start).astimezone(timezone.utc)
     return {
         "start": _aware_seconds(request.start),
         "end": _aware_seconds(request.end),
         "duration": request.duration_seconds,
         # Mismo formato de facto que usan los paneles Xtream Codes para
         # timeshift.php; sin espacios, para que la query siga siendo válida.
-        "utc": start.astimezone().strftime("%Y-%m-%d:%H-%M-%S"),
+        "utc": inicio_utc.strftime("%Y-%m-%d:%H-%M-%S"),
     }
+
+
+def _validar_valor_renderizado(nombre: str, valor: object) -> str:
+    """Comprueba que un valor renderizado sea apto para una query.
+
+    Es una defensa en profundidad: hoy los valores son un epoch o un sello, y
+    ninguno de los dos tiene nada sospechoso. La comprobación existe para que
+    **añadir un marcador con texto** en el futuro no introduzca una inyección
+    de parámetros ni un salto de línea en la URL.
+
+    Raises:
+        CatchupError: el valor es demasiado largo o trae un carácter prohibido.
+    """
+    texto = str(valor)
+    if len(texto) > MAX_TEMPLATE_VALUE_LENGTH:
+        raise CatchupError(
+            f"El valor del marcador «{{{nombre}}}» es demasiado largo para "
+            f"una dirección ({len(texto)} caracteres); no se intenta construir "
+            "la petición."
+        )
+    malo = _RESERVED_IN_VALUE.intersection(texto)
+    if malo:
+        raise CatchupError(
+            f"El valor del marcador «{{{nombre}}}» trae caracteres que no son "
+            "válidos en una dirección; no se intenta construir la petición."
+        )
+    return texto
 
 
 def render_source_template(template: str, request: CatchupRequest) -> str:
@@ -782,6 +920,17 @@ def render_source_template(template: str, request: CatchupRequest) -> str:
         raise CatchupError(
             "El proveedor declaró una plantilla de archivo vacía; "
             "no se puede construir la petición."
+        )
+    if len(template) > MAX_TEMPLATE_LENGTH:
+        raise CatchupError(
+            "La plantilla de archivo del proveedor es demasiado larga "
+            f"({len(template)} caracteres) para ser una dirección de archivo; "
+            "no se intenta construir la petición."
+        )
+    if _CONTROL_IN_TEMPLATE.intersection(template):
+        raise CatchupError(
+            "La plantilla de archivo del proveedor trae saltos de línea o "
+            "caracteres de control; no se intenta construir la dirección."
         )
     values = template_values(request)
     chunks: list[str] = []
@@ -810,13 +959,99 @@ def render_source_template(template: str, request: CatchupRequest) -> str:
                 "la sintaxis del proveedor."
             )
         used.add(field_name)
-        chunks.append(str(values[field_name]))
+        chunks.append(_validar_valor_renderizado(field_name, values[field_name]))
     if not used:
         raise CatchupError(
             "La plantilla de archivo del proveedor no indica dónde colocar el "
             "instante; no se intenta construir la dirección."
         )
-    return "".join(chunks)
+    return CatchupAdapter._validate_playable("".join(chunks))
+
+
+# ---------------------------------------------------------------------------
+# Validación del intervalo (CU-02)
+# ---------------------------------------------------------------------------
+
+
+def validar_intervalo(
+    request: "CatchupRequest",
+    *,
+    maximo: int = MAX_REQUEST_SECONDS,
+) -> None:
+    """Valida el intervalo pedido **antes** de construir nada (CU-02).
+
+    Es el orden que exige el SDD §10: primero se comprueba que la petición tiene
+    sentido, después se decide si el proveedor la sirve. Antes de la Fase 1 esa
+    comprobación no existía y el intervalo imposible se normalizaba a un
+    segundo en silencio (``max(1, …)``): una petición invertida llegaba al
+    reproductor como si fuera válida.
+
+    Los cuatro motivos se distinguen porque el usuario reacciona distinto a
+    cada uno:
+
+    1. **Falta un extremo del intervalo** — no hay nada que pedir.
+    2. **El fin es igual al inicio** — intervalo de duración cero.
+    3. **El fin es anterior al inicio** — intervalo invertido.
+    4. **La duración supera el tope** — el dato es disparatado o la petición,
+       demasiado larga.
+
+    Un programa que cruza medianoche **no** es un caso especial: es un
+    intervalo válido con fin posterior al inicio.
+
+    Args:
+        request: la petición a comprobar.
+        maximo: duración máxima admitida en segundos.
+
+    Raises:
+        CatchupInvalidIntervalError: el intervalo no sirve, o ``maximo`` no es
+            un entero positivo. Los dos son fallos controlados con motivo.
+    """
+    try:
+        tope = int(maximo)
+    except (TypeError, ValueError) as exc:
+        raise CatchupInvalidIntervalError(
+            f"El tope de duración tiene que ser un entero en segundos, no {maximo!r}."
+        ) from exc
+    if tope <= 0:
+        raise CatchupInvalidIntervalError(
+            f"El tope de duración tiene que ser mayor que cero, no {tope}."
+        )
+
+    inicio = getattr(request, "start", None)
+    fin = getattr(request, "end", None)
+    if not isinstance(inicio, datetime) or not isinstance(fin, datetime):
+        raise CatchupInvalidIntervalError(
+            "No se sabe qué intervalo pedir: a este programa le falta la hora "
+            "de inicio o la de fin en la guía, así que no se intenta reproducir "
+            "el archivo."
+        )
+
+    if _aware(fin) > _aware(inicio):
+        delta = (_aware(fin) - _aware(inicio)).total_seconds()
+    elif _aware(fin) == _aware(inicio):
+        raise CatchupInvalidIntervalError(
+            "Este programa empieza y termina a la misma hora, así que no hay "
+            "nada que reproducir del archivo."
+        )
+    else:
+        raise CatchupInvalidIntervalError(
+            "Este programa termina antes de empezar. No es un problema del "
+            "proveedor: es un dato de la guía, así que no se intenta reproducir "
+            "el archivo."
+        )
+
+    if delta > tope:
+        pedidas = delta / 3600
+        if tope % 3600 == 0 and tope / 3600 == 1:
+            maximo_texto = "1 hora"
+        elif tope % 3600 == 0:
+            maximo_texto = f"{tope // 3600} horas"
+        else:
+            maximo_texto = f"{tope / 3600:.1f} horas"
+        raise CatchupInvalidIntervalError(
+            f"Esta grabación dura {pedidas:.1f} horas y el máximo por intento es "
+            f"{maximo_texto}. Reproduce sólo la parte del programa que te interese."
+        )
 
 
 # ---------------------------------------------------------------------------

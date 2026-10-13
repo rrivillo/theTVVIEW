@@ -596,13 +596,25 @@ class TestAdaptadores(unittest.TestCase):
         self.assertEqual(valores["start"], int(inicio.timestamp()))
         self.assertEqual(valores["end"], int(NOW.timestamp()))
         self.assertEqual(valores["duration"], 3 * 3600)
-        self.assertEqual(valores["utc"],
-                         inicio.astimezone().strftime("%Y-%m-%d:%H-%M-%S"))
+        # `{utc}` es el instante en UTC (CU-03), no la hora local del proceso.
+        # Antes esta línea comparaba contra `astimezone()` — la hora local — y
+        # por eso pasaba con el valor equivocado.
+        self.assertEqual(
+            valores["utc"],
+            inicio.astimezone(timezone.utc).strftime("%Y-%m-%d:%H-%M-%S"),
+        )
         self.assertNotIn(" ", str(valores["utc"]))  # válido en una query
         self.assertEqual(set(valores), {"start", "end", "duration", "utc"})
 
     def test_se_valida_antes_de_construir_nunca_al_reves(self) -> None:
-        """§10 / §20.9: si la validación falla, no sale ninguna URL."""
+        """§10 / §20.9: si la validación falla, no sale ninguna URL.
+
+        Los tres rechazos que se comprueban aquí son los del contrato: sin
+        declaración del proveedor, intervalo imposible y fuera de la ventana.
+        El intervalo de la ventana se mantiene corto a propósito (CU-02): si
+        durara más que ``MAX_REQUEST_SECONDS``, lo rechazaría el tope y la
+        prueba dejaría de comprobar lo que dice comprobar.
+        """
         canal = m3u_channel(catchup="append", catchup_days="7",
                             catchup_source="http://p/ts/{start}")
         cap = capability_for(canal)
@@ -611,11 +623,21 @@ class TestAdaptadores(unittest.TestCase):
             with self.assertRaises(CatchupNotAvailableError):
                 catchup.build_playback_request(canal, DISABLED,
                                                CatchupRequest("1", NOW, NOW), now=NOW)
+            with self.assertRaises(catchup.CatchupInvalidIntervalError):
+                # Invertido a propósito: el fin es anterior al inicio (CU-02).
+                catchup.build_playback_request(
+                    canal, cap,
+                    CatchupRequest("1", NOW - timedelta(hours=1),
+                                   NOW - timedelta(hours=2)),
+                    now=NOW,
+                )
             with self.assertRaises(CatchupOutsideArchiveWindowError):
+                # Intervalo sano de 2 h, pero de hace 30 días: la ventana de
+                # este canal es de 7 días (catchup-days="7").
                 catchup.build_playback_request(
                     canal, cap,
                     CatchupRequest("1", NOW - timedelta(days=30),
-                                   NOW - timedelta(days=29)),
+                                   NOW - timedelta(days=30) + timedelta(hours=2)),
                     now=NOW,
                 )
             build.assert_not_called()

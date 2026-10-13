@@ -37,6 +37,7 @@ from thetvview.catchup import (
     classify_request,
     is_within_archive_window,
     render_source_template,
+    validar_intervalo,
 )
 from thetvview.models import Channel
 
@@ -76,58 +77,76 @@ def req(inicio: datetime, fin: datetime) -> CatchupRequest:
 
 
 # ---------------------------------------------------------------------------
-# 1. Intervalos: el fallo silencioso que la Fase 1 cierra
+# 1. Intervalos: el fallo silencioso que CU-02 cerró
+#
+# Estas pruebas congelaban el defecto **antes** de la Fase 1: el intervalo
+# invertido se normalizaba a 1 s, se clasificaba AVAILABLE y construía la URL.
+# Siguen aquí como prueba de regresión del estado **nuevo**, con el antes
+# anotado en cada caso. El criterio de aceptación de CU-02 vive en
+# ``tests/test_catchup_intervalos.py``.
 # ---------------------------------------------------------------------------
 
 
 class TestIntervaloInvertido(unittest.TestCase):
-    """Fin anterior al inicio: hoy se normaliza a 1 s sin avisar."""
+    """Fin anterior al inicio: se rechaza con motivo (antes: 1 s en silencio)."""
 
     def setUp(self) -> None:
         self.invertida = req(NOW - timedelta(hours=3), NOW - timedelta(hours=4))
 
-    def test_la_duracion_se_normaliza_a_un_segundo(self):
+    def test_la_duracion_sigue_siendo_calculable(self):
+        """Diagnóstico: el valor se lee (mínimo 1 s) para el modal y el informe.
+
+        Antes de CU-02 esto era también lo que se **enviaba** al proveedor.
+        """
         self.assertEqual(self.invertida.duration_seconds, 1)
 
-    def test_se_considera_dentro_de_la_ventana(self):
+    def test_se_rechaza_en_lugar_de_normalizar(self):
+        with self.assertRaises(CatchupError) as ctx:
+            validar_intervalo(self.invertida)
+        self.assertIn("antes de empezar", str(ctx.exception))
+
+    def test_no_se_considera_dentro_de_la_ventana(self):
+        """Antes devolvía AVAILABLE. Ahora es un estado propio."""
         cap = cap_m3u()
-        self.assertTrue(is_within_archive_window(self.invertida.to_program(), cap, NOW))
-        self.assertIs(classify_request(cap, self.invertida, NOW), CatchupState.AVAILABLE)
-
-    def test_se_construye_la_url_sin_error(self):
-        canal = canal_m3u()
-        pedido = build_playback_request(
-            canal, capability_for(canal), self.invertida, now=NOW
-        )
-        self.assertEqual(pedido.duration, 1)
-        # El proveedor recibe un intervalo de 1 s que el usuario nunca pidió.
-        self.assertIn("duration=1", pedido.url)
-        self.assertIn(f"start={int(self.invertida.start.timestamp())}", pedido.url)
-
-    def test_inicio_igual_a_fin_tambien_se_normaliza(self):
-        igual = req(NOW - timedelta(hours=1), NOW - timedelta(hours=1))
-        self.assertEqual(igual.duration_seconds, 1)
         self.assertIs(
-            classify_request(cap_m3u(), igual, NOW), CatchupState.AVAILABLE
+            classify_request(cap, self.invertida, NOW), CatchupState.INVALID_INTERVAL
         )
 
-    def test_la_redaccion_no_tapa_el_intervalo_invertido(self):
-        """No hay ningún camino que rechace el intervalo: `describe_state` sólo
-        habla de ventana, y un intervalo invertido **sí** está en la ventana."""
+    def test_no_se_construye_la_url(self):
+        """Antes sí se construía (`duration=1`)."""
+        canal = canal_m3u()
+        with self.assertRaises(CatchupError):
+            build_playback_request(
+                canal, capability_for(canal), self.invertida, now=NOW
+            )
+
+    def test_inicio_igual_a_fin_tambien_se_rechaza(self):
+        igual = req(NOW - timedelta(hours=1), NOW - timedelta(hours=1))
+        with self.assertRaises(CatchupError) as ctx:
+            validar_intervalo(igual)
+        self.assertIn("misma hora", str(ctx.exception))
+        self.assertIs(
+            classify_request(cap_m3u(), igual, NOW), CatchupState.INVALID_INTERVAL
+        )
+
+    def test_la_redaccion_ya_explica_el_motivo(self):
+        """Antes `describe_state` decía «sin cambios». Ahora hay estado nuevo."""
         cap = cap_m3u()
         estado = classify_request(cap, self.invertida, NOW)
-        self.assertIs(estado, CatchupState.AVAILABLE)
-        self.assertEqual(
-            catchup.describe_state(estado, cap),
-            "Estado de archivo del proveedor sin cambios.",
-        )
+        self.assertIsNot(estado, CatchupState.AVAILABLE)
+        self.assertIn("guía", catchup.describe_state(estado, cap))
 
-    def test_no_hay_duracion_maxima_por_ningun_lado(self):
-        """Congelado: una petición de 400 días se acepta si la ventana alcanza."""
+    def test_la_duracion_excesiva_tiene_tope(self):
+        """Antes 400 días se aceptaban si la ventana alcanzaba."""
         enorme = req(NOW - timedelta(days=400), NOW)
         cap = cap_m3u(archive_duration_seconds=500 * DIA)
         self.assertEqual(enorme.duration_seconds, 400 * DIA)
-        self.assertIs(classify_request(cap, enorme, NOW), CatchupState.AVAILABLE)
+        with self.assertRaises(CatchupError):
+            validar_intervalo(enorme)
+        with self.assertRaises(CatchupError):
+            build_playback_request(
+                canal_m3u(), capability_for(canal_m3u()), enorme, now=NOW
+            )
 
 
 # ---------------------------------------------------------------------------
