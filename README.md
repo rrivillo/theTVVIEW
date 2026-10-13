@@ -47,6 +47,14 @@ ver y con qué reproductor.
 - Éste proyecto recibió asistencia de OpenCode, en su plan free. No lo hizo
   completo, pero sí ayudó. Sé que harías un mejor trabajo sin IA, así que,
   sé educado.
+- En específico, el proyecto partió en un primer lugar con una codificación
+  bien rudimentaria, hecha por mi. Luego, usé OpenCode para solucionar
+  puntos que escapan de mi experiencia programadora (por ejemplo: comandos
+  personalizados para reproductores, etc). A partir de Septiembre de 2026,
+  los detalles finos se han ido puliendo en base a la metodología de trabajo
+  por Spec-Driven Development (SDD). Esos documentos no serán subidos
+  al reprositorio Git del proyecto, ya que considero que aumentan el tamaño
+  del proyecto, sin una justificación que lo sostenga.  
 
 ---
 
