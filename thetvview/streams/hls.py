@@ -40,6 +40,8 @@ from ..tracks.models import (
     subtitle_id,
     video_id,
 )
+from . import manifest_limits
+from .manifest_limits import DEFAULT_MANIFEST_LIMITS, ManifestLimits
 
 __all__ = [
     "HlsParseError",
@@ -54,6 +56,39 @@ __all__ = [
 
 class HlsParseError(ValueError):
     """El texto no es un manifiesto HLS legible (mensaje apto para modal)."""
+
+
+# ---------------------------------------------------------------------------
+# Límites del análisis (FR-STREAM-004)
+# ---------------------------------------------------------------------------
+
+#: Cada cuántas líneas se mira el reloj dentro de :func:`_scan`: suficiente
+#: para cortar un análisis lento sin llamar a ``monotonic`` en cada línea.
+_CHEQUEO_TIEMPO_CADA = 4096
+
+
+def _comprobar_tamano(text: str, limits: ManifestLimits) -> None:
+    """El texto cabe en ``max_bytes`` (caracteres primero, bytes después)."""
+    if len(text) > limits.max_bytes or len(text.encode("utf-8")) > limits.max_bytes:
+        raise HlsParseError(
+            f"El manifiesto HLS supera el límite de {limits.max_bytes} bytes."
+        )
+
+
+def _comprobar_referencias(total: int, limits: ManifestLimits) -> None:
+    """No se acumulan más de ``max_refs`` referencias."""
+    if total > limits.max_refs:
+        raise HlsParseError(
+            f"El manifiesto HLS declara más de {limits.max_refs} referencias."
+        )
+
+
+def _comprobar_tiempo(inicio: float, limits: ManifestLimits) -> None:
+    """El análisis no se ha pasado de ``max_seconds`` (reloj monótono)."""
+    if limits.max_seconds > 0 and manifest_limits.ahora() - inicio > limits.max_seconds:
+        raise HlsParseError(
+            f"El análisis del manifiesto HLS lleva más de {limits.max_seconds:g} s."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +329,7 @@ def parse_master_playlist(
     *,
     final_url: str = "",
     live: bool = True,
+    limits: ManifestLimits | None = None,
 ) -> MediaCapabilities:
     """Interpreta un master playlist HLS.
 
@@ -303,14 +339,19 @@ def parse_master_playlist(
             resuelven las URI relativas.
         live: si el directo está en marcha (por defecto sí: en IPTV casi
             siempre lo está; un master con ``EXT-X-ENDLIST`` es VOD).
+        limits: límites de tamaño/referencias/tiempo (FR-STREAM-004);
+            por defecto :data:`manifest_limits.DEFAULT_MANIFEST_LIMITS`.
 
     Returns:
         MediaCapabilities con ``adaptive_bitrate`` a True **sólo** si hay
         dos o más variantes (SDD §14/§15).
 
     Raises:
-        HlsParseError: si no hay ni ``#EXTM3U`` ni ninguna variante.
+        HlsParseError: si no hay ni ``#EXTM3U`` ni ninguna variante, o si
+            el manifiesto excede los límites (FR-STREAM-004).
     """
+    efectivos = limits or DEFAULT_MANIFEST_LIMITS
+    _comprobar_tamano(text, efectivos)
     if not text or not text.strip():
         raise HlsParseError("El manifiesto está vacío.")
     lines = _lines(text)
@@ -319,7 +360,7 @@ def parse_master_playlist(
             "El archivo no es una lista HLS: falta la cabecera #EXTM3U."
         )
 
-    media_entries, variants = _scan(lines)
+    media_entries, variants = _scan(lines, efectivos)
     if not variants and not media_entries:
         raise HlsParseError(
             "El manifiesto HLS no declara ninguna pista ni variante."
@@ -342,12 +383,19 @@ def parse_media_playlist(
     *,
     final_url: str = "",
     live: bool = True,
+    limits: ManifestLimits | None = None,
 ) -> MediaCapabilities:
     """Interpreta un media playlist (una sola pista, sin alternativas).
 
     Un media playlist **no** ofrece opciones: por diseño devuelve una
     variante y un audio, y el modelo no muestra ningún selector (SDD §32).
+
+    Los límites del FR-STREAM-004 también cubren aquí el caso extremo de
+    un media playlist con decenas de miles de ``EXTINF``: se cuentan
+    mientras se miran y se corta al ``max_refs``.
     """
+    efectivos = limits or DEFAULT_MANIFEST_LIMITS
+    _comprobar_tamano(text, efectivos)
     if not text or not text.strip():
         raise HlsParseError("El manifiesto está vacío.")
     lines = _lines(text)
@@ -356,13 +404,20 @@ def parse_media_playlist(
             "El archivo no es una lista HLS: falta la cabecera #EXTM3U."
         )
     has_endlist = any(line.startswith("#EXT-X-ENDLIST") for line in lines)
-    has_inf = any(line.startswith("#EXTINF") for line in lines)
+    segmentos = 0
+    for line in lines:
+        if line.startswith("#EXTINF"):
+            segmentos += 1
+            _comprobar_referencias(segmentos, efectivos)
+    has_inf = segmentos > 0
     if not has_inf and not any(line.startswith("#EXT-X-STREAM-INF") for line in lines):
         raise HlsParseError(
             "El manifiesto HLS no declara segmentos (falta #EXTINF)."
         )
     if any(line.startswith("#EXT-X-STREAM-INF") for line in lines):
-        return parse_master_playlist(text, final_url=final_url, live=live)
+        return parse_master_playlist(
+            text, final_url=final_url, live=live, limits=efectivos
+        )
 
     duration = _target_duration(lines)
     return MediaCapabilities(
@@ -396,11 +451,21 @@ def parse_hls(
     *,
     final_url: str = "",
     live: bool = True,
+    limits: ManifestLimits | None = None,
 ) -> MediaCapabilities:
-    """Detecta master vs media playlist y devuelve las capacidades."""
+    """Detecta master vs media playlist y devuelve las capacidades.
+
+    El límite de tamaño se comprueba **antes** de mirar nada, para que ni
+    siquiera la detección de master/media recorra un texto gigante
+    (FR-STREAM-004).
+    """
+    efectivos = limits or DEFAULT_MANIFEST_LIMITS
+    _comprobar_tamano(text, efectivos)
     if is_master_playlist(text):
-        return parse_master_playlist(text, final_url=final_url, live=live)
-    return parse_media_playlist(text, final_url=final_url, live=live)
+        return parse_master_playlist(
+            text, final_url=final_url, live=live, limits=efectivos
+        )
+    return parse_media_playlist(text, final_url=final_url, live=live, limits=efectivos)
 
 
 # ---------------------------------------------------------------------------
@@ -408,12 +473,20 @@ def parse_hls(
 # ---------------------------------------------------------------------------
 
 
-def _scan(lines: list[str]) -> tuple[list[_Media], list[_Variant]]:
+def _scan(
+    lines: list[str], limits: ManifestLimits
+) -> tuple[list[_Media], list[_Variant]]:
     media_entries: list[_Media] = []
     variants: list[_Variant] = []
     pending: dict[str, str] | None = None
+    inicio = manifest_limits.ahora()
+    desde_ultima_mirada = 0
 
     for line in lines:
+        desde_ultima_mirada += 1
+        if desde_ultima_mirada >= _CHEQUEO_TIEMPO_CADA:
+            desde_ultima_mirada = 0
+            _comprobar_tiempo(inicio, limits)
         line = line.strip()
         if not line:
             continue
@@ -422,6 +495,7 @@ def _scan(lines: list[str]) -> tuple[list[_Media], list[_Variant]]:
             entry = _media_from(attrs)
             if entry is not None:
                 media_entries.append(entry)
+                _comprobar_referencias(len(media_entries) + len(variants), limits)
             continue
         if line.startswith("#EXT-X-STREAM-INF:"):
             pending = parse_attribute_list(line[len("#EXT-X-STREAM-INF:"):])
@@ -430,7 +504,9 @@ def _scan(lines: list[str]) -> tuple[list[_Media], list[_Variant]]:
             continue
         if pending is not None:
             variants.append(_variant_from(pending, line))
+            _comprobar_referencias(len(media_entries) + len(variants), limits)
             pending = None
+    _comprobar_tiempo(inicio, limits)
     return media_entries, variants
 
 

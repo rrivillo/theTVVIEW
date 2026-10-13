@@ -38,14 +38,43 @@ from ..tracks.models import (
     subtitle_id,
     video_id,
 )
+from . import manifest_limits
+from .manifest_limits import ManifestLimitError
 
-__all__ = ["parse_dash", "DASH_MAX_BYTES", "DASH_MAX_DEPTH", "DASH_MAX_NODES"]
+__all__ = [
+    "parse_dash",
+    "DASH_MAX_BYTES",
+    "DASH_MAX_DEPTH",
+    "DASH_MAX_NODES",
+    "DASH_MAX_REFS",
+    "DASH_MAX_SECONDS",
+]
 
 #: Topes propios del MPD: es más grande que un manifiesto HLS, pero sigue
 #: siendo un fichero de texto. Si lo excede, es un MPD hostil o gigante.
 DASH_MAX_BYTES: int = 8 * 1024 * 1024
 DASH_MAX_DEPTH: int = 64
 DASH_MAX_NODES: int = 200_000
+#: Cantidad máxima de referencias (BaseURL, Representation, Segment*) y
+#: presupuesto de tiempo del análisis (FR-STREAM-004; los cuatro números
+#: viven documentados en :mod:`thetvview.streams.manifest_limits`).
+DASH_MAX_REFS: int = 10_000
+DASH_MAX_SECONDS: float = 5.0
+
+#: Elementos que cuentan como «referencia a un recurso» para
+#: :data:`DASH_MAX_REFS`: la base donde viven, la unidad de pista y los
+#: segmentos.
+_REF_TAGS: frozenset[str] = frozenset(
+    {
+        "BaseURL",
+        "Representation",
+        "SegmentURL",
+        "SegmentTemplate",
+        "SegmentList",
+        "Segment",
+        "Initialization",
+    }
+)
 
 #: ``mimeType``/``contentType`` que identifican el tipo de AdaptationSet.
 _TEXT_TYPES: frozenset[str] = frozenset({"text", "application/ttml+xml", "application/mp4t+ttml"})
@@ -65,6 +94,26 @@ _ROLE_MAP: dict[str, str] = {
 }
 
 
+def _comprobar_referencias(root: ET.Element, max_refs: int) -> None:
+    """Cuenta las referencias del MPD y corta en ``max_refs`` (FR-STREAM-004)."""
+    refs = 0
+    for node in root.iter():
+        if _local(node.tag) in _REF_TAGS:
+            refs += 1
+            if refs > max_refs:
+                raise ManifestLimitError(
+                    f"El MPD declara más de {max_refs} referencias."
+                )
+
+
+def _comprobar_tiempo(inicio: float, max_seconds: float) -> None:
+    """El análisis no se ha pasado de ``max_seconds`` (reloj monótono)."""
+    if max_seconds > 0 and manifest_limits.ahora() - inicio > max_seconds:
+        raise ManifestLimitError(
+            f"El análisis del MPD lleva más de {max_seconds:g} s."
+        )
+
+
 def parse_dash(
     data: str | bytes,
     *,
@@ -73,6 +122,8 @@ def parse_dash(
     max_bytes: int = DASH_MAX_BYTES,
     max_depth: int = DASH_MAX_DEPTH,
     max_nodes: int = DASH_MAX_NODES,
+    max_refs: int = DASH_MAX_REFS,
+    max_seconds: float = DASH_MAX_SECONDS,
 ) -> MediaCapabilities:
     """Interpreta un MPD y devuelve las capacidades del stream.
 
@@ -82,20 +133,32 @@ def parse_dash(
             de DASH son sueles absolutas y, si no, el reproductor las
             resuelve él; no se absolutizan aquí a propósito).
         live: si se sabe. Por defecto se deduce de ``type="dynamic"``.
+        max_bytes/max_depth: topes del XML (van a ``xml_safe.parse_xml``).
+        max_nodes: tope de nodos en memoria (límite de *memoria* del
+            FR-STREAM-004).
+        max_refs: tope de referencias (BaseURL, Representation, Segment*)
+            y max_seconds: presupuesto de tiempo del análisis
+            (FR-STREAM-004; ver :mod:`thetvview.streams.manifest_limits`).
 
     Raises:
         ParseError (de ``security.xml_safe``): DTD/entidades/profundidad/
             nodos/bytes.
+        ManifestLimitError: referencias o tiempo excedidos (FR-STREAM-004);
+            es un ``ValueError``, como el caso de abajo.
         ValueError: el XML no es un MPD utilizable.
     """
+    inicio = manifest_limits.ahora()
     root = parse_xml(
         data,
         max_bytes=max_bytes,
         max_depth=max_depth,
         max_nodes=max_nodes,
     )
+    _comprobar_tiempo(inicio, max_seconds)
     if _local(root.tag) != "MPD":
         raise ValueError("El documento no es un MPD (elemento raíz distinto de MPD).")
+    _comprobar_referencias(root, max_refs)
+    _comprobar_tiempo(inicio, max_seconds)
 
     if live is None:
         live = (root.get("type") or "static").strip().lower() == "dynamic"
@@ -117,6 +180,7 @@ def parse_dash(
         for adaptation in container:
             if _local(adaptation.tag) != "AdaptationSet":
                 continue
+            _comprobar_tiempo(inicio, max_seconds)
             _collect(adaptation, base, declared, audios, texts, videos)
 
     audio_uris = {t.id: t.uri for t in audios if t.uri}

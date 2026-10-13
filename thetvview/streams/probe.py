@@ -266,18 +266,29 @@ def _download(
     if head is not None and head_status < 400:
         content_type = str(head.headers.get("content-type", ""))
         declared = _content_length(head.headers)
-        if _looks_like_manifest(content_type) or (
-            declared is not None and declared <= MAX_MANIFEST_BYTES
-        ):
-            resp = client.request(
-                url, headers=headers, timeout=timeout, max_bytes=MAX_MANIFEST_BYTES
-            )
-            return (
-                resp.body,
-                resp.final_url,
-                str(resp.headers.get("content-type", "")),
-                resp.status,
-            )
+        # FR-STREAM-004: el tope del cuerpo depende de lo que se vaya a
+        # pedir. Si parece manifiesto (incluido el vacío, que lo decide el
+        # cuerpo), se permite hasta MAX_MPD_BYTES —un MPD puede pasar de
+        # las 2 MiB—; si no, sólo un cuerpo pequeño justifica el GET.
+        es_manifiesto = _looks_like_manifest(content_type)
+        tope = MAX_MPD_BYTES if es_manifiesto else MAX_MANIFEST_BYTES
+        if es_manifiesto or (declared is not None and declared <= tope):
+            try:
+                resp = client.request(
+                    url, headers=headers, timeout=timeout, max_bytes=tope
+                )
+            except ResponseTooLargeError:
+                # El cuerpo supera el tope del manifiesto: no se
+                # materializa y se cae al Range acotado de abajo, que es
+                # lo que ya se hacía con un directo sin fin.
+                resp = None
+            if resp is not None:
+                return (
+                    resp.body,
+                    resp.final_url,
+                    str(resp.headers.get("content-type", "")),
+                    resp.status,
+                )
 
     ranged = dict(headers)
     ranged["Range"] = f"bytes=0-{RANGE_PROBE_BYTES - 1}"
@@ -324,7 +335,10 @@ def _read_prefix(
         pass  # ya hay suficiente para decidir
     finally:
         iterator.close()
-    return bytes(out[:RANGE_PROBE_BYTES]), url, ""
+    # FR-STREAM-001: la base es la URL **final** tras las redirecciones,
+    # no la que pidió el usuario.
+    final = getattr(iterator, "final_url", "") or url
+    return bytes(out[:RANGE_PROBE_BYTES]), final, ""
 
 
 def _parse(body: bytes, detection, final_url: str) -> MediaCapabilities:

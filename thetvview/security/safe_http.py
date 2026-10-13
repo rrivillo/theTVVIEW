@@ -492,6 +492,35 @@ class _Opened:
     conn: Any = None  # http.client.HTTPConnection (para cerrar el socket)
 
 
+class _StreamHandle:
+    """Iterador de cuerpo con la URL final a la vista (FR-STREAM-001).
+
+    Lo que devuelve :meth:`SafeHttpClient.stream`: se itera como cualquier
+    iterador y se cierra con ``close()``. ``final_url`` es la URL **tras**
+    las redirecciones —la base contra la que se resuelven las referencias
+    relativas de un manifiesto—, que un generador pelado no puede enseñar.
+    """
+
+    __slots__ = ("_gen", "final_url", "status")
+
+    def __init__(self, gen: Iterator[bytes], *, final_url: str, status: int) -> None:
+        self._gen = gen
+        self.final_url = final_url
+        self.status = status
+
+    def __iter__(self) -> "_StreamHandle":
+        return self
+
+    def __next__(self) -> bytes:
+        return next(self._gen)
+
+    def close(self) -> None:
+        """Cierra el stream y el socket (idempotente)."""
+        cerrar = getattr(self._gen, "close", None)
+        if callable(cerrar):
+            cerrar()
+
+
 # ---------------------------------------------------------------------------
 # Cliente
 # ---------------------------------------------------------------------------
@@ -721,11 +750,17 @@ class SafeHttpClient:
         timeout: float | None = None,
         headers: Mapping[str, str] | None = None,
         retry: bool = True,
-    ) -> Iterator[bytes]:
+    ) -> _StreamHandle:
         """Itera el cuerpo por trozos con el límite de tamaño activo.
 
         ``offset``/``length`` piden un rango (``Range``); si el servidor lo
         ignora, el límite de tamaño sigue aplicándose.
+
+        Devuelve un manejador con **``final_url``** a la vista: la URL
+        final tras las redirecciones, que es la base contra la que se
+        resuelven las referencias relativas (FR-STREAM-001). La petición
+        se abre aquí mismo: un error de red o de estado sale en la llamada
+        y no a media iteración.
         """
         cap = self._cap(max_bytes)
         extra = dict(headers or {})
@@ -740,8 +775,24 @@ class SafeHttpClient:
             status, reason = opened.status, opened.reason
             _close_opened(opened)
             raise _with_status(NetworkError(_status_message(status, reason)), status)
+        return _StreamHandle(
+            self._body_iter(opened, cap, started, timeout, chunk_size),
+            final_url=opened.final_url,
+            status=opened.status,
+        )
+
+    @staticmethod
+    def _body_iter(
+        opened: _Opened,
+        cap: int | None,
+        started: float,
+        timeout: float | None,
+        chunk_size: int,
+    ) -> Iterator[bytes]:
         try:
-            yield from _iter_body(opened.fp, opened.headers, cap, started, timeout, chunk_size)
+            yield from _iter_body(
+                opened.fp, opened.headers, cap, started, timeout, chunk_size
+            )
         finally:
             _close_opened(opened)
 

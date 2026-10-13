@@ -6,10 +6,12 @@ mensajes humanos).
 
 Diseño:
 - probe_channel_url(channel, timeout) -> HealthSnapshot : prueba HTTP HEAD
-  (fallback GET range) midiendo latencia y código.
+  (fallback GET range) midiendo latencia y código; el Content-Type que
+  ya viene en la cabecera es la pista gratuita de la dimensión «fuente».
 - classify_health(snapshots, player_alive) -> HealthStatus : agrega últimos
   probes + estado del reproductor y devuelve nivel 0..5 con etiqueta, barra
-  y color curses.
+  y color curses, **y las tres dimensiones del §11.1** (red / fuente /
+    reproducción) de las que el nivel se deriva (DIAG-003).
 - ChannelHealthMonitor : hilo daemon que sondea cada `interval` segundos sin
   bloquear la TUI; expone status() thread-safe.
 
@@ -54,11 +56,40 @@ class HealthSnapshot:
     http_code: int | None
     error: str | None  # mensaje corto amigable en español
     raw_error: str | None = None  # opcional para debug
+    #: Content-Type que el servidor declaró, si lo declaró. Es la única
+    #: pista de la **validez de la fuente** (§11.1, dimensión 2) que sale
+    #: gratis de una sonda que ya se está haciendo: no cuesta una petición
+    #: extra (FR-DIAG-002/004).
+    content_type: str | None = None
+
+
+class DimensionEstado(str, Enum):
+    """Estado de **una** dimensión de salud (§11.1).
+
+    §11.1 exige tres dimensiones independientes —red/servidor, validez de
+    la fuente y reproducción— sin colapsarlas en un «funciona». Ésta es la
+    escala común de las tres y sólo dice lo que se ha medido:
+    ``DESCONOCIDO`` no es «malo»: es «no se ha comprobado» (FR-STA-02).
+    """
+
+    OK = "ok"
+    DEGRADADO = "degradado"
+    FALLA = "falla"
+    DESCONOCIDO = "desconocido"
+
+    def __str__(self) -> str:  # pragma: no cover - depuración
+        return self.value
 
 
 @dataclass
 class HealthStatus:
-    """Estado agregado listo para UI."""
+    """Estado agregado listo para UI.
+
+    Las tres dimensiones del §11.1 viven aquí **por separado** y el nivel
+    0..5 se deriva de ellas: la UI no cambia (sigue leyendo `level`), pero
+    «el servidor contesta» deja de significar «esto funciona». Lo que no se
+    ha medido queda ``DESCONOCIDO`` en su dimensión, nunca en «ok».
+    """
 
     level: int  # 0..5
     label: str  # Ej. "Excelente"
@@ -81,6 +112,12 @@ class HealthStatus:
     #: La barra lo muestra para no decir «funciona» cuando sólo se sabe que el
     #: proceso existe.
     evidencia: EvidenceLevel = EvidenceLevel.NONE
+    #: Dimensión 1 (§11.1): DNS, conexión, TLS, HTTP y tiempos.
+    red: DimensionEstado = DimensionEstado.DESCONOCIDO
+    #: Dimensión 2 (§11.1): tipo de contenido y validez de la fuente.
+    fuente: DimensionEstado = DimensionEstado.DESCONOCIDO
+    #: Dimensión 3 (§11.1): señales del motor y avance de medios.
+    reproduccion: DimensionEstado = DimensionEstado.DESCONOCIDO
 
 
 class Estado(str, Enum):
@@ -271,6 +308,13 @@ def probe_channel_url(
     def _latency() -> float:
         return (time.monotonic() - start) * 1000.0
 
+    def _tipo(resp) -> str | None:  # noqa: ANN001 - respuesta de safe_http
+        """Content-Type declarado, si lo hay: gratis, ya viene en la cabecera."""
+        try:
+            return str(resp.headers.get("content-type", "") or "").strip() or None
+        except Exception:  # noqa: BLE001 - una cabecera rara no rompe la sonda
+            return None
+
     def _network_fail(exc: Exception) -> HealthSnapshot:
         # safe_http ya redacta URLs/credenciales en el mensaje.
         return HealthSnapshot(
@@ -279,6 +323,7 @@ def probe_channel_url(
 
     try:
         resp = client.head(raw_url, headers=headers, timeout=timeout)
+        content_type = _tipo(resp)
         code = int(resp.status)
         if code in (405, 501, 403, 400):
             # Reintentar con GET: muchos servidores HLS rechazan HEAD.
@@ -292,6 +337,7 @@ def probe_channel_url(
                 timeout=timeout,
                 read_body=False,
             )
+            content_type = _tipo(resp) or content_type
             code = int(resp.status)
     except Exception as exc:  # noqa: BLE001 - la sonda nunca debe romper el hilo
         return _network_fail(exc)
@@ -299,7 +345,9 @@ def probe_channel_url(
     # 2xx y 3xx se consideran éxito (redirecciones HLS válidas)
     success = 200 <= code < 400
     err = None if success else f"HTTP {code}"
-    return HealthSnapshot(now, _latency(), success, code, err, err)
+    return HealthSnapshot(
+        now, _latency(), success, code, err, err, content_type=content_type
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -356,13 +404,121 @@ def _proceso_vivo(
     return evidencia.rank >= EvidenceLevel.PROCESS_ALIVE.rank
 
 
+# ---------------------------------------------------------------------------
+# Dimensiones de salud (§11.1 · DIAG-003)
+# ---------------------------------------------------------------------------
+#
+# §11.1 exige tres dimensiones **independientes**: red/servidor, validez de
+# la fuente y reproducción. El nivel 0..5 se deriva de ellas (con un techo
+# cuando una dimensión está a la baja); ellas no se derivan del nivel.
+# Nada se colapsa en un «funciona».
+
+#: Lo que un Content-Type **sí** prueba sobre la fuente (FR-DIAG-003). Un
+#: HTML o un JSON en un canal de vídeo no es un stream: es un error
+#: disfrazado de 200. Todo lo demás queda DESCONOCIDO — un tipo raro no
+#: prueba nada en ninguna dirección, y inventar un veredicto sería peor.
+_FUENTE_FALLA_MIME: tuple[str, ...] = ("text/html", "application/json", "xhtml")
+_FUENTE_OK_MIME: tuple[str, ...] = (
+    "mpegurl",
+    "dash+xml",
+    "mp2t",
+    "video/",
+    "audio/",
+    "mpg",
+    "mp4",
+    "matroska",
+    "ogg",
+)
+
+
+def fuente_de_mimetipo(content_type: str | None) -> DimensionEstado:
+    """Traduce un Content-Type declarado a la dimensión «fuente» (§11.1).
+
+    Sólo afirma lo que el tipo prueba: ``text/html`` no puede ser un stream
+    (``FALLA``); los tipos de manifiesto y medios dicen ``OK``; lo demás,
+    incluido el vacío, es ``DESCONOCIDO`` — no «malo».
+    """
+    mime = (content_type or "").split(";", 1)[0].strip().lower()
+    if not mime:
+        return DimensionEstado.DESCONOCIDO
+    if any(pista in mime for pista in _FUENTE_FALLA_MIME):
+        return DimensionEstado.FALLA
+    if any(pista in mime for pista in _FUENTE_OK_MIME):
+        return DimensionEstado.OK
+    return DimensionEstado.DESCONOCIDO
+
+
+def _dimension_red(snaps: list[HealthSnapshot]) -> DimensionEstado:
+    """Dimensión 1 (§11.1): lo que las sondas prueban del servidor."""
+    if not snaps:
+        return DimensionEstado.DESCONOCIDO
+    if snaps[-1].success is None:
+        # No medible por red (rtmp://…): no se sabe, no es «ok».
+        return DimensionEstado.DESCONOCIDO
+    exitos = sum(1 for s in snaps if s.success is True)
+    tasa = exitos / len(snaps)
+    if tasa == 0.0:
+        return DimensionEstado.FALLA
+    if tasa < 0.8 or snaps[-1].success is False:
+        return DimensionEstado.DEGRADADO
+    return DimensionEstado.OK
+
+
+def _dimension_reproduccion(
+    vivo: bool, nivel: EvidenceLevel
+) -> DimensionEstado:
+    """Dimensión 3 (§11.1): señales del motor y avance de medios.
+
+    El proceso vivo **sin** confirmación de medios no es ``OK``: es
+    ``DESCONOCIDO``. Que mpv exista no dice que haya imagen (FR-REC-002).
+    """
+    if not vivo:
+        return DimensionEstado.FALLA
+    if nivel.rank >= EvidenceLevel.MEDIA_SEEN.rank:
+        return DimensionEstado.OK
+    return DimensionEstado.DESCONOCIDO
+
+
+def _techo_por_dimensiones(
+    nivel: int,
+    red: DimensionEstado,
+    fuente: DimensionEstado,
+) -> int:
+    """Techo que las dimensiones imponen al nivel medido (§11.1).
+
+    Un servidor accesible con fuente inválida **no** se marca como
+    reproducción funcional: cae a «Mala» aunque la red sea impecable. Y si
+    la red está en ``FALLA``, no hay nivel que salvar.
+    """
+    if red is DimensionEstado.FALLA:
+        return 0
+    if fuente is DimensionEstado.FALLA:
+        return min(nivel, 1)
+    if fuente is DimensionEstado.DEGRADADO:
+        return min(nivel, 3)
+    return nivel
+
+
+def _aviso_de_fuente(fuente: DimensionEstado, detalle: str) -> str:
+    """Añade al detalle lo que la dimensión «fuente» sabe, si algo sabe."""
+    if fuente is DimensionEstado.FALLA:
+        return (
+            f"{detalle}. La fuente no sirve: el servidor contesta, pero el "
+            "contenido no parece reproducible."
+        )
+    if fuente is DimensionEstado.DEGRADADO:
+        return f"{detalle}. El tipo de contenido de la fuente no es el esperado."
+    return detalle
+
+
 def classify_health(
     snapshots: list[HealthSnapshot] | Deque[HealthSnapshot],
     *,
     player_alive: bool | None = None,
     evidencia: EvidenceLevel | None = None,
+    fuente: DimensionEstado | None = None,
 ) -> HealthStatus:
-    """Agrega snapshots y produce HealthStatus 0..5.
+    """Agrega snapshots y produce HealthStatus 0..5 con sus dimensiones.
 
     Reglas fáciles de explicar al usuario:
     - Si el reproductor no está vivo -> 0 Sin señal.
@@ -371,6 +527,21 @@ def classify_health(
       "No medible: ver reproductor".
     - Sin no: success_rate y latencia mediana determinan nivel; jitter alto
       baja un escalón.
+
+    Dimensiones (§11.1 · DIAG-003)
+    -------------------------------
+
+    Además del número, el resultado lleva **tres dimensiones por separado**
+    —`red` (servidor/tiempos), `fuente` (contenido válido) y `reproduccion`
+    (evidencia del motor)— y el nivel se deriva de ellas: una red
+    impecable con fuente inválida techoa a «Mala», porque un servidor que
+    contesta no está sirviendo algo reproducible. La UI sigue leyendo
+    sólo `level`/`label`/`summary`, así que nada cambia visualmente; lo
+    que cambia es que ya se puede responder **por qué**.
+
+    `fuente`: si quien llama ya sabe el veredicto de la fuente (p. ej. de
+    un análisis de manifiesto), lo pasa aquí y manda; si no, se deriva del
+    Content-Type que la sonda ya trajo (gratis: FR-DIAG-002/004).
 
     ``evidencia`` (FR-REC-002)
     ---------------------------
@@ -389,6 +560,18 @@ def classify_health(
     n = len(snaps)
     nivel_evidencia = _normalizar_evidencia(evidencia, player_alive)
     vivo = _proceso_vivo(nivel_evidencia, player_alive)
+    # Las tres dimensiones (§11.1) se calculan con lo que ya se tiene:
+    # nunca abren red ni inventan un veredicto.
+    ultima = snaps[-1] if snaps else None
+    dim_red = _dimension_red(snaps)
+    if fuente is not None and not isinstance(fuente, DimensionEstado):
+        fuente = DimensionEstado(str(fuente))
+    dim_fuente = (
+        fuente
+        if fuente is not None
+        else fuente_de_mimetipo(ultima.content_type if ultima else None)
+    )
+    dim_repro = _dimension_reproduccion(vivo, nivel_evidencia)
 
     if not vivo:
         return HealthStatus(
@@ -404,6 +587,10 @@ def classify_health(
             jitter_ms=None,
             probe_count=n,
             success_count=0,
+            evidencia=nivel_evidencia,
+            red=dim_red,
+            fuente=dim_fuente,
+            reproduccion=DimensionEstado.FALLA,
         )
 
     if n == 0:
@@ -422,10 +609,14 @@ def classify_health(
             jitter_ms=None,
             probe_count=0,
             success_count=0,
+            evidencia=nivel_evidencia,
+            red=DimensionEstado.DESCONOCIDO,
+            fuente=DimensionEstado.DESCONOCIDO,
+            reproduccion=dim_repro,
         )
 
     # Caso no HTTP medible: si el último es None
-    last = snaps[-1]
+    last = ultima
     if last.success is None:
         return HealthStatus(
             level=3,
@@ -441,6 +632,10 @@ def classify_health(
             probe_count=n,
             success_count=n,
             medible=False,
+            evidencia=nivel_evidencia,
+            red=dim_red,
+            fuente=dim_fuente,
+            reproduccion=dim_repro,
         )
 
     success_count = sum(1 for s in snaps if s.success is True)
@@ -471,6 +666,10 @@ def classify_health(
             jitter_ms=jitter_val,
             probe_count=n,
             success_count=0,
+            evidencia=nivel_evidencia,
+            red=DimensionEstado.FALLA,
+            fuente=dim_fuente,
+            reproduccion=dim_repro,
         )
 
     # Nivel base por latencia (sobre avg o last)
@@ -507,11 +706,14 @@ def classify_health(
     if last.success is False and success_rate >= 0.5:
         base = max(1, base - 1)
 
-    level = max(0, min(5, base))
+    # El nivel mide la calidad de la **red**, pero no manda él solo: las
+    # dimensiones del §11.1 techoan el resultado — un servidor accesible
+    # con fuente inválida no se marca como reproducción funcional.
+    level = _techo_por_dimensiones(max(0, min(5, base)), dim_red, dim_fuente)
     label = health_label(level)
     bar = health_bar(level)
     color = _color_for(level)
-    detail = _LEVEL_META[level][3]
+    detail = _aviso_de_fuente(dim_fuente, _LEVEL_META[level][3])
 
     # Summary humano
     parts: list[str] = []
@@ -563,6 +765,9 @@ def classify_health(
         probe_count=n,
         success_count=success_count,
         evidencia=nivel_evidencia,
+        red=dim_red,
+        fuente=dim_fuente,
+        reproduccion=dim_repro,
     )
 
 

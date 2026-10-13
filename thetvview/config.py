@@ -27,6 +27,11 @@ FAVORITES_JSON: Path = DATA_DIR / "favorites.json"
 THEME_JSON: Path = DATA_DIR / "theme.json"
 PREFS_JSON: Path = DATA_DIR / "prefs.json"
 RECENTS_JSON: Path = DATA_DIR / "recents.json"
+#: Caché de combinaciones exitosas del router (FR-CAP-007). Sólo contiene
+#: transportes y nombres de motor: nunca URLs (pueden llevar token).
+PLAYER_CACHE_JSON: Path = DATA_DIR / "player_cache.json"
+DIAGNOSTICS_DIR: Path = DATA_DIR / "diagnostics"
+DIAGNOSTICS_JSON: Path = DATA_DIR / "diagnostics.json"
 XTREAM_CACHE_DIR: Path = DATA_DIR / "xtream_cache"
 TRACK_CACHE_DIR: Path = DATA_DIR / "track_cache"
 IPC_DIR: Path = DATA_DIR / "ipc"
@@ -202,6 +207,7 @@ def ensure_dirs() -> None:
         PLAYLIST_CACHE_DIR,
         XTREAM_CACHE_DIR,
         TRACK_CACHE_DIR,
+        DIAGNOSTICS_DIR,
         PREFS_JSON.parent,
         RECENTS_JSON.parent,
     ):

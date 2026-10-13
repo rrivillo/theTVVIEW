@@ -82,6 +82,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..streams.transport import Transport
+from .confidence import Confidence, clave_de, nivel_confianza
 
 __all__ = [
     "PlayerProtocolSupport",
@@ -146,6 +147,26 @@ class PlayerProtocolSupport:
                 "aquí (el reproductor puede saberlo, pero no lo sabemos nosotros)"
             )
         return "no soportado por este reproductor"
+
+    def confianza(self, transport: Transport | str) -> Confidence | None:
+        """Nivel de confianza de «este reproductor abre este transporte» (FR-CAP-002).
+
+        ``DETECTED`` si el transporte está en ``medido`` (la medición
+        empírica de 2026-10-04), ``DECLARED`` si sólo figura en la tabla
+        sin medir, y ``VERIFIED`` únicamente con una evidencia enlazada en
+        :data:`thetvview.player.confidence.EVIDENCIAS_VERIFICADAS`.
+
+        Devuelve None si la fila **no afirma nada** ni siquiera un «no»: los
+        «no» explicados en :meth:`why_not` (p. ej. VLC con UDP) no son una
+        capacidad positiva, y su motivo ya se muestra en el modal. Ojo con
+        el matiz de compatibilidad: ``medido is None`` significa «sin medir»
+        aquí, aunque :meth:`can_play` lo trate como medible.
+        """
+        clave = _clave(transport)
+        if clave not in self.transports:
+            return None
+        medido = self.medido is not None and clave in self.medido
+        return nivel_confianza(medido, clave_de(self.name, clave))
 
 
 def _clave(transport: Transport | str) -> str:

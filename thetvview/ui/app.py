@@ -2040,6 +2040,9 @@ class App:
         )
 
         informe = diagnose(channel)
+        # DIAG-004: el resultado alimenta el historial local acotado, y con
+        # él se distingue un fallo nuevo de uno recurrente (FR-DIAG-005).
+        nota_historial = self._registrar_diagnose(channel, informe)
         pasos = None
         if con_conexion:
             # La excepción anti-SSRF es **de la fuente que aportó el canal**,
@@ -2057,9 +2060,89 @@ class App:
                     f"no se pudo comprobar: {type(exc).__name__}",
                 )
         texto = render_report(informe, pas=pasos)
+        if nota_historial:
+            texto += f"\n\n{nota_historial}"
+        # DIAG-002: el informe completo del §11.3 (sesión, motor, tiempos,
+        # eventos) se compone **sin red** y se guarda en un archivo 0600
+        # que el usuario pueda compartir. Si guardar falla, el modal sigue:
+        # un archivo no puede impedir ver el diagnóstico.
+        ruta = self._guardar_informe_sesion(channel, pasos, nota_historial)
+        if ruta is not None:
+            texto += f"\n\nInforme completo (§11.3) guardado en:\n  {ruta}"
         # `_show_notice` (y no `notify`): el informe es largo y ya viene
         # encabezado, así que no se duplica en la barra de estado.
         self._show_notice(f"Diagnóstico · {channel.name}", texto)
+
+    def _registrar_diagnose(self, channel, informe) -> str | None:  # noqa: ANN001
+        """Anota el resultado en el historial y devuelve la nota FR-DIAG-005.
+
+        Se consulta la recurrencia **antes** de registrar el de hoy, para
+        que «nuevo» y «recurrente» digan la verdad. Sin historial (tests,
+        app sin `run()`), no hay nota y nadie se entera.
+        """
+        historial = getattr(self, "diagnosticos", None)
+        if historial is None:
+            return None
+        try:
+            clave = str(
+                getattr(channel, "tvg_id", "") or getattr(channel, "name", "") or ""
+            )
+            ok = bool(getattr(informe, "ok", False))
+            recurrente = (not ok) and bool(
+                historial.es_recurrente(clave)
+            )
+            historial.registrar(
+                clave, ok, motivo=str(getattr(informe, "verdict", "")), fase="diagnose"
+            )
+            if ok:
+                return None
+            if recurrente:
+                return "Fallo recurrente: este canal ya fallaba antes (historial local)."
+            return "Fallo nuevo: sin fallos anteriores registrados de este canal."
+        except Exception:  # noqa: BLE001 - el historial nunca rompe el modal
+            return None
+
+    def _guardar_informe_sesion(self, channel, pasos, historial=None):  # noqa: ANN001
+        """Informe §11.3 desde datos ya en memoria (DIAG-002 · FR-DIAG-009).
+
+        Recoge la sesión vigente (``app._sessions``) y el supervisor de la
+        pantalla de reproducción (``app.screen``) si existen; lo que no
+        exista se queda como «desconocido». **No hace red**: la
+        comprobación activa, si la hubo, ya vino en `pasos`.
+        """
+        from ..diagnostics.report import construir_informe, guardar_informe
+
+        sesion = None
+        try:
+            sesion_actual = getattr(getattr(self, "_sessions", None), "actual", None)
+            if callable(getattr(sesion_actual, "para_informe", None)):
+                sesion = sesion_actual.para_informe()
+        except Exception:  # noqa: BLE001 - un informe nunca rompe el modal
+            sesion = None
+        motor = None
+        eventos = None
+        try:
+            sup = getattr(getattr(self, "screen", None), "supervisor", None)
+            if callable(getattr(sup, "para_informe", None)):
+                motor = sup.para_informe()
+            bus = getattr(self, "eventos", None)
+            correlacion = (sesion or {}).get("correlation_id")
+            if bus is not None and correlacion:
+                eventos = bus.buscar(correlation_id=correlacion) or None
+        except Exception:  # noqa: BLE001 - idem: pantalla ausente o rara
+            motor, eventos = None, None
+        texto = construir_informe(
+            canal=str(getattr(channel, "name", "") or ""),
+            sesion=sesion,
+            motor=motor,
+            conexion=pasos,
+            eventos=eventos,
+            historial=historial,
+        )
+        try:
+            return guardar_informe(texto)
+        except OSError:
+            return None
 
     # --- Errores: barra redactada + modal con las acciones que existen -------
 
@@ -2929,6 +3012,33 @@ class App:
         stdscr = self.stdscr
         curses.curs_set(0)
         theme.init_colors(self.theme_name)
+        # Caché de combinaciones exitosas (FR-CAP-007). Nace aquí y no en
+        # `__init__` a propósito: los tests construyen App sin `run()`, y
+        # así ni leen ni escriben `data/player_cache.json`. Cualquier fallo
+        # la deja desactivada (`getattr(..., None)` en los llamadores).
+        try:
+            from ..player.success_cache import default_cache
+
+            self.combinaciones = default_cache()
+        except Exception:
+            self.combinaciones = None
+        # Buzón de eventos del §3.3 (DIAG-001). Mismo criterio que la
+        # caché: nace en `run()`, y los tests que montan App sin bucle
+        # nunca lo crean — el informe lo busca con `getattr` defensivo.
+        try:
+            from ..diagnostics.events import EventBus
+
+            self.eventos = EventBus()
+        except Exception:
+            self.eventos = None
+        # Historial local de diagnósticos (DIAG-004 · FR-DIAG-005/010):
+        # acotado por cantidad, edad y tamaño, en data/diagnostics.json.
+        try:
+            from ..diagnostics.history import default_historial
+
+            self.diagnosticos = default_historial()
+        except Exception:
+            self.diagnosticos = None
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS)
         except Exception:

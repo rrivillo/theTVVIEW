@@ -43,6 +43,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .confidence import Confidence, clave_de, nivel_confianza
+
 __all__ = [
     "PlayerTrackSupport",
     "PLAYER_TRACK_SUPPORT",
@@ -91,6 +93,11 @@ class PlayerTrackSupport:
     quality_unit: str = ""
     #: Por qué no puede lo que no puede. Va a los modales y a SECURITY.md.
     notes: str = ""
+    #: Kinds comprobados en esta máquina (medición del 2026-10-02 contra un
+    #: master HLS de laboratorio). None = «sin medir» → sólo DECLARED
+    #: (FR-CAP-002). Los booleanos de arriba siguen mandando en el argv:
+    #: este campo existe para poder distinguir «declarado» de «medido».
+    medido: frozenset[str] | None = None
 
     def supports(self, kind: str) -> bool:
         if kind == KIND_AUDIO:
@@ -108,6 +115,25 @@ class PlayerTrackSupport:
         if kind == KIND_SUBTITLES:
             return bool(self.subtitles_by_index)
         return False
+
+    def confianza(self, kind: str) -> Confidence | None:
+        """Nivel de confianza de la afirmación sobre `kind` (FR-CAP-002).
+
+        ``DETECTED`` si el kind está en ``medido`` (las filas de esta
+        tabla se midieron el 2026-10-02), ``DECLARED`` si la fila no
+        tiene ``medido``, ``VERIFIED`` sólo con evidencia enlazada. None
+        si el kind ni siquiera es de los que esta fila afirma (no está en
+        :data:`KINDS`).
+
+        La confianza cubre el valor que sea —tanto el ``True`` como el
+        ``False``— porque procede de la misma medición: que mpv no pueda
+        fijar calidad también está medido (``--video-bitrate`` no existe
+        en 0.40.0, ver el docstring del módulo).
+        """
+        if kind not in KINDS:
+            return None
+        medido = self.medido is not None and kind in self.medido
+        return nivel_confianza(medido, clave_de(self.name, kind))
 
 
 _MPV_NOTES = (
@@ -137,6 +163,7 @@ PLAYER_TRACK_SUPPORT: dict[str, PlayerTrackSupport] = {
         hot_control=True,
         quality_unit=QUALITY_UNIT_BPS,
         notes=_MPV_NOTES,
+        medido=frozenset(KINDS),
     ),
     "vlc": PlayerTrackSupport(
         name="vlc",
@@ -147,6 +174,7 @@ PLAYER_TRACK_SUPPORT: dict[str, PlayerTrackSupport] = {
         subtitles_by_language=True,
         hot_control=False,
         notes=_VLC_NOTES,
+        medido=frozenset(KINDS),
     ),
     "mplayer": PlayerTrackSupport(
         name="mplayer",
@@ -157,6 +185,7 @@ PLAYER_TRACK_SUPPORT: dict[str, PlayerTrackSupport] = {
         subtitles_by_language=True,
         hot_control=False,
         notes=_MPLAYER_NOTES,
+        medido=frozenset(KINDS),
     ),
 }
 

@@ -32,10 +32,18 @@ from .hls import (
     parse_media_playlist,
     split_codecs,
 )
+from .manifest_limits import (
+    DEFAULT_MANIFEST_LIMITS,
+    ManifestLimitError,
+    ManifestLimits,
+)
 
 __all__ = [
+    "DEFAULT_MANIFEST_LIMITS",
     "Detection",
     "HlsParseError",
+    "ManifestLimitError",
+    "ManifestLimits",
     "detect_protocol",
     "looks_like_dash",
     "looks_like_hls",

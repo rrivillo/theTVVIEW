@@ -4090,6 +4090,17 @@ def play_channel(  # noqa: ANN001
         # preferencia. No es lo mismo que `last_player` (el último usado), y por
         # eso viaja en `prefs.preferred_backend` y no aquí.
         extra["preferred"] = preferred_backend
+    # Criterio FR-CAP-007: sólo si **no** hay preferencia del usuario y no
+    # pidió motor explícito, el router puede apoyarse en una combinación
+    # que ya funcionó para este transporte. Viaja como `preferred` (el
+    # criterio 1) y no dentro de `extra`, para no duplicar el kwarg en el
+    # fallback de `_lanzar_con_router`. `combinaciones` lo crea App.run():
+    # en tests no existe y aquí no se toca disco.
+    cache = getattr(app, "combinaciones", None)
+    if cache is not None and not preferred_backend and not player_name:
+        ganador = _combinacion_exitosa(cache, channel.url)
+        if ganador is not None:
+            preferred_backend = ganador.reproductor
     fallos: set[str] = set()
     # Sesión de reproducción (SDD §4). Se abre **antes** del lanzamiento: si el
     # lanzamiento falla, la sesión termina con `init_failed` y su motivo queda
@@ -4177,6 +4188,11 @@ def play_channel(  # noqa: ANN001
     ))
     app.prefs.set_last_player(effective_name)
     _recordar_reciente(app, canal_original, effective_name)
+    if cache is not None and not player_name:
+        # FR-CAP-007: sólo la ruta del router deja combinación en la
+        # caché; un lanzamiento explícito ya queda en `prefs` y además la
+        # preferencia del usuario manda sobre la caché.
+        _guardar_combinacion(cache, channel.url, effective_name)
     for aviso in _avisos_sin_repetir(app, channel, effective_name, avisos):
         app.notify_warning(aviso)
     if catchup_playback is not None:
@@ -4202,6 +4218,51 @@ def _diagnosticar(app, channel) -> None:  # noqa: ANN001
     fn = getattr(app, "show_diagnose", None)
     if callable(fn):
         fn(channel, con_conexion=True)
+
+
+def _transporte_clave(url: str) -> str | None:
+    """Clave de caché para una URL: su transporte, **nunca** la URL.
+
+    Las URLs de IPTV pueden llevar token en la query o userinfo
+    reconstruido, así que a disco no va la URL (misma regla que para
+    Recientes, SDD §37). El transporte es además lo único sobre lo que
+    decide el router, así que la granularidad es exacta (FR-CAP-007).
+    """
+    from thetvview.streams.detector import detect_protocol
+    from thetvview.streams.transport import Transport
+
+    try:
+        transporte = detect_protocol(url=url).transport
+    except Exception:
+        return None
+    if transporte is Transport.UNKNOWN:
+        return None
+    return transporte.value
+
+
+def _combinacion_exitosa(cache, url: str):  # noqa: ANN001
+    """La combinación que ya abrió este transporte, o None (FR-CAP-007)."""
+    clave = _transporte_clave(url)
+    if not clave:
+        return None
+    try:
+        return cache.buscar(clave)
+    except Exception:
+        # Una caché ilegible no cambia el comportamiento de siempre: el
+        # router decide solo.
+        return None
+
+
+def _guardar_combinacion(cache, url: str, reproductor: str) -> None:  # noqa: ANN001
+    """Anota el motor que acaba de abrir este transporte (sin la URL)."""
+    clave = _transporte_clave(url)
+    if not clave or not reproductor:
+        return
+    try:
+        cache.recordar(clave, reproductor)
+    except Exception:
+        # Una caché que falla no puede romper una reproducción.
+        pass
 
 
 def _error_credenciales(nombre: str, detalle: str):

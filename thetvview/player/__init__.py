@@ -7,6 +7,13 @@ listas blancas y sus límites, y la UI **no** habla mpv/vlc/mplayer. Aquí vive:
   (verificado empíricamente contra los binarios, plan F5a);
 - :mod:`thetvview.player.protocols` — qué **transportes** abre cada uno, que es
   otra pregunta y por eso es otra tabla (SDD-M Fase 0);
+- :mod:`thetvview.player.media` — qué **contenedores y códecs** decodifica
+  cada uno (FR-CAP-001, plan Fase 5), y :mod:`thetvview.player.confidence` —
+  con qué evidencia lo sabemos: ``DECLARED``/``DETECTED``/``VERIFIED``
+  (FR-CAP-002);
+- :mod:`thetvview.player.success_cache` — la caché de combinaciones
+  exitosas del router, con fecha, versión, ámbito y caducidad
+  (FR-CAP-007);
 - :mod:`thetvview.player.router` — elige reproductor por capacidad, no por el
   primero que encuentre (SDD-M §8);
 - :mod:`thetvview.player.errors` — errores de reproducción normalizados
@@ -31,6 +38,16 @@ from .errors import (
     StreamErrorCode,
     classify_message,
     classify_returncode,
+)
+from .confidence import Confidence
+from .media import (
+    PLAYER_MEDIA_SUPPORT,
+    PlayerMediaSupport,
+    confianza_media,
+    media_support_for,
+    normalizar_codec,
+    normalizar_contenedor,
+    soporta,
 )
 from .protocols import (
     PLAYER_PROTOCOL_SUPPORT,
@@ -94,15 +111,18 @@ __all__ = [
     "KIND_SUBTITLES",
     "KINDS",
     "MAX_BACKEND_ATTEMPTS",
+    "PLAYER_MEDIA_SUPPORT",
     "PLAYER_PROTOCOL_SUPPORT",
     "PLAYER_TRACK_SUPPORT",
     "SUBTITLE_RENDITION_BLIND",
     "TRANSPORTS",
     "Candidate",
+    "Confidence",
     "MpvIpc",
     "MpvIpcError",
     "NoCompatibleBackend",
     "PlayerError",
+    "PlayerMediaSupport",
     "PlayerProtocolSupport",
     "PlayerTrackSupport",
     "StreamError",
@@ -110,12 +130,16 @@ __all__ = [
     "classify_message",
     "classify_returncode",
     "command_for",
+    "confianza_media",
     "diagnose_early_exit",
     "explain_early_exit",
     "explain_no_backend",
     "hot_control",
     "ipc_path",
     "launch",
+    "media_support_for",
+    "normalizar_codec",
+    "normalizar_contenedor",
     "order_candidates",
     "protocol_candidates",
     "protocol_support_for",
@@ -123,6 +147,7 @@ __all__ = [
     "protocol_verified",
     "quality_unit_for",
     "select_backend",
+    "soporta",
     "subtitle_rendition_blind",
     "support_for",
     "supports",

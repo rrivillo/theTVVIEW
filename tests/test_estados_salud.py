@@ -22,11 +22,13 @@ from unittest import mock
 
 from thetvview.channel_health import (
     ChannelHealthMonitor,
+    DimensionEstado,
     Estado,
     HealthSnapshot,
     HealthStatus,
     classify_health,
     estado_de,
+    fuente_de_mimetipo,
     health_label,
 )
 from thetvview.models import Channel
@@ -222,6 +224,121 @@ class TestBadgeDeEstado(unittest.TestCase):
         with mock.patch.object(colors, "pair", return_value=0):
             estado_badge(ventana, 1, 0, Estado.DESCONOCIDO, 4)
         self.assertTrue(all(len(c[2]) <= 4 for c in ventana.calls))
+
+
+# ---------------------------------------------------------------------------
+# 4. Las tres dimensiones del §11.1 (DIAG-003)
+# ---------------------------------------------------------------------------
+
+
+def _snap_ctype(
+    success: bool | None = True, content_type: str | None = None
+) -> HealthSnapshot:
+    ahora = datetime.now(timezone.utc)
+    return HealthSnapshot(
+        ahora,
+        100.0,
+        success,
+        200 if success else None,
+        None,
+        content_type=content_type,
+    )
+
+
+class TestDimensionesDeSalud(unittest.TestCase):
+    """§11.1: tres dimensiones independientes; el nivel se deriva de ellas."""
+
+    def test_servidor_ok_con_fuente_invalida_no_es_funcional(self):
+        """El 200 con HTML no es reproducción: cae a «Mala», no a «Excelente»."""
+        snaps = [_snap_ctype(True, "text/html; charset=utf-8")]
+        status = classify_health(snaps, player_alive=True)
+        self.assertIs(status.red, DimensionEstado.OK)
+        self.assertIs(status.fuente, DimensionEstado.FALLA)
+        self.assertLessEqual(status.level, 1)
+        self.assertIs(estado_de(status), Estado.OFFLINE)
+        # Y lo dice con palabras, no sólo con el número.
+        self.assertIn("no parece reproducible", status.detail)
+
+    def test_fuente_degradada_techoa_a_regular(self):
+        status = classify_health(
+            [_snap_ctype(True)], player_alive=True, fuente=DimensionEstado.DEGRADADO
+        )
+        self.assertLessEqual(status.level, 3)
+        self.assertIn("no es el esperado", status.detail)
+
+    def test_fuente_declarada_manda_sobre_el_mime(self):
+        """Quien ya analizó el manifiesto sabe más que la cabecera."""
+        status = classify_health(
+            [_snap_ctype(True, "application/vnd.apple.mpegurl")],
+            player_alive=True,
+            fuente=DimensionEstado.FALLA,
+        )
+        self.assertIs(status.fuente, DimensionEstado.FALLA)
+
+    def test_reproduccion_sin_medios_es_desconocida(self):
+        """Proceso vivo sin confirmar medios no es «ok» (FR-REC-002)."""
+        from thetvview.player.evidence import EvidenceLevel
+
+        status = classify_health(
+            [_snap_ctype(True)], player_alive=True, evidencia=EvidenceLevel.PROCESS_ALIVE
+        )
+        self.assertIs(status.red, DimensionEstado.OK)
+        self.assertIs(status.reproduccion, DimensionEstado.DESCONOCIDO)
+
+    def test_reproduccion_con_medios_es_ok(self):
+        from thetvview.player.evidence import EvidenceLevel
+
+        status = classify_health(
+            [_snap_ctype(True)], player_alive=True, evidencia=EvidenceLevel.MEDIA_SEEN
+        )
+        self.assertIs(status.reproduccion, DimensionEstado.OK)
+
+    def test_reproductor_parado_es_falla_de_reproduccion(self):
+        status = classify_health([_snap_ctype(True)], player_alive=False)
+        self.assertIs(status.reproduccion, DimensionEstado.FALLA)
+
+    def test_sin_sondas_las_dimensiones_no_afirman(self):
+        status = classify_health([], player_alive=True)
+        self.assertIs(status.red, DimensionEstado.DESCONOCIDO)
+        self.assertIs(status.fuente, DimensionEstado.DESCONOCIDO)
+        self.assertIs(status.reproduccion, DimensionEstado.DESCONOCIDO)
+
+    def test_red_en_falla_es_nivel_cero(self):
+        snaps = [_snap_ctype(False, "application/vnd.apple.mpegurl")] * 3
+        status = classify_health(snaps, player_alive=True)
+        self.assertIs(status.red, DimensionEstado.FALLA)
+        self.assertEqual(status.level, 0)
+
+    def test_no_medible_no_se_puntua_como_falla(self):
+        """Un rtmp:// no cae por dimensión ninguna: no se ha medido nada."""
+        status = classify_health([_snap_ctype(None)], player_alive=True)
+        self.assertIs(status.red, DimensionEstado.DESCONOCIDO)
+        self.assertEqual(status.level, 3)
+
+    def test_las_dimensiones_son_aditivas(self):
+        """Los campos que la UI lee de siempre siguen intactos."""
+        status = classify_health(
+            [_snap_ctype(True, "video/mp2t")], player_alive=True
+        )
+        self.assertGreaterEqual(status.level, 4)
+        self.assertTrue(status.label)
+        self.assertTrue(status.bar)
+        self.assertTrue(status.summary)
+
+    def test_fuente_de_mimetipo(self):
+        casos = [
+            ("application/vnd.apple.mpegurl", DimensionEstado.OK),
+            ("application/dash+xml; charset=utf-8", DimensionEstado.OK),
+            ("video/mp2t", DimensionEstado.OK),
+            ("text/html", DimensionEstado.FALLA),
+            ("application/json", DimensionEstado.FALLA),
+            ("text/plain", DimensionEstado.DESCONOCIDO),
+            ("", DimensionEstado.DESCONOCIDO),
+            (None, DimensionEstado.DESCONOCIDO),
+        ]
+        for mime, esperado in casos:
+            with self.subTest(mime=mime):
+                self.assertIs(fuente_de_mimetipo(mime), esperado)
 
 
 if __name__ == "__main__":
