@@ -2646,6 +2646,7 @@ class NowPlayingScreen(Screen):
         intentos_maximos: int = 5,
         session=None,  # noqa: ANN001 - PlaybackSession | None
         es_vigente=None,  # noqa: ANN001 - Callable[[], bool] | None
+        al_medir=None,  # noqa: ANN001 - Callable[[Evidence], None] | None
     ) -> None:
         super().__init__(app)
         self.channel = channel
@@ -2715,6 +2716,10 @@ class NowPlayingScreen(Screen):
                     session=self.session,
                     is_vigente=es_vigente,
                     evidencia=self.evidencia,
+                    # H-01: la medición llega al observador de la sesión. Sin
+                    # él, «inicio confirmado» no puede ocurrir nunca, que es
+                    # preferible a que ocurra por otra razón.
+                    al_medir=al_medir,
                 )
                 self.supervisor.start(proc)
             except Exception:
@@ -3957,6 +3962,28 @@ def _registro_sesiones(app) -> SessionRegistry:  # noqa: ANN001
         return SessionRegistry()
 
 
+def _observar_sesion(app, sesion) -> None:  # noqa: ANN001
+    """Ata un :class:`ObservadorDeSesion` al bus de `app`, si lo hay (H-01).
+
+    Devuelve el observador para poder seguir dándole señales, sobre todo la
+    evidencia de :mod:`player.evidence`: sin ella, «inicio confirmado» no
+    puede ocurrir, porque ese suceso existe **precisamente** para no declarar
+    que algo suena sin comprobarlo.
+
+    Nunca lanza. Un bus que no se puede construir deja la reproducción igual,
+    que es lo que pasaba antes de este ticket.
+    """
+    bus = getattr(app, "eventos", None)
+    if bus is None:
+        return None
+    try:
+        from thetvview.diagnostics.session_events import observar
+
+        return observar(sesion, bus)
+    except Exception:  # noqa: BLE001 - diagnosticar no puede impedir ver
+        return None
+
+
 def _nada():  # noqa: ANN201 - context manager vacío, para el `with` condicional
     """Context manager que no hace nada.
 
@@ -4157,6 +4184,14 @@ def play_channel(  # noqa: ANN001
     # registrado, en vez de ser un `return` sin rastro (FR-PLAY-010).
     registro = _registro_sesiones(app)
     sesion = registro.start(_clave_canal(channel), player_name or "")
+    # H-01: la sesión nace **atada** al bus de eventos. Se ata aquí, y no más
+    # tarde, para que el fallo de un lanzamiento que ni siquiera ocurre
+    # deje rastro igual que el de uno que sí ocurrió.
+    #
+    # `getattr` defensivo: los tests montan pantallas con dobles que no son
+    # `App`, y sin bus no hay eventos — que es exactamente lo que se quiere
+    # cuando no hay bus.
+    observador = _observar_sesion(app, sesion)
     sesion.start()
     try:
         # Si el canal venía como referencia opaca de cámara, `resolved` lleva
@@ -4235,6 +4270,10 @@ def play_channel(  # noqa: ANN001
         intentos_maximos=reconnect_max_attempts,
         session=sesion,
         es_vigente=lambda: registro.is_current(sesion.session_id),
+        # H-01: la evidencia llega al observador, que es quien decide si lo
+        # medido basta para decir «está sonando». El supervisor no sabe qué
+        # hay al otro lado, y así `player` no depende de `diagnostics`.
+        al_medir=(observador.evidencia if observador is not None else None),
     ))
     app.prefs.set_last_player(effective_name)
     _recordar_reciente(app, canal_original, effective_name)

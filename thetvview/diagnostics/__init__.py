@@ -22,6 +22,12 @@ from .events import (
 )
 from .history import HistorialDiagnostico, RegistroHistorial, default_historial
 from .report import DESCONOCIDO, construir_informe, guardar_informe
+from .session_events import (
+    NIVEL_DE_INICIO,
+    ObservadorDeSesion,
+    observar,
+    tipo_de_evento,
+)
 from .taxonomy import (
     CODES_CONOCIDOS,
     MOTIVOS_CONOCIDOS,
@@ -37,10 +43,12 @@ __all__ = [
     "DEFAULT_MAX_EVENTS",
     "DESCONOCIDO",
     "MOTIVOS_CONOCIDOS",
+    "NIVEL_DE_INICIO",
     "Causa",
     "Event",
     "EventBus",
     "HistorialDiagnostico",
+    "ObservadorDeSesion",
     "RegistroHistorial",
     "Severity",
     "causa_de",
@@ -51,4 +59,6 @@ __all__ = [
     "explicacion_de",
     "guardar_informe",
     "nuevo_correlation_id",
+    "observar",
+    "tipo_de_evento",
 ]

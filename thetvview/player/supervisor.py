@@ -53,6 +53,7 @@ from .evidence import Evidence, EvidenceLevel, ProcessAliveSignal
 from .session import AttemptRecord, EndReason, PlaybackSession
 
 __all__ = [
+    "HitoDelBucle",
     "PlaybackState",
     "PlaybackProfile",
     "PROFILE_FLAGS",
@@ -68,6 +69,41 @@ __all__ = [
 #: Los cuatro segundos del §17, medidos. El último reintento espera 10 s; más
 #: allá no es «paciencia», es una app que parece colgada.
 DEFAULT_BACKOFF: tuple[int, ...] = (1, 2, 5, 10)
+
+
+class HitoDelBucle(str, Enum):
+    """Lo que el bucle del supervisor decide anotar en la sesión (H-01).
+
+    Deliberadamente **no** es el mismo enumerado que
+    :class:`~thetvview.player.session.EventoDeCiclo`. Son dos cosas distintas:
+    aquí están las decisiones del supervisor (el proceso volvió, se agotaron
+    los reintentos, el relanzamiento falló), y en ``player.session`` los sucesos
+    que la sesión emite. Un mismo nombre para las dos sería cómodo y sería un
+    error: «el proceso volvió» no es «se está viendo el canal».
+
+    Cerrado como está porque antes eran cadenas sueltas en siete llamadas a
+    ``_nota``, y una cadena escrita a mano no la valida nadie (H-01).
+    """
+
+    #: El proceso volvió a estar vivo.
+    REPRODUCIENDO = "reproduciendo"
+    #: Se está esperando antes del siguiente intento.
+    REINTENTADO = "reintentado"
+    #: La evidencia llegó al umbral de estabilidad.
+    ESTABLE = "estable"
+    #: Se observó un error de reproducción. La sesión puede seguir viva.
+    FALLO = "fallo"
+    #: Se acabaron los reintentos y la sesión termina.
+    AGOTADO = "agotado"
+    #: El error no es reintentable; la sesión termina.
+    PERMANENTE = "permanente"
+    #: El relanzamiento no devolvió proceso; la sesión termina.
+    REINTENTO_FALLIDO = "reintento_fallido"
+    #: El propio bucle falló; la sesión termina.
+    ERROR_INTERNO = "error_interno"
+
+    def __str__(self) -> str:  # pragma: no cover - comodidad de depuración
+        return self.value
 
 
 class PlaybackState(str, Enum):
@@ -384,6 +420,17 @@ class ReconnectSupervisor:
     #: conserva la tabla fija de :attr:`policy` (comportamiento de siempre).
     retry_policy: RetryPolicy | None = None
     al_cambiar: Callable[[PlaybackState, int], None] | None = None
+    #: Notificación de cada medición de evidencia, H-01.
+    #:
+    #: Es un ``Callable[[Evidence], None]`` y no el observador de diagnóstico
+    #: porque `player` no puede saber que existe un paquete `diagnostics`: la
+    #: dependencia va en un solo sentido, y el que sabe de las dos es la capa
+    #: de arriba. La UI le pasa ``ObservadorDeSesion.evidencia``.
+    #:
+    #: Existe para que «inicio confirmado» salga de una **medición** y no de
+    #: que el proceso esté vivo: es el suceso que existe precisamente para no
+    #: declarar que algo suena sin comprobarlo.
+    al_medir: Callable[[Evidence], None] | None = None
 
     def __post_init__(self) -> None:
         self.estado: PlaybackState = PlaybackState.CONNECTING
@@ -523,7 +570,7 @@ class ReconnectSupervisor:
                 if self._proceso_vivo():
                     if self.estado is not PlaybackState.PLAYING:
                         self._cambiar(PlaybackState.PLAYING)
-                        self._nota("reproduciendo")
+                        self._nota(HitoDelBucle.REPRODUCIENDO)
                     self._muestrear_evidencia()
                     self._stop.wait(self.poll_seconds)
                     continue
@@ -539,13 +586,19 @@ class ReconnectSupervisor:
                 # red llegan aquí igual y **no** pueden recibir el mismo trato.
                 fallo = self._clasificar()
                 self.ultimo_error = fallo
+                # Se anota el fallo **antes** de decidir si se reintenta: un
+                # corte del que la sesión se recupera es el dato que explica
+                # por qué se cortó, y si sólo se anotaran los finales, el
+                # informe contaría los Symptom finales y no las causas (H-01).
+                if fallo is not None:
+                    self._nota(HitoDelBucle.FALLO)
                 if fallo is not None and not retryable(getattr(fallo, "code", None)):
                     self._cambiar(PlaybackState.ERROR)
-                    self._nota("permanente")
+                    self._nota(HitoDelBucle.PERMANENTE)
                     return
                 if not self._puede_reintentar(fallo):
                     self._cambiar(PlaybackState.ERROR)
-                    self._nota("agotado")
+                    self._nota(HitoDelBucle.AGOTADO)
                     return
                 self.intentos += 1
                 self.reconexiones += 1
@@ -562,15 +615,15 @@ class ReconnectSupervisor:
                 nuevo = self._relanzar()
                 if nuevo is None:
                     self._cambiar(PlaybackState.ERROR)
-                    self._nota("reintento_fallido")
+                    self._nota(HitoDelBucle.REINTENTO_FALLIDO)
                     return
                 with self._candado:
                     self.proceso = nuevo
                 self._cambiar(PlaybackState.CONNECTING)
-                self._nota("reintentado")
+                self._nota(HitoDelBucle.REINTENTADO)
         except Exception:  # noqa: BLE001 - un hilo supervisor nunca tumba la app
             self._cambiar(PlaybackState.ERROR)
-            self._nota("error_interno")
+            self._nota(HitoDelBucle.ERROR_INTERNO)
 
     def _es_vigente(self) -> bool:
         """¿Sigue vigente la sesión que observa este supervisor?
@@ -588,8 +641,20 @@ class ReconnectSupervisor:
             return True
         return not self.session.ended
 
-    def _nota(self, evento: str) -> None:
+    def _nota(self, hito: HitoDelBucle) -> None:
         """Anota un hito del bucle en la sesión. Sin sesión, no hace nada.
+
+        El parámetro es un :class:`HitoDelBucle`, no una cadena. Antes eran
+        cadenas repartidas por un ``if/elif`` de siete ramas, y eso es
+        exactamente el olor que H-02 cierra en el resto del proyecto: un
+        ``"permanente"`` escrito a mano es un nombre que nada valida, que
+        nadie traduce y que puede cambiar sin que nadie lo note.
+
+        Son **dos** vocabularios y no uno, porque son dos cosas: `HitoDelBucle`
+        son las decisiones que toma el supervisor, y
+        :class:`~thetvview.player.session.EventoDeCiclo` son los sucesos que
+        emite la sesión. Cada hito produce exactamente un suceso, y el mapeo
+        está en un sitio.
 
         Los fallos de la anotación **se tragan**: un registro que revienta no
         puede tumbar el hilo del supervisor ni cambiar la recuperación.
@@ -598,22 +663,27 @@ class ReconnectSupervisor:
         if sesion is None:
             return
         try:
-            if evento == "reproduciendo":
+            if hito is HitoDelBucle.REPRODUCIENDO:
                 sesion.playing()
-            elif evento == "reintentado":
+            elif hito is HitoDelBucle.REINTENTADO:
                 sesion.nuevo_intento()
-            elif evento == "estable":
+            elif hito is HitoDelBucle.ESTABLE:
                 sesion.note_stable()
-            elif evento == "agotado":
+            elif hito is HitoDelBucle.FALLO:
+                # El error se anota **aunque** la sesión siga viva: un corte
+                # del que se recuperó es el dato que explica por qué tardó, y
+                # sin él el informe sólo cuenta los finales.
+                sesion.nota_fallo(self.ultimo_error)
+            elif hito is HitoDelBucle.AGOTADO:
                 sesion.end(EndReason.RETRIES_EXHAUSTED, "se agotaron los reintentos")
-            elif evento == "permanente":
+            elif hito is HitoDelBucle.PERMANENTE:
                 sesion.end(
                     EndReason.PLAYBACK_ERROR,
                     getattr(self.ultimo_error, "resumen", "") or "error permanente",
                 )
-            elif evento == "reintento_fallido":
+            elif hito is HitoDelBucle.REINTENTO_FALLIDO:
                 sesion.end(EndReason.PLAYBACK_ERROR, "el relanzamiento falló")
-            elif evento == "error_interno":
+            elif hito is HitoDelBucle.ERROR_INTERNO:
                 sesion.end(EndReason.INTERNAL_ERROR, "fallo en el supervisor")
         except Exception:  # noqa: BLE001 - anotar nunca rompe la recuperación
             pass
@@ -684,7 +754,11 @@ class ReconnectSupervisor:
         fuente = self.evidencia
         if fuente is None:
             # Sin fuente declarada, el único hecho comprobable es que existe.
-            self.evidencia_actual = ProcessAliveSignal().sample()
+            # Se avisa igualmente: `PROCESS_ALIVE` es un dato, y quien escuche
+            # puede decidir por su cuenta si le basta (H-01).
+            medida = ProcessAliveSignal().sample()
+            self.evidencia_actual = medida
+            self._avisar_medida(medida)
             return
         ahora = time.monotonic()
         if ahora < self._proxima_evidencia:
@@ -704,10 +778,27 @@ class ReconnectSupervisor:
         # no se puede comprobar **es** información.
         if medida.level is not EvidenceLevel.NONE:
             self.evidencia_actual = medida
+        # La medición se avisa **antes** de decidir por el nivel: quien la
+        # escucha puede tener una regla distinta y así no depende de cuándo se
+        # mire aquí (H-01).
+        self._avisar_medida(medida)
         if medida.estable:
             if self.intentos:
                 self.intentos = 0
-            self._nota("estable")
+            self._nota(HitoDelBucle.ESTABLE)
+
+    def _avisar_medida(self, medida: Evidence) -> None:
+        """Notifica una medición a `al_medir`. Nunca lanza.
+
+        Traga las excepciones por el mismo motivo que `_avisar`: un oyente
+        roto no puede cambiar lo que el supervisor decide hacer.
+        """
+        if self.al_medir is None:
+            return
+        try:
+            self.al_medir(medida)
+        except Exception:  # noqa: BLE001 - el observador no rompe al supervisor
+            pass
 
     def _relanzar(self) -> object | None:
         if self.relanzar is None:

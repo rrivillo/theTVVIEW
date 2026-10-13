@@ -1460,6 +1460,138 @@ def check_historial_migracion_v2() -> str:
             "escribir_como(1) verificado, source_id opaco en disco")
 
 
+def check_historial_eventos_ciclo_vida() -> str:
+    """H-01: los sucesos de reproducción dejan rastro, y no se inventan.
+
+    El bus de eventos existía con el contrato entero del §3.3 y **cero**
+    ``emit()`` en producción: el informe tenía un formato y ningún suceso que
+    lo llenara. Este control comprueba que ahora hay cableado, y sobre todo
+    que el cableado no miente:
+
+    1. **Existe.** `play_channel` ata la sesión al bus y un ciclo completo
+       deja intento, lanzamiento, fin con su motivo y su duración.
+    2. **«Inicio confirmado» se gana.** Sólo sale de una medición
+       :class:`Evidence` de nivel ``MEDIA_SEEN`` o superior. Un proceso vivo,
+       una fuente aceptada o un ``UNKNOWN`` **no** lo producen: son hechos
+       distintos y decir «está sonando» con ellos sería mentir.
+    3. **Un fallo sale de la taxonomía.** Su ``reason_code`` y su
+       ``retryable`` vienen de ``StreamError``, nunca inventados.
+    4. **Un oyente roto no tumba la reproducción** y **anota** el fallo, para
+       que no desaparezca en silencio.
+    5. **Ningún evento lleva la URL del canal.**
+    """
+    from thetvview.diagnostics.events import EventBus
+    from thetvview.diagnostics.session_events import (
+        NIVEL_DE_INICIO,
+        ObservadorDeSesion,
+        tipo_de_evento,
+    )
+    from thetvview.player.errors import StreamError, StreamErrorCode
+    from thetvview.player.evidence import Evidence, EvidenceLevel
+    from thetvview.player.session import EndReason, EventoDeCiclo, PlaybackSession
+
+    # --- (2) El nivel que confirma ----------------------------------------
+    _require(NIVEL_DE_INICIO is EvidenceLevel.MEDIA_SEEN,
+             "«inicio confirmado» no exige evidencia de medios")
+    for nivel in EvidenceLevel:
+        bus = EventBus()
+        sesion = PlaybackSession(channel_key="d.1", player_name="mpv")
+        observador = ObservadorDeSesion(bus, sesion=sesion)
+        sesion.oyente = observador
+        observador.evidencia(Evidence(level=nivel, reason="check"))
+        confirma = sesion.first_media_at is not None
+        debe = nivel.comproblable and nivel.rank >= NIVEL_DE_INICIO.rank
+        _require(confirma == debe,
+                 f"el nivel {nivel.value} da «inicio confirmado»={confirma} "
+                 f"cuando debería ser {debe}")
+
+    # --- (2 bis) Y entrar en PLAYING no lo produce -------------------------
+    # El sabotaje que este control tenía que cazar: hacer que `playing()` —
+    # que sólo significa «el proceso está vivo»— emita «inicio confirmado».
+    bus = EventBus()
+    sesion = PlaybackSession(channel_key="d.1", player_name="mpv")
+    sesion.oyente = ObservadorDeSesion(bus, sesion=sesion)
+    sesion.start()
+    sesion.launched()
+    sesion.playing()
+    sesion.end(EndReason.USER_STOPPED)
+    tipos_sin_medir = [e.event_type for e in bus.events()]
+    _require("playback.lanzado" in tipos_sin_medir,
+             "sin evidencia tampoco debe faltar el lanzamiento")
+    _require(tipo_de_evento(EventoDeCiclo.INICIO_CONFIRMADO) not in tipos_sin_medir,
+             "entrar en PLAYING declara que se está viendo el canal sin "
+             "ninguna evidencia: eso es mentir")
+
+    # --- (3) El fallo sale de la taxonomía -------------------------------
+    bus = EventBus()
+    sesion = PlaybackSession(channel_key="d.1", player_name="mpv")
+    sesion.oyente = ObservadorDeSesion(bus, sesion=sesion)
+    for codigo in StreamErrorCode:
+        sesion.nota_fallo(StreamError(code=codigo, resumen="x",
+                                      observado=f"rc={codigo.value}"))
+    fallos = [e for e in bus.events() if e.event_type == "playback.fallo"]
+    _require(len(fallos) == len(StreamErrorCode),
+             "no salió un evento de fallo por cada código")
+    for evento, codigo in zip(fallos, StreamErrorCode):
+        _require(evento.reason_code == codigo.value,
+                 f"el fallo de {codigo.value} dice {evento.reason_code}")
+        _require(evento.retryable == codigo.reintentable,
+                 f"el fallo de {codigo.value} no lleva la política de reintento")
+
+    # --- (1) y (4) Un ciclo completo --------------------------------------
+    class _BusRoto:
+        def emit(self, evento):  # noqa: ANN001, ANN201
+            raise RuntimeError("el bus está en llamas")
+
+        def events(self):  # noqa: ANN201
+            return []
+
+    bus = EventBus()
+    # Se construye con una URL con credenciales y luego se le deja sólo la
+    # clave: si algo se colara, el evento llevaría el userinfo y salta aquí.
+    sesion = PlaybackSession(
+        channel_key="http://u:secreto@proveedor.test/live/d/1.ts", player_name="mpv"
+    )
+    sesion.channel_key = "d.1"
+    sesion.oyente = ObservadorDeSesion(bus, sesion=sesion)
+    sesion.start()
+    sesion.nuevo_intento()
+    sesion.launched()
+    sesion.note_first_media()
+    sesion.nota_fallo(StreamError(code=StreamErrorCode.NETWORK_ERROR,
+                                  resumen="x", observado="cerrada"))
+    sesion.playing()
+    sesion.end(EndReason.USER_STOPPED, "paró el usuario")
+    tipos = [e.event_type for e in bus.events()]
+    for suceso in (EventoDeCiclo.LANZADO, EventoDeCiclo.INTENTO,
+                   EventoDeCiclo.INICIO_CONFIRMADO, EventoDeCiclo.FALLO,
+                   EventoDeCiclo.FIN):
+        _require(tipo_de_evento(suceso) in tipos,
+                 f"un ciclo completo no dejó rastro de {suceso.value}")
+    fin = next(e for e in bus.events() if e.event_type == "playback.fin")
+    _require(fin.reason_code == EndReason.USER_STOPPED.value,
+             "el evento de fin no lleva su motivo")
+    _require("duracion_viva_s" in fin.details, "el evento de fin no lleva duración")
+
+    # --- (5) Ningún evento lleva la URL ------------------------------------
+    crudo = str([e.to_dict() for e in bus.events()])
+    _require("secreto" not in crudo and "proveedor.test" not in crudo,
+             "un evento de reproducción lleva la URL del canal")
+
+    # --- (4) Un bus roto no tumba la sesión --------------------------------
+    sesion2 = PlaybackSession(channel_key="d.1", player_name="mpv")
+    observador2 = ObservadorDeSesion(_BusRoto(), sesion=sesion2)
+    sesion2.oyente = observador2
+    sesion2.start()
+    sesion2.end(EndReason.CANCELLED)
+    _require(sesion2.ended, "un bus roto tumbó la sesión de reproducción")
+    _require(observador2.errores, "el fallo del bus no quedó anotado en ningún sitio")
+
+    return ("ciclo completo con 5 sucesos; «inicio confirmado» exige "
+            f"{NIVEL_DE_INICIO.value}; un bus roto deja {len(observador2.errores)} "
+            "error anotado sin tumbar la sesión")
+
+
 # ---------------------------------------------------------------------------
 # Registro
 # ---------------------------------------------------------------------------
@@ -1619,6 +1751,8 @@ CHECKS: tuple[tuple[str, str, Callable[[], str]], ...] = (
      check_historial_taxonomia_unica),
     ("historial_migracion_v2", "History schema v2 migration",
      check_historial_migracion_v2),
+    ("historial_eventos_ciclo", "Playback lifecycle events",
+     check_historial_eventos_ciclo_vida),
 )
 
 

@@ -74,6 +74,8 @@ __all__ = [
     "SessionState",
     "SessionPhase",
     "EndReason",
+    "EventoDeCiclo",
+    "SUCESOS_DE_PROBLEMA",
     "AttemptRecord",
     "PlaybackSession",
     "TransitionError",
@@ -196,6 +198,55 @@ class EndReason(str, Enum):
 
     def __str__(self) -> str:  # pragma: no cover
         return self.value
+
+
+class EventoDeCiclo(str, Enum):
+    """Los sucesos del ciclo de vida de una sesión, con nombre cerrado (H-01).
+
+    Vive aquí, y no en el módulo que los consume, porque hay **tres** capas que
+    necesitan hablar de lo mismo: la sesión que lo produce, el supervisor que
+    decide cuándo, y el diagnóstico que lo escribe. Con una cadena suelta
+    cada capa tendría su propia palabra para el mismo suceso —y el supervisor
+    de hecho las tenía: ``_nota("reproducendo")`` repartía texto por un
+    ``if/elif``— y nadie detectaría el desacuerdo porque todas serían
+    «nombres válidos».
+
+    Con un enum no se puede escribir un suceso que no exista, y añadir uno es
+    un cambio visible en un solo sitio.
+
+    El orden de los miembros no significa nada; sólo los valores.
+    """
+
+    #: Se registró un intento de reproducción (el 1, el 2, el relanzamiento).
+    INTENTO = "intento"
+    #: El proceso arrancó. Hecho comprobado: el proceso existe.
+    LANZADO = "lanzado"
+    #: Llegó medio de verdad (FR-REC-001). **Exige evidencia**, no un proceso vivo.
+    INICIO_CONFIRMADO = "inicio_confirmado"
+    #: Reproducción estable tras el umbral de segundos continuos.
+    ESTABLE = "estable"
+    #: Se cortó durante la reproducción.
+    INTERRUMPIDO = "interrumpido"
+    #: Volvió después de un corte.
+    RECUPERADO = "recuperado"
+    #: Se observó un fallo, con su código y su hecho observado.
+    FALLO = "fallo"
+    #: Cambió la lista de la que viene el canal.
+    CAMBIO_DE_FUENTE = "cambio_de_fuente"
+    #: Cambió el reproductor con el que se está viendo.
+    CAMBIO_DE_REPRODUCTOR = "cambio_de_reproductor"
+    #: La sesión terminó. El motivo va en ``reason_code`` (H-02).
+    FIN = "fin"
+
+    def __str__(self) -> str:  # pragma: no cover - comodidad de depuración
+        return self.value
+
+
+#: Los sucesos que son un problema. Lo demás es el ciclo normal, y el
+#: informe de un ciclo normal en verde no es una sorpresa.
+SUCESOS_DE_PROBLEMA: frozenset[EventoDeCiclo] = frozenset(
+    {EventoDeCiclo.INTERRUMPIDO, EventoDeCiclo.FALLO}
+)
 
 
 #: Estados desde los que no se vuelve a uno activo (invariante §4.2).
@@ -383,6 +434,16 @@ class PlaybackSession:
     #: Recursos con dueño. Se rellena en cuanto se adquiere cada uno.
     resources: "ResourceScope" = field(default_factory=lambda: ResourceScope())
 
+    #: Último fallo observado, con su código y su hecho (H-01). ``None`` si
+    #: esta sesión no ha tenido ninguno: no se inicializa con un ``UNKNOWN``
+    #: porque «no ha fallado» y «falló y no sabemos por qué» son cosas
+    #: distintas, y confundirlas hace que un canal sano parezca dudoso.
+    fallo: object = field(default=None, repr=False)
+    #: Quien quiere enterarse de los sucesos del ciclo (H-01). Se llama con
+    #: ``(sesion, EventoDeCiclo)`` y **sus excepciones se tragan**: un bus de
+    #: diagnóstico roto no puede tumbar la reproducción del usuario.
+    oyente: object = field(default=None, repr=False, compare=False)
+
     #: Reloj inyectable (monotónico). Los tests lo fijan; la app no.
     _reloj: object = field(default=None, repr=False, compare=False)
     _candado: threading.RLock = field(
@@ -436,6 +497,7 @@ class PlaybackSession:
             transition(self, SessionState.STARTING)
             self.phase = SessionPhase.LANZAMIENTO
             self.launch_started_at = self.launch_started_at or _ahora()
+        self.notificar(EventoDeCiclo.LANZADO)
         return self
 
     def launched(self) -> "PlaybackSession":
@@ -443,13 +505,25 @@ class PlaybackSession:
         with self._candado:
             self.process_started_at = self.process_started_at or _ahora()
             self.phase = SessionPhase.CONFIRMACION
+        self.notificar(EventoDeCiclo.LANZADO)
         return self
 
     def playing(self) -> "PlaybackSession":
-        """`STARTING`/`RECOVERING` → `PLAYING`."""
+        """`STARTING`/`RECOVERING` → `PLAYING`.
+
+        **No** emite «inicio confirmado»: entrar en `PLAYING` sólo quiere decir
+        que el proceso está vivo (FR-REC-001), y eso no es lo mismo que estar
+        viendo el canal. Ese suceso sale de :meth:`note_first_media`, que sólo
+        se llama con evidencia comprobada. Sólo el regreso desde
+        `RECOVERING` genera un suceso propio, porque es un hecho que ya no se
+        puede deducir del estado.
+        """
         with self._candado:
+            estaba_recuperando = self.interruption_at is not None
             transition(self, SessionState.PLAYING)
             self.phase = SessionPhase.SUPERVISION
+        if estaba_recuperando:
+            self.notificar(EventoDeCiclo.RECUPERADO)
         return self
 
     def recovering(self) -> "PlaybackSession":
@@ -458,19 +532,78 @@ class PlaybackSession:
             transition(self, SessionState.RECOVERING)
             self.phase = SessionPhase.RECUPERACION
             self.interruption_at = self.interruption_at or _ahora()
+        self.notificar(EventoDeCiclo.INTERRUMPIDO)
         return self
 
     def note_first_media(self) -> "PlaybackSession":
         """Primera evidencia de medios (`first_media_at`), sólo la primera vez."""
         with self._candado:
+            primera = self.first_media_at is None
             self.first_media_at = self.first_media_at or _ahora()
+        if primera:
+            self.notificar(EventoDeCiclo.INICIO_CONFIRMADO)
         return self
 
     def note_stable(self) -> "PlaybackSession":
         """Reproducción estable (`stable_playback_at`), sólo la primera vez."""
         with self._candado:
+            primera = self.stable_playback_at is None
             self.stable_playback_at = self.stable_playback_at or _ahora()
+        if primera:
+            self.notificar(EventoDeCiclo.ESTABLE)
         return self
+
+    def nota_fallo(self, fallo: object = None) -> "PlaybackSession":
+        """Anota un fallo observado (H-01) y lo deja en la sesión.
+
+        `fallo` es un :class:`~thetvview.player.errors.StreamError` o ``None``.
+        ``None`` significa **que no se sabe la causa**, no que no haya pasado
+        nada: por eso el evento sale sin ``reason_code`` en vez de inventar uno.
+        """
+        with self._candado:
+            self.fallo = fallo
+            intento = self.intento_actual
+            if intento is not None:
+                intento.resultado = str(
+                    getattr(fallo, "code", "") or ""
+                )
+        self.notificar(EventoDeCiclo.FALLO)
+        return self
+
+    def nota_cambio_de_fuente(self, source_id: str) -> "PlaybackSession":
+        """El canal pasa a venir de otra lista (H-01)."""
+        self.notificar(EventoDeCiclo.CAMBIO_DE_FUENTE, {"source_id": str(source_id)})
+        return self
+
+    def nota_cambio_de_reproductor(self, player_name: str) -> "PlaybackSession":
+        """Se cambia el reproductor con el que se está viendo (H-01).
+
+        El nombre nuevo pasa a ser el de la sesión, de modo que los sucesos
+        siguientes llevan el motor que realmente está sonando.
+        """
+        nuevo = str(player_name or "")
+        if nuevo:
+            self.player_name = nuevo
+        self.notificar(EventoDeCiclo.CAMBIO_DE_REPRODUCTOR, {"player": nuevo})
+        return self
+
+    def notificar(
+        self, evento: "EventoDeCiclo", detalles: dict | None = None
+    ) -> None:
+        """Avisa al :attr:`oyente` de un suceso del ciclo. Nunca lanza.
+
+        Se traga las excepciones del oyente a propósito. La alternativa —dejar
+        que el bus reviente— convertiría un problema de diagnóstico en una
+        sesión de reproducción muerta: se pierde el canal abierto, no sólo la
+        traza.
+        """
+        oyente = self.oyente
+        if oyente is None:
+            return
+        try:
+            oyente(self, evento, detalles or {})
+        except Exception:  # noqa: BLE001 - un oyente roto no tumba la sesión
+            pass
 
     def end(
         self,
@@ -510,11 +643,23 @@ class PlaybackSession:
             if intento is not None and intento.ended_at is None:
                 intento.ended_at = self.ended_at
                 intento.end_reason = reason
+            # `duracion_viva` siempre se sabe; `duracion_reproduccion` sólo
+            # si llegó a verse algo, y por eso se omite en vez de ir en cero:
+            # cero significaría «se cortó al instante de abrir».
+            duracion = self.duracion_viva()
+            reproduccion = self.duracion_reproduccion()
+        # Fuera del candado: avisar puede hacer trabajo de verdad (escribir en
+        # el bus) y `close_all` llama a liberadores externos. Con el candado
+        # tomado, un oyente lento bloquearía a quien sólo consulta el estado.
+        medidas: dict = {"duracion_viva_s": duracion}
+        if reproduccion is not None:
+            medidas["duracion_reproduccion_s"] = reproduccion
+        self.notificar(EventoDeCiclo.FIN, medidas)
         if release:
-            # Fuera del candado: los `release` de recursos son llamadas
-            # externas (parar un proxy, borrar un socket) y no deben hacerse
-            # con el candado de la sesión tomado: un `release` lento
-            # bloquearía a quien sólo quiere consultar el estado.
+            # Los `release` de recursos son llamadas externas (parar un proxy,
+            # borrar un socket) y no deben hacerse con el candado de la sesión
+            # tomado: un `release` lento bloquearía a quien sólo quiere
+            # consultar el estado.
             self.resources.close_all()
         return self
 
@@ -542,7 +687,12 @@ class PlaybackSession:
                 espera_previa=max(0.0, float(espera_previa)),
             )
             self.attempts.append(registro)
-            return registro
+            espera = registro.espera_previa
+        self.notificar(
+            EventoDeCiclo.INTENTO,
+            {"intento": registro.index, "espera_previa_s": espera},
+        )
+        return registro
 
     # -- recursos -------------------------------------------------------------
 

@@ -41,6 +41,7 @@ __all__ = [
     "Causa",
     "causa_de",
     "causa_de_codigo",
+    "causa_de_motivo",
     "codigo_de",
     "es_razon_conocida",
     "explicacion_de",
@@ -62,6 +63,11 @@ MOTIVOS_CONOCIDOS: frozenset[str] = CODES_CONOCIDOS | frozenset(
 
 #: Índice inverso para no recorrer el enum en cada resolución.
 _POR_VALOR: dict[str, StreamErrorCode] = {c.value: c for c in StreamErrorCode}
+
+#: Los motivos de cierre, por su valor. No son códigos de error y no entran
+#: en :func:`codigo_de`: son otro vocabulario con otro significado, y mezclarlos
+#: haría que «lo paró el usuario» se pudiera leer como «error de red».
+_FINAL: frozenset[str] = frozenset(m.value for m in EndReason)
 
 
 def codigo_de(valor: object) -> StreamErrorCode | None:
@@ -172,6 +178,22 @@ class Causa:
 def causa_de(fallo: "StreamError | None") -> Causa:
     """Causa de un fallo del reproductor. Sin fallo, causa vacía."""
     return Causa.desde(fallo)
+
+
+def causa_de_motivo(motivo: object) -> Causa:
+    """Causa a partir de un :class:`EndReason`, no de un error de red.
+
+    Un motivo de cierre no viene con hecho observado ni con política de
+    reintento: «lo detuviste tú» no se reintenta, pero tampoco es un fallo que
+    haya que arreglar. Por eso :attr:`Causa.recoverable` queda en ``None``
+    —no se pronuncia— en vez de en ``False``, que affirmaría que se comprobó
+    que no sirve.
+    """
+    if isinstance(motivo, EndReason):
+        return Causa(reason_code=motivo.value, recoverable=None)
+    if isinstance(motivo, str) and motivo.strip() in _FINAL:
+        return Causa(reason_code=motivo.strip(), recoverable=None)
+    return Causa()
 
 
 def causa_de_codigo(codigo: object) -> Causa:
