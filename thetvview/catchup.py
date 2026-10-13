@@ -36,6 +36,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 from urllib.parse import quote, unquote
 
+from .player.errors import StreamErrorCode
 from .security.errors import IPTVError
 
 if TYPE_CHECKING:  # pragma: no cover - sólo tipado
@@ -81,6 +82,10 @@ __all__ = [
     "validar_intervalo",
     "MAX_TEMPLATE_LENGTH",
     "MAX_TEMPLATE_VALUE_LENGTH",
+    "StreamErrorCode",
+    "describe_unavailable",
+    "texto_indisponibilidad",
+    "explicar_estado",
 ]
 
 
@@ -240,6 +245,28 @@ class CatchupState(Enum):
     #: ``OUTSIDE_ARCHIVE_WINDOW`` porque la reacción es otra (informar del dato,
     #: no esperar a que vuelva la copia).
     INVALID_INTERVAL = "invalid_interval"
+
+    # --- Estados de indisponibilidad (CU-04) --------------------------------
+    #
+    # Antes había un único `ERROR` para todo lo que falla, y el modal decía
+    # «la reproducción falló»: cierto y vacío. El usuario no podía saber si
+    # reintentar, recargar credenciales, esperar la red o rendirse. Estos
+    # estados separan las causas que el proyecto **ya sabe distinguir**, sin
+    # inventar ninguna: se traducen desde `player.errors.StreamErrorCode`.
+
+    #: El proveedor respondió y el archivo no está. Es «no está», no «no sé».
+    NOT_AVAILABLE = "not_available"
+    #: 401/403: las credenciales están malas o caducaron.
+    AUTH_FAILED = "auth_failed"
+    #: No se pudo ni conectar: DNS, conexión rechazada, sin respuesta.
+    NETWORK = "network"
+    #: Algo falló y no hay evidencia para distinguir la causa.
+    UNKNOWN = "unknown"
+    #: El usuario paró, no es un fallo del canal.
+    CANCELLED = "cancelled"
+    #: El motor no pudo reproducirlo. El archivo puede estar perfectamente.
+    PLAYER = "player"
+
     LOADING = "loading"
     PLAYING = "playing"
     ERROR = "error"
@@ -966,6 +993,148 @@ def render_source_template(template: str, request: CatchupRequest) -> str:
             "instante; no se intenta construir la dirección."
         )
     return CatchupAdapter._validate_playable("".join(chunks))
+
+
+# ---------------------------------------------------------------------------
+# Indisponibilidad distinguida (CU-04)
+# ---------------------------------------------------------------------------
+
+#: De cada estado de indisponibilidad, qué se le puede decir al usuario.
+#:
+#: La regla es que cada mensaje **cambie lo que el usuario hace**: recargar
+#: credenciales no es esperar la red, y rendirse no es reintentar. Un texto
+#: genérico que valiera para todos no informaría de nada.
+_INDISPONIBILIDAD: dict["CatchupState", str] = {
+    CatchupState.NOT_AVAILABLE: (
+        "El proveedor dice que este contenido ya no está en su archivo. Puede "
+        "que lo hayan borrado o que la copia nunca llegara a guardarse."
+    ),
+    CatchupState.AUTH_FAILED: (
+        "El proveedor rechazó tus credenciales al pedir el archivo. Vuelve a "
+        "guardar el usuario y la contraseña de esa lista e inténtalo otra vez."
+    ),
+    CatchupState.NETWORK: (
+        "No se pudo conectar con el servidor para pedir el archivo. Puede ser "
+        "que esté caído o que tu red no llegue; el directo tampoco funcionará "
+        "mientras tanto."
+    ),
+    CatchupState.UNKNOWN: (
+        "El archivo no se pudo reproducir y no se sabe por qué: el motor no "
+        "dijo un motivo que se pueda interpretar. Puedes volver a intentarlo, "
+        "pero si falla otra vez conviene revisar la lista."
+    ),
+    CatchupState.CANCELLED: (
+        "Cancelaste antes de que empezara la reproducción, así que no se pidió "
+        "el archivo."
+    ),
+    CatchupState.PLAYER: (
+        "El archivo se pidió bien, pero el reproductor no pudo reproducirlo. "
+        "Prueba con otro motor en la ayuda del reproductor."
+    ),
+}
+
+#: Códigos de red: no hubo conexión con el servidor. Traducidos, nunca
+#: inventados: son los que `player.errors` ya clasifica así.
+_CODIGOS_DE_RED: frozenset[object] = frozenset(
+    {
+        StreamErrorCode.CONNECTION_FAILED,
+        StreamErrorCode.CONNECTION_TIMEOUT,
+        StreamErrorCode.DNS,
+        StreamErrorCode.NETWORK_ERROR,
+        StreamErrorCode.TLS_FAILED,
+    }
+)
+
+#: El proveedor respondió y el contenido no está. Ojo: `SERVER_ERROR` entra
+#: aquí porque un 500 al pedir una copia archivada significa, para el usuario,
+#: lo mismo que un 404 — no la tiene — y separarlos llevaría a un
+#: consejo que no sirve («vuelve a intentarlo» sobre un archivo borrado).
+_CODIGOS_NO_DISPONIBLE: frozenset[object] = frozenset(
+    {
+        StreamErrorCode.NOT_FOUND,
+        StreamErrorCode.SERVER_ERROR,
+        StreamErrorCode.MANIFEST_INVALID,
+        StreamErrorCode.MEDIA_DEMUX,
+    }
+)
+
+#: El motor falló, no el canal. El archivo puede estar perfectamente.
+_CODIGOS_DEL_MOTOR: frozenset[object] = frozenset(
+    {
+        StreamErrorCode.PLAYER_MISSING,
+        StreamErrorCode.PLAYER_STARTUP,
+        StreamErrorCode.PLAYER_EXIT,
+        StreamErrorCode.CODEC_UNSUPPORTED,
+        StreamErrorCode.INVALID_URL,
+        StreamErrorCode.UNSUPPORTED_PROTOCOL,
+        StreamErrorCode.TRACK_SELECTION,
+        StreamErrorCode.BUFFERING_TIMEOUT,
+    }
+)
+
+
+def describe_unavailable(
+    codigo: "StreamErrorCode | str | None",
+) -> CatchupState:
+    """Traduce un error observado al estado de indisponibilidad (CU-04).
+
+    **Traduce, no decide.** La única fuente de verdad sobre qué falló es
+    :class:`thetvview.player.errors.StreamErrorCode`; este módulo no mantiene
+    una lista paralela de errores (sería una segunda taxonomía, que el DoD
+    prohíbe explícitamente).
+
+    Todo lo que no venga de ahí —un texto suelto, un ``None``, un código
+    desconocido— es :attr:`CatchupState.UNKNOWN`. Es la regla del proyecto:
+    *desconocido no es falso*. Ante la duda se dice que no se sabe, no que fue
+    la red.
+
+    Args:
+        codigo: código de la taxonomía del reproductor, o algo que no lo sea.
+
+    Returns:
+        El estado correspondiente; nunca lanza.
+    """
+    if codigo is None:
+        return CatchupState.UNKNOWN
+    try:
+        valor = StreamErrorCode(codigo) if not isinstance(codigo, StreamErrorCode) else codigo
+    except (ValueError, TypeError):
+        # Un texto suelto o un código de otra versión: no se clasifica.
+        return CatchupState.UNKNOWN
+    if valor is StreamErrorCode.CANCELLED:
+        return CatchupState.CANCELLED
+    if valor is StreamErrorCode.AUTH_FAILED:
+        return CatchupState.AUTH_FAILED
+    if valor in _CODIGOS_DE_RED:
+        return CatchupState.NETWORK
+    if valor in _CODIGOS_NO_DISPONIBLE:
+        return CatchupState.NOT_AVAILABLE
+    if valor in _CODIGOS_DEL_MOTOR:
+        return CatchupState.PLAYER
+    return CatchupState.UNKNOWN
+
+
+def texto_indisponibilidad(estado: CatchupState) -> str:
+    """El texto explicativo de un estado de indisponibilidad.
+
+    Dirección inversa de :func:`describe_unavailable`: aquí se va del estado al
+    mensaje. Un estado sin texto propio (los que describe
+    :func:`describe_state`, como ``OUTSIDE_ARCHIVE_WINDOW``) devuelve el texto
+    genérico de :func:`describe_state` en vez de inventar uno.
+    """
+    texto = _INDISPONIBILIDAD.get(estado)
+    if texto is not None:
+        return texto
+    return describe_state(estado)
+
+
+def explicar_estado(estado: CatchupState) -> CatchupError:
+    """El texto de un estado de indisponibilidad, como error del dominio.
+
+    Existe para que la UI pueda lanzar el mensaje al modal con el mismo tipo
+    que el resto de fallos de catch-up, sin conocer el diccionario.
+    """
+    return CatchupError(texto_indisponibilidad(estado))
 
 
 # ---------------------------------------------------------------------------
