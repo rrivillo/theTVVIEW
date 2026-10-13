@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "entradas": [
+    {"momento": 1767225600.0, "canal": "espanol.espn", "exito": true, "motivo": "READY", "fase": "diagnose"},
+    {"momento": 1767229200.0, "canal": "espanol.espn", "exito": false, "motivo": "SIN REPRODUCTOR", "fase": "diagnose"},
+    {"momento": 1767232800.0, "canal": "espn.com", "exito": false, "motivo": "REFERENCIA OPACA", "fase": "diagnose"},
+    {"momento": 1767236400.0, "canal": "espn.com", "exito": false, "motivo": "SIN REPRODUCTOR", "fase": "diagnose"},
+    {"momento": 1767240000.0, "canal": "cine Fox", "exito": true, "motivo": "", "fase": ""},
+    {"momento": 1767243600.0, "canal": "la 1", "exito": true, "motivo": "READY", "fase": "diagnose"},
+    {"momento": 1767247200.0, "canal": "la 1", "exito": false, "motivo": "SIN REPRODUCTOR", "fase": "diagnose"},
+    {"momento": 1767250800.0, "canal": "la 1", "exito": false, "motivo": "SIN REPRODUCTOR", "fase": "diagnose"},
+    {"momento": 1767254400.0, "canal": "la 1", "exito": true, "motivo": "READY", "fase": "diagnose"}
+  ]
+}

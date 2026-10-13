@@ -1365,6 +1365,101 @@ def check_persistence_atomic() -> str:
             "migración v0→v1 idempotente")
 
 
+def check_historial_migracion_v2() -> str:
+    """H-03: el historial se migra a la v2 sin perder nada y sin filtrar.
+
+    Tres cosas que un ``json.dump`` no garantiza por sí solo:
+
+    1. **El identificador de fuente no llega a disco en crudo.** El real es
+       ``xtream|<panel>|<url>|<usuario>``: la URL y el usuario son justo lo
+       que un ``diagnostics.json`` no puede contener, porque es un fichero
+       que el usuario copia para pasar el informe a otro. Se comprueba
+       leyendo el fichero **de verdad** después de registrar.
+    2. **La migración no pierde datos ni inventa datos.** Las nueve entradas
+       de una v1 real siguen ahí con sus cinco campos, y los cinco nuevos
+       quedan desconocidos en vez de rellenados con conjeturas.
+    3. **El retroceso existe.** ``escribir_como(1)`` produce un fichero que la
+       v1 leería sin Que la v1 lo lea, y el v2 que escribió la v2 lo seguiría
+       leyendo después (los campos nuevos se omiten al no saberse, en vez de
+       escribir ``null``, que parece una medición).
+    """
+    import json
+    import tempfile
+
+    from thetvview.diagnostics.history import (
+        VERSION_ACTUAL,
+        HistorialDiagnostico,
+        RegistroHistorial,
+        source_id_opaco,
+    )
+
+    #: Reloj falso. Sin él, la limpieza por edad (30 días) tiraría las
+    #: entradas de la v1 de ejemplo y la comprobación mediría otra cosa.
+    ahora = 1_767_225_600.0 + 86_400.0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ruta = Path(tmp) / "diagnostics.json"
+
+        # --- (1) El source_id crudo no llega a disco --------------------
+        crudo = "xtream|Mi Panel|http://usuario:clave@panel.test:8080/live"
+        historial = HistorialDiagnostico(ruta, ahora=lambda: ahora)
+        historial.registrar("espn", False, source_id=crudo, player="mpv",
+                            error_code="network_error", duration_ms=1500.0)
+        en_disco = ruta.read_text(encoding="utf-8")
+        _require("clave" not in en_disco,
+                 "la contraseña de la fuente llegó a diagnostics.json")
+        _require("panel.test" not in en_disco,
+                 "el servidor de la fuente llegó a diagnostics.json")
+        _require("Mi Panel" in en_disco,
+                 "el nombre de la lista no se guarda: el modal no puede nombrarla")
+        _require(source_id_opaco(source_id_opaco(crudo)) == source_id_opaco(crudo),
+                 "opacar el source_id dos veces no da lo mismo")
+
+        # --- (2) Una v1 real se migra sin perder ni inventar -------------
+        v1 = {"version": 1, "entradas": [
+            {"momento": 1767225600.0 + i * 3600.0, "canal": f"canal.{i}",
+             "exito": i % 2 == 0, "motivo": "READY", "fase": "diagnose"}
+            for i in range(9)
+        ]}
+        ruta.write_text(json.dumps(v1), encoding="utf-8")
+        migrado = HistorialDiagnostico(ruta, ahora=lambda: ahora)
+        entradas = migrado.entradas()
+        _require(len(entradas) == 9,
+                 f"la migración perdió entradas: {len(entradas)} de 9")
+        for entrada in entradas:
+            _require(entrada.source_id == "" and entrada.player == ""
+                     and entrada.error_code == "" and entrada.recoverable is None
+                     and entrada.duration_ms is None,
+                     f"la migración inventó datos en {entrada.canal}")
+        antes = {(e["momento"], e["canal"], e["exito"]) for e in v1["entradas"]}
+        despues = {(e.momento, e.canal, e.exito) for e in entradas}
+        _require(antes == despues, "la migración alteró los datos de la v1")
+
+        # --- (3) El retroceso existe y no rompe nada ---------------------
+        _require(VERSION_ACTUAL == 2, "la versión actual del historial no es la 2")
+        _require(migrado.escribir_como(1), "escribir_como(1) no pudo escribir")
+        retroceso = json.loads(ruta.read_text(encoding="utf-8"))
+        _require(retroceso["version"] == 1, "el retroceso no escribió version 1")
+        _require(set(retroceso["entradas"][0]) == {
+            "momento", "canal", "exito", "motivo", "fase"
+        }, "el retroceso metió campos de la v2 en el fichero")
+        releido = HistorialDiagnostico(ruta, ahora=lambda: ahora).entradas()
+        _require(len(releido) == 9, "el fichero retrocedido no se vuelve a leer")
+        _require(releido[0].source_id == "",
+                 "el fichero retrocedido trae un source_id de la v2")
+
+        # --- (extra) Lo que no se sabe, no se escribe ---------------------
+        _require("recoverable" not in RegistroHistorial(
+            momento=1.0, canal="a", exito=False).a_dict(),
+            "un recoverable desconocido se escribe en el fichero")
+        _require("duration_ms" not in RegistroHistorial(
+            momento=1.0, canal="a", exito=False).a_dict(),
+            "una duración no medida se escribe en el fichero")
+
+    return ("migración v1→v2 sin pérdida (9 entradas de fixture), retroceso "
+            "escribir_como(1) verificado, source_id opaco en disco")
+
+
 # ---------------------------------------------------------------------------
 # Registro
 # ---------------------------------------------------------------------------
@@ -1522,6 +1617,8 @@ CHECKS: tuple[tuple[str, str, Callable[[], str]], ...] = (
      check_persistence_atomic),
     ("historial_taxonomia_unica", "Single taxonomy for the technical history",
      check_historial_taxonomia_unica),
+    ("historial_migracion_v2", "History schema v2 migration",
+     check_historial_migracion_v2),
 )
 
 
