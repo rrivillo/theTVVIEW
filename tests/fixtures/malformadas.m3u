@@ -1,0 +1,47 @@
+#EXTM3U x-tvg-url="guia.xml.gz"
+# Todo lo que hay aquí encontró un fallo en algún momento (M3U-004).
+# Ninguna línea puede hacer que el parser se rompa, tire la lista entera
+# ni se interprete de dos maneras distintas.
+#
+# 1) Nombre con comas: la última coma lo truncaba a "HD".
+#EXTINF:-1 tvg-id="c1",Canal, La 1
+http://x/1.ts
+# 2) Coma dentro de un valor entrecomillado + nombre con comas.
+#EXTINF:-1 group-title="Deportes, Locales" tvg-id="c2",Canal, HD
+http://x/2.ts
+# 3) group-title="-": placeholder de Xtream, no un grupo real.
+#EXTINF:-1 group-title="-",Todos
+http://x/3.ts
+# 4) Atributo duplicado: gana el último.
+#EXTINF:-1 tvg-id="malo" tvg-id="bueno",Duplicado
+http://x/4.ts
+# 5) tvg-logo con prefijo residual (bug real de IPTVSV.m3u).
+#EXTINF:-1 tvg-logo="tvg-logo="http://logo.example/x.png",Con Logo Roto
+http://x/5.ts
+# 6) Comillas sin cerrar: se lee lo que se puede, sin excepción.
+#EXTINF:-1 tvg-id="roto,Sin Cerrar
+http://x/6.ts
+# 7) Sin comas detrás: EXTINF vacío.
+#EXTINF:-1
+http://x/7.ts
+# 8) Atributos duplicados sin comillas: se ignoran, no se comen la URL.
+#EXTINF:-1 tvg-id=abc tvg-name=def,Sin Comillas
+http://x/8.ts
+# 9) NUL y espacios: se limpia, no rompe.
+#EXTINF:-1 ,Con NUL
+http://x/9.ts
+# 10) Línea larguísima: no se cuelga.
+#EXTINF:-1 tvg-name="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",Larguisimo
+http://x/10.ts
+# 11) EXTINF sin URL seguido de otro: el colgado se descarta.
+#EXTINF:-1,Colgado
+# 12) URL con credenciales: se guarda, se redacta al mostrarse.
+#EXTINF:-1 tvg-id="c12",Con Credenciales
+http://usuario:clave@proveedor.example/12.ts
+# 13) Opciones huérfanas (sin EXTINF previo): se ignoran.
+#EXTVLCOPT:http-user-agent=theTVVIEW
+# 14) unicode y emoji en el nombre.
+#EXTINF:-1 tvg-id="c14",Ñandú 📺 Émoji
+http://x/14.ts
+# 15) El final: EXTINF sin URL no crea ningún canal.
+#EXTINF:-1,Se Queda Colgada Al Final

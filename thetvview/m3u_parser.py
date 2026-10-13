@@ -1,7 +1,9 @@
 """Parser M3U/M3U8 de IPTV (happy path, solo stdlib).
 
 Contrato v1 (validado con iptv-epg-expert):
-- parse_file acepta str|Path; abre con utf-8-sig + errors="replace"
+- parse_file acepta str|Path; la decodificación pasa por
+  `m3u_encoding` (BOM → UTF-8 estricto → cp1252 → latin-1 → replace
+  registrado), nunca por un `replace` silencioso
   (resuelve BOM y encodings sucias sin crash).
 - Falta #EXTM3U: se parsea igual.
 - EXTINF huérfano (sin URL): descartado.
@@ -36,6 +38,7 @@ from pathlib import Path
 from typing import Mapping
 
 from . import config
+from . import m3u_encoding
 from .cam_ref import registrar_camara
 from .epg_parser import SOURCE_ATTRS, resolve_source, split_sources
 from .channel_identity import ReconcileReport, reconcile
@@ -47,7 +50,7 @@ from .storage.json_store import (
 )
 from .security.errors import IPTVError, ParseError
 from .security.limits import get_limits
-from .security.local_files import gunzip_limited, read_limited_text
+from .security.local_files import gunzip_limited, read_limited_bytes
 from .security.redaction import redact_text
 from .security.safe_http import SafeHttpClient
 from .security.url_policy import PURPOSE_METADATA
@@ -123,14 +126,66 @@ def _read_header_epg(playlist: Playlist, header: str) -> None:
         playlist.epg_url = playlist.epg_urls[0]
 
 
+#: Primera coma **fuera** de un valor entrecomillado (M3U-002). La
+#: aserción mira lo que queda hasta el final de la línea: si ahí el número
+#: de comillas es par, la coma no está dentro de un valor. Es el mismo
+#: criterio que usan ffmpeg y VLC, y se resuelve en C sobre el resto de la
+#: línea, así que el caso normal (una sola coma) ni siquiera lo necesita.
+_COMA_SEPARADORA_RE = re.compile(r',(?=(?:[^"]*"[^"]*")*[^"]*$)')
+
+
+def _separador_extinf(rest: str) -> int:
+    """Índice de la coma que separa atributos y nombre, o -1.
+
+    Ruta rápida, en este orden y sin coste extra:
+
+    - **Una sola coma** en la línea: se devuelve tal cual (es el caso de
+      casi todas las entradas reales, y ``count`` es C).
+    - **Varias comas**: se busca la primera que cae **fuera** de un valor
+      entrecomillado, con :data:`_COMA_SEPARADORA_RE`. Esto arregla el caso
+      que la última coma rompía, ``#EXTINF:-1 tvg-id="a",Canal, HD``, donde
+      el nombre se quedaba en «HD» y «Canal» se perdía.
+    - **Línea mal formada** (comillas sin cerrar, sin ninguna coma
+      candidata): escaneo de izquierda a derecha y, si tampoco aparece,
+      se devuelve -1. Nunca hay excepción: una línea rota no puede tirar el
+      resto de la lista (FR-M3U-005).
+    """
+    if rest.count(",") == 1:
+        return rest.find(",")
+    found = _COMA_SEPARADORA_RE.search(rest)
+    if found is not None:
+        return found.start()
+    dentro = False
+    for indice, caracter in enumerate(rest):
+        if caracter == '"':
+            dentro = not dentro
+        elif caracter == "," and not dentro:
+            return indice
+    return -1
+
+
 def _split_extinf(rest: str) -> tuple[dict[str, str], str]:
     """Separa `#EXTINF:<rest>` en (attrs, nombre).
 
-    Estrategia v1: la coma separadora es la última coma de la línea;
-    los nombres IPTV rara vez contienen comas y esto evita romper cuando
-    los valores de atributos incluyen comas entrecomilladas.
+    El separador lo decide :func:`_separador_extinf`; el nombre es **todo**
+    lo que va detrás, comas incluidas (los nombres IPTV las llevan:
+    «Canal, La 1»).
+
+    Reglas de directivas y metadatos (FR-M3U-003), documentadas a propósito:
+
+    - **Atributo duplicado**: gana el último (``findall`` + dict). Es lo
+      que hacen el resto de reproductores y evita depender del orden.
+    - **Atributo desconocido**: se conserva en ``Channel.attrs`` tal cual
+      (texto plano, sin interpretar). Es metadata que otro reproductor
+      entendería y que se puede guardar sin riesgo, así que no se tira;
+      lo que se redacta son las URLs cuando se muestran o se vuelcan en un
+      informe, no el dato almacenado.
+    - **Atributo sin comillas**: ``key=valor`` sin comillas **no** se
+      interpreta como atributo dentro de EXTINF. Sólo la cabecera
+      ``#EXTM3U`` acepta esa forma (ver ``_HEADER_ATTR_RE``); en el cuerpo
+      se ignora para no comerse media URL.
     """
-    comma_idx = rest.rfind(",")
+    comma_idx = _separador_extinf(rest)
     if comma_idx == -1:
         # Sin nombre tras la coma: attrs vacíos, nombre vacío.
         return {}, ""
@@ -299,12 +354,21 @@ def parse_file(path: str | Path) -> Playlist:
     Nunca lanza por contenido malformado; solo por errores de E/S.
 
     La lectura pasa por
-    :func:`thetvview.security.local_files.read_limited_text`: fichero
+    :func:`thetvview.security.local_files.read_limited_bytes`: fichero
     regular, sin symlinks y con límite de tamaño (gap B11). Los fallos
     salen como ``OSError`` con mensaje ya amable (incluye la ruta).
+
+    Los bytes se decodifican con la política explícita de
+    :mod:`thetvview.m3u_encoding` (M3U-001). Si la lista no es UTF-8, la
+    decisión queda registrada y hay aviso para el modal: un ``tvg-id`` o
+    un nombre cambiados por una sustitución silenciosa sería el peor
+    fallo posible de este módulo.
     """
     p = Path(path)
-    return parse_text(read_limited_text(p), source=str(p), name=p.stem)
+    decision = m3u_encoding.registrar(
+        m3u_encoding.decodificar_m3u(read_limited_bytes(p), origen=str(p))
+    )
+    return parse_text(decision.texto, source=str(p), name=p.stem)
 
 
 DEFAULT_TIMEOUT: float = 30.0
@@ -542,11 +606,19 @@ def _decompress_and_decode(data: bytes, url_hint: str) -> str:
 
     La descompresión va acotada por ``limits.max_file_bytes``: una bomba
     gzip servida por el panel no puede expandirse en memoria sin tope.
+
+    La decodificación es la de :mod:`thetvview.m3u_encoding` (M3U-001) y
+    **registra** la decisión cuando la lista no es UTF-8, para que la TUI
+    pueda avisar en un modal en vez de dejar nombres con «�» sin
+    explicación.
     """
     looks_gz = url_hint.lower().split("?", 1)[0].endswith(".gz") or data[:2] == _GZIP_MAGIC
     if looks_gz:
         data = gunzip_limited(data, what="La playlist descargada")
-    return data.decode("utf-8-sig", errors="replace")
+    decision = m3u_encoding.registrar(
+        m3u_encoding.decodificar_m3u(data, origen=url_hint or "la lista descargada")
+    )
+    return decision.texto
 
 
 def _playlist_name_for(url: str) -> str:

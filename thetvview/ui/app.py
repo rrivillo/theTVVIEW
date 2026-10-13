@@ -104,6 +104,14 @@ def load_epg_source(source: str, *, force_refresh: bool = False,
     return parse_file(source)
 
 
+#: Callback que muestra los avisos de **codificación** de una lista
+#: (M3U-001 · FR-M3U-001). Lo registra `App.run()`; `load_playlist_source`
+#: lo consume después de cada carga, y el aviso se marca como visto para
+#: no repetirse en el siguiente repintado. Vive aquí y no como atributo
+#: porque el aviso lo produce el parser, que no conoce la TUI.
+_aviso_codificacion = None  # Callable[[str], None] | None
+
+
 def load_playlist_source(
     source: str,
     *,
@@ -111,6 +119,7 @@ def load_playlist_source(
     allow_private: bool = False,
     confirmar=None,  # noqa: ANN001 - Callable[[PlaylistValidation], bool] | None
     previa: Playlist | None = None,
+    aviso=None,  # noqa: ANN001 - Callable[[str], None] | None
 ) -> Playlist:
     """Parsea una fuente IPTV (path local o URL http(s)).
 
@@ -125,18 +134,36 @@ def load_playlist_source(
 
     ``allow_private`` habilita red privada/loopback solo si la fuente lo
     tiene declarado en el catálogo (SDD §11).
+
+    Tras cargar, si el parser registró una decisión de codificación que
+    el usuario debe ver (lista heredada o con sustituciones), se muestra
+    en un modal con `aviso` —o con el callback global que registró la
+    TUI—. Es una aviso, no un error: la lista se abre igual.
     """
-    from thetvview import m3u_parser
+    global _aviso_codificacion  # noqa: PLW0603 - el aviso va al modal activo
+
+    from thetvview import m3u_encoding, m3u_parser
 
     if source.lower().startswith(("http://", "https://")):
-        return m3u_parser.load_url(
+        playlist = m3u_parser.load_url(
             source,
             force_refresh=force_refresh,
             allow_private=allow_private,
             confirmar=confirmar,
             previa=previa,
         )
-    return m3u_parser.parse_file(source)
+    else:
+        playlist = m3u_parser.parse_file(source)
+
+    mostrar = aviso or _aviso_codificacion
+    if mostrar is not None:
+        try:
+            texto = m3u_encoding.texto_aviso_pendiente()
+            if texto:
+                mostrar(texto)
+        except Exception:  # noqa: BLE001 - un aviso nunca rompe la carga
+            pass
+    return playlist
 
 
 def prompt_text(stdscr: curses.window, status: StatusBar, label: str) -> str | None:
@@ -3039,6 +3066,14 @@ class App:
             self.diagnosticos = default_historial()
         except Exception:
             self.diagnosticos = None
+        # Aviso de codificación de listas (M3U-001): si una lista llega en
+        # cp1252/latin-1 o con sustituciones, se avisa **en un modal**, una
+        # vez, en vez de dejar nombres con caracteres raros sin explicación.
+        global _aviso_codificacion  # noqa: PLW0603 - lo consume load_playlist_source
+
+        _aviso_codificacion = lambda texto: self._show_notice(  # noqa: E731
+            "Codificación de la lista", texto
+        )
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS)
         except Exception:
