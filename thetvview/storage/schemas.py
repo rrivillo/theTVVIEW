@@ -32,6 +32,7 @@ __all__ = [
     "validate_playlist_list",
     "validate_favorites",
     "validate_recents",
+    "validate_collections",
     "get_validator",
     "stamped",
     "ensure_version",
@@ -150,6 +151,28 @@ def validate_recents(data: Any) -> None:
     )
 
 
+def validate_collections(data: Any) -> None:
+    """Valida ``collections.json``: lista de colecciones versionadas."""
+    _require(isinstance(data, list), "collections.json debe contener una lista.")
+    for i, entrada in enumerate(data):
+        _require(isinstance(entrada, dict), f"la entrada {i} de collections no es un objeto.")
+        if "id" in entrada:
+            _require(isinstance(entrada["id"], str) and entrada["id"].strip(), "id inválido.")
+        if "name" in entrada:
+            _require(isinstance(entrada["name"], str) and entrada["name"].strip(), "name inválido.")
+        if "type" in entrada:
+            _require(entrada["type"] in ("manual", "smart", "system"), "type inválido.")
+        if "members" in entrada:
+            _require(isinstance(entrada["members"], list), "members debe ser lista.")
+        if "rules" in entrada and entrada["rules"] is not None:
+            _require(isinstance(entrada["rules"], dict), "rules debe ser objeto.")
+        if "schema_version" in entrada:
+            try:
+                int(entrada["schema_version"])
+            except (TypeError, ValueError):
+                raise StorageError("schema_version inválido en collections.") from None
+
+
 #: Formato -> validador. Los nombres coinciden con el nombre de fichero sin
 #: extensión, que es como se registran en :mod:`thetvview.storage.json_store`.
 SCHEMAS: dict[str, Callable[[Any], None]] = {
@@ -158,6 +181,7 @@ SCHEMAS: dict[str, Callable[[Any], None]] = {
     "playlists": validate_playlist_list,
     "favorites": validate_favorites,
     "recents": validate_recents,
+    "collections": validate_collections,
 }
 
 
