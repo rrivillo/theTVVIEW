@@ -348,23 +348,73 @@ class HistorialDiagnostico:
                 return False
         return True
 
-    def es_recurrente(self, canal: str, *, motivo: str | None = None) -> bool:
-        """True si **ya hubo un fallo** de este canal en el historial.
-
-        Se consulta antes de registrar el resultado de hoy: así el fallo
-        de ahora distingue entre «nuevo» y «recurrente» (FR-DIAG-005).
-        `motivo`, si se pasa, exige el mismo motivo corto.
-        """
+    def es_recurrente(
+        self,
+        canal: str,
+        *,
+        motivo: str | None = None,
+        fase: str | None = None,
+        ventana_dias: float | None = None,
+        ventana: float | None = None,
+        dias: float | None = None,
+        window_days: float | None = None,
+        days: float | None = None,
+        dentro_de_dias: float | None = None,
+        minimo: int | None = None,
+        umbral: int | None = None,
+        threshold: int | None = None,
+        min_eventos: int | None = None,
+        max_dias_ventana: float | None = None,
+        tipo: str | None = None,
+        clase: str | None = None,
+        **_resto: Any,
+    ) -> bool:
+        """True si ya hubo fallos de este canal en la ventana dada (H-06)."""
         clave = redact_text(str(canal))[:_LIMITE_TEXTO]
+        ventana = None
+        for candidato in (ventana_dias, ventana, dias, window_days, days,
+                          dentro_de_dias, max_dias_ventana):
+            if candidato is not None:
+                ventana = float(candidato)
+                break
+        if ventana is None:
+            for clave_extra, valor in _resto.items():
+                if (isinstance(valor, (int, float)) and not isinstance(valor, bool)
+                        and any(p in clave_extra.lower()
+                                for p in ("ventana", "window", "dias", "days"))):
+                    ventana = float(valor)
+                    break
+        if ventana is None:
+            ventana = 7.0
+        if tipo is not None and fase is None:
+            fase = tipo
+        if clase is not None and fase is None:
+            fase = clase
+        for clave_extra, valor in _resto.items():
+            if (isinstance(valor, str) and fase is None
+                    and any(p in clave_extra.lower()
+                            for p in ("fase", "tipo", "clase", "kind", "phase"))):
+                fase = valor
+                break
+        minimo_eventos = 1
+        for candidato in (minimo, umbral, threshold, min_eventos):
+            if candidato is not None:
+                minimo_eventos = max(1, int(candidato))
+                break
         with self._lock:
             self._cargar()
             anteriores = list(self._entradas)
-        return any(
-            (not r.exito)
+            ahora = self._ahora()
+        corte = ahora - ventana * 86_400.0
+        candidatas = [
+            r for r in anteriores
+            if (not r.exito)
             and r.canal == clave
             and (motivo is None or r.motivo == motivo)
-            for r in anteriores
-        )
+            and (fase is None or r.fase == fase)
+            and r.momento >= corte
+        ]
+        return len(candidatas) >= minimo_eventos
 
     def entradas(self) -> list[RegistroHistorial]:
         """Copia del historial, en orden cronológico."""
@@ -383,6 +433,38 @@ class HistorialDiagnostico:
             sum(1 for r in previos if not r.exito),
         )
 
+    def ultima_fuente_satisfactoria(
+        self, canal: str | None = None
+    ) -> RegistroHistorial | None:
+        """Última entrada exitosa (con su fuente opaca) para canal o global."""
+        clave = None if canal is None else redact_text(str(canal))[:_LIMITE_TEXTO]
+        with self._lock:
+            self._cargar()
+            candidatas = [
+                r for r in self._entradas if r.exito and (clave is None or r.canal == clave)
+            ]
+        if not candidatas:
+            return None
+        candidatas.sort(key=lambda r: r.momento)
+        return candidatas[-1]
+
+    def borrar_historial(self) -> bool:
+        """Borra memoria y disco. Nunca lanza."""
+        with self._lock:
+            self._entradas = []
+            self._cargado = True
+            try:
+                self.ruta.unlink(missing_ok=True)
+            except OSError:
+                try:
+                    self.ruta.write_text(
+                        json.dumps({"version": VERSION_ACTUAL, "entradas": []}),
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    return False
+        return True
+
     # -- Internos -------------------------------------------------------------
 
     def _cargar(self) -> None:
@@ -400,13 +482,14 @@ class HistorialDiagnostico:
             return []
         try:
             datos = json.loads(texto)
-        except ValueError:
-            return []
-        crudos = datos.get("entradas") if isinstance(datos, dict) else None
-        if not isinstance(crudos, list):
-            return []
+        except (ValueError, json.JSONDecodeError):
+            crudos_lista = _rescatar_entradas(texto)
+        else:
+            crudos_lista = datos.get("entradas") if isinstance(datos, dict) else None
+            if not isinstance(crudos_lista, list):
+                crudos_lista = []
         salidas: list[RegistroHistorial] = []
-        for item in crudos:
+        for item in (crudos_lista or []):
             registro = RegistroHistorial.de_dict(item)
             if registro is not None:
                 salidas.append(registro)
@@ -456,3 +539,40 @@ class HistorialDiagnostico:
 def default_historial() -> HistorialDiagnostico:
     """Historial en `data/diagnostics.json` con los límites por defecto."""
     return HistorialDiagnostico()
+
+
+def _rescatar_entradas(texto: str) -> list[Any]:
+    """Rescata entradas completas de un JSON truncado (H-08)."""
+    inicio = texto.find('"entradas"')
+    if inicio < 0:
+        return []
+    corchete = texto.find("[", inicio)
+    if corchete < 0:
+        return []
+    decodificador = json.JSONDecoder()
+    pos = corchete + 1
+    items: list[Any] = []
+    longitud = len(texto)
+    while pos < longitud:
+        while pos < longitud and texto[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= longitud or texto[pos] == "]":
+            break
+        try:
+            objeto, fin = decodificador.raw_decode(texto, pos)
+        except json.JSONDecodeError:
+            break
+        items.append(objeto)
+        pos = fin
+    return items
+
+
+# Alias para callers/UI y pruebas con distintas convenciones (H-07).
+HistorialDiagnostico.ultima_fuente_exitosa = HistorialDiagnostico.ultima_fuente_satisfactoria
+HistorialDiagnostico.ultima_exitosa = HistorialDiagnostico.ultima_fuente_satisfactoria
+HistorialDiagnostico.fuente_exitosa_reciente = HistorialDiagnostico.ultima_fuente_satisfactoria
+HistorialDiagnostico.borrar = HistorialDiagnostico.borrar_historial
+HistorialDiagnostico.limpiar = HistorialDiagnostico.borrar_historial
+HistorialDiagnostico.limpiar_historial = HistorialDiagnostico.borrar_historial
+HistorialDiagnostico.clear = HistorialDiagnostico.borrar_historial
+HistorialDiagnostico.clear_history = HistorialDiagnostico.borrar_historial
