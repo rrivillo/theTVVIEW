@@ -1370,6 +1370,136 @@ def check_persistence_atomic() -> str:
 # ---------------------------------------------------------------------------
 
 
+def check_historial_taxonomia_unica() -> str:
+    """H-02: el historial técnico escribe motivos de la taxonomía del reproductor.
+
+    El riesgo que se cierra aquí no es «un dato feo»: es una **segunda
+    taxonomía**. Si el módulo de diagnóstico acepta cualquier cadena como
+    ``reason_code``, nada impide que mañana aparezca ``"fallo_de_red"`` al
+    lado de ``"network_error"``, los dos diciendo lo mismo con nombres
+    distintos, y ningún informe detecte el desacuerdo porque los dos son
+    «motivos válidos».
+
+    Se comprueba, no se supone:
+
+    1. **Todo código conocido es del reproductor**, y el conjunto no tiene ni
+       un código de más: es exactamente la unión de ``StreamErrorCode`` y
+       ``EndReason``.
+    2. **Un motivo inventado no se resuelve.** ``codigo_de`` devuelve ``None``
+       en vez de inventar o normalizar a ``UNKNOWN``.
+    3. **Sin código no se afirma uno.** ``reason_code`` vacío y
+       ``"unknown"`` son cosas distintas, y la segunda es la única que se
+       marca como causa no conocida.
+    4. **En el paquete no hay ``reason_code`` literal.** Se recorre el
+       código real de ``thetvview/diagnostics/`` buscando una cadena escrita
+       a mano en una llamada a ``Event(...)`` o ``registrar(...)``.
+    """
+    import ast
+
+    from thetvview.diagnostics import taxonomy
+    from thetvview.diagnostics.taxonomy import (
+        CODES_CONOCIDOS,
+        MOTIVOS_CONOCIDOS,
+        Causa,
+        causa_de_codigo,
+        codigo_de,
+        es_razon_conocida,
+    )
+    from thetvview.player.errors import StreamError, StreamErrorCode
+    from thetvview.player.session import EndReason
+
+    # --- (1) La unión es exacta ------------------------------------------
+    esperados = {c.value for c in StreamErrorCode} | {m.value for m in EndReason}
+    _require(set(CODES_CONOCIDOS) <= esperados,
+             "CODES_CONOCIDOS trae códigos que no son de player.errors")
+    _require(set(MOTIVOS_CONOCIDOS) == esperados,
+             "MOTIVOS_CONOCIDOS no es exactamente la taxonomía del reproductor")
+
+    for codigo in StreamErrorCode:
+        _require(codigo_de(codigo.value) is codigo,
+                 f"codigo_de no resuelve {codigo.value}")
+
+    # --- (2) Un motivo inventado no se resuelve ---------------------------
+    # Cadenas que parecen motivo pero no son: dos son castellano (una posible
+    # taxonomía paralelo mal pensada) y dos son HTTP (códigos que existen en
+    # otros sitios pero no aquí, y es justo el cruce peligroso).
+    for inventado in ("fallo_de_red", "no_se_abre", "http_500", "fallo de red"):
+        _require(codigo_de(inventado) is None,
+                 f"codigo_de se inventó un código para {inventado!r}")
+        _require(not es_razon_conocida(inventado),
+                 f"es_razon_conocida acepta {inventado!r}")
+    _require(codigo_de("") is None, "codigo_de('') no es None")
+    _require(codigo_de(None) is None, "codigo_de(None) no es None")
+    _require(codigo_de(42) is None, "codigo_de(42) no es None")
+
+    # --- (3) Sin código no se afirma uno ----------------------------------
+    vacia = causa_de_codigo(None)
+    _require(vacia.reason_code == "",
+             "sin código, reason_code debe quedar vacío, no relleno")
+    _require(vacia.recoverable is None,
+             "sin código, no se pronuncia la recuperabilidad")
+    _require(not vacia.causa_conocida,
+             "una causa vacía no puede declarar su causa conocida")
+    _require(Causa().confianza == "desconocida",
+             "una causa vacía no puede declarar confianza observada")
+    unknown = causa_de_codigo(StreamErrorCode.UNKNOWN)
+    _require(unknown.reason_code == StreamErrorCode.UNKNOWN.value,
+             "UNKNOWN debe conservarse como código, no desaparecer")
+    _require(not unknown.causa_conocida,
+             "UNKNOWN es una conjetura y no puede declararse causa conocida")
+    _require(unknown.observado == "",
+             "causa_de_codigo no puede inventar un hecho observado")
+
+    # --- (4) En el paquete no hay motivos escritos a mano ------------------
+    permitidos = {"taxonomy.py"}
+    ofensas: list[str] = []
+    for ruta in sorted(Path(taxonomy.__file__).parent.rglob("*.py")):
+        if ruta.name in permitidos:
+            continue
+        arbol = ast.parse(ruta.read_text(encoding="utf-8"), str(ruta))
+        for nodo in ast.walk(arbol):
+            if not isinstance(nodo, ast.Call):
+                continue
+            nombre = getattr(nodo.func, "id", None) or getattr(nodo.func, "attr", None)
+            if nombre not in ("Event", "registrar"):
+                continue
+            for palabra in nodo.keywords:
+                if palabra.arg != "reason_code":
+                    continue
+                if not isinstance(palabra.value, ast.Constant):
+                    continue
+                valor = palabra.value.value
+                if valor in (None, ""):
+                    continue
+                ofensas.append(f"{ruta.name}:{nodo.lineno}={valor!r}")
+    _require(not ofensas, f"reason_code escrito a mano en: {'; '.join(ofensas)}")
+
+    # --- (extra) El hecho y la inferencia no se mezclan -------------------
+    # Se recorre TODO el enum, no un ejemplo: la regla que se comprueba es
+    # «recoverable sale de reintentable», y un solo ejemplo no la garantiza.
+    for codigo in StreamErrorCode:
+        fallo = StreamError(code=codigo, resumen="x", observado=f"rc={codigo.value}")
+        causa = taxonomy.causa_de(fallo)
+        _require(causa.recoverable == codigo.reintentable,
+                 f"recoverable deja de ser la política de player.errors en "
+                 f"{codigo.value}")
+        _require(causa.reason_code == codigo.value,
+                 f"causa_de cambia el código de {codigo.value}")
+        _require(causa.observado == f"rc={codigo.value}",
+                 f"causa_de pierde el hecho observado de {codigo.value}")
+    _require(taxonomy.causa_de(None) == Causa(),
+             "sin fallo no debe haber causa")
+    _require(taxonomy.causa_de(StreamError(code=StreamErrorCode.AUTH_FAILED,
+                                           resumen="x")).causa_conocida,
+             "auth_failed es una causa observada")
+
+    return (
+        f"Motivos conocidos: {len(MOTIVOS_CONOCIDOS)} "
+        f"({len(CODES_CONOCIDOS)} de error + {len(esperados) - len(CODES_CONOCIDOS)} "
+        f"de cierre). Códigos literales en diagnostics/: {len(ofensas)}."
+    )
+
+
 CHECKS: tuple[tuple[str, str, Callable[[], str]], ...] = (
     ("secret_redaction", "Secret redaction", check_secret_redaction),
     ("tls_verification", "HTTPS certificate verification", check_tls_verification),
@@ -1390,6 +1520,8 @@ CHECKS: tuple[tuple[str, str, Callable[[], str]], ...] = (
      check_track_discovery_is_sandboxed),
     ("persistence_atomic", "Atomic persistence & versioning",
      check_persistence_atomic),
+    ("historial_taxonomia_unica", "Single taxonomy for the technical history",
+     check_historial_taxonomia_unica),
 )
 
 
