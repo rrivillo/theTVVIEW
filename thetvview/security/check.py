@@ -1592,6 +1592,135 @@ def check_historial_eventos_ciclo_vida() -> str:
             "error anotado sin tumbar la sesión")
 
 
+def check_historial_redaccion_al_escribir() -> str:
+    """H-04: lo que se escribe ya está limpio, y no se limpia al leer.
+
+    El destino de todo esto es un ``diagnostics.json`` que el usuario copia
+    para pasar el informe a otra persona. Si la redacción ocurriera al leer,
+    el secreto seguiría en el fichero que se copió, en la copia de seguridad y
+    en el adjunto de correo: se habría protegido **la pantalla**, que es justo
+    lo que no importa.
+
+    Por eso este control comprueba dos cosas que parecen contrarias:
+
+    1. **Nada que escribamos lleva el centinela**, ni en disco, ni en memoria,
+       ni en el registro que devuelve ``registrar`` — que es donde se nota la
+       diferencia: si sólo se limpiara en disco, el objeto en memoria llevaría
+       el secreto y podría acabar en un informe por otro camino.
+    2. **Leer NO limpia.** Un fichero escrito a mano con un secreto se
+       devuelve tal cual. Es contraintuitivo y es la prueba: si la lectura
+       limpiara, las dos garantías coexistirían y nadie sabría cuál estaba
+       protegiendo de verdad. Al no limpiar la lectura, la única garantía que
+       existe es la de no escribirlo, que es la que importa.
+
+    Y de paso, que nadie escribe un historial por su cuenta fuera de
+    ``history.py``, que es un camino que ningún centinela vería.
+    """
+    import json
+    import stat
+    import tempfile
+
+    from thetvview import config
+    from thetvview.diagnostics import default_historial
+    from thetvview.diagnostics.events import EventBus
+    from thetvview.diagnostics.history import HistorialDiagnostico
+    from thetvview.diagnostics.session_events import ObservadorDeSesion
+    from thetvview.player.errors import StreamError, StreamErrorCode
+    from thetvview.player.session import EndReason, PlaybackSession
+
+    canario = "CANARIO-SECRETO-4f2a9c"
+    sentinelas: dict[str, str] = {
+        "userinfo": f"http://usuario:{canario}@proveedor.test/live/1.ts",
+        "parametro": f"http://proveedor.test/live/1.ts?password={canario}&x=1",
+        "xtream": f"xtream://Panel/live/{canario}/{canario}/101.ts",
+        "cabecera": f"Authorization: Bearer {canario}",
+        "token": f"fallo con token={canario} al abrir",
+        "cookie": f"Cookie: sesion={canario}",
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ruta = Path(tmp) / "diagnostics.json"
+
+        # --- (1) Nada que escribamos lleva el centinela ------------------
+        reloj = [1_800_000_000.0]
+        historial = HistorialDiagnostico(ruta, ahora=lambda: reloj[0])
+        for nombre, valor in sentinelas.items():
+            registro = historial.registrar(
+                valor, False, motivo=valor, fase=valor,
+                source_id=f"m3u|{valor}|{valor}", player=valor,
+                error_code="network_error", duration_ms=7.0,
+            )
+            destinos = {
+                "el registro devuelto": str(registro.a_dict()),
+                "las entradas en memoria": str([e.a_dict()
+                                                for e in historial.entradas()]),
+                "el fichero": ruta.read_text(encoding="utf-8"),
+            }
+            for destino, texto in destinos.items():
+                _require(canario not in texto,
+                         f"el centinela «{nombre}» llegó a {destino}")
+
+        modo = stat.S_IMODE(ruta.stat().st_mode)
+        _require(modo == 0o600, f"diagnostics.json no es 0600 (es {modo:o})")
+
+        # --- (2) Leer NO limpia ------------------------------------------
+        # Se escribe a mano, se borra todo lo que el historial escribiría, y
+        # se comprueba que la lectura lo devuelve tal cual.
+        ruta.write_text(json.dumps({
+            "version": 2,
+            "entradas": [{
+                "momento": 1_800_000_000.0,
+                "canal": f"http://u:{canario}@a.test/1.ts",
+                "exito": False, "motivo": "", "fase": "diagnose",
+            }],
+        }), encoding="utf-8")
+        leido = HistorialDiagnostico(ruta, ahora=lambda: reloj[0]).entradas()
+        _require(len(leido) == 1, "no se pudo leer el fichero escrito a mano")
+        _require(canario in leido[0].canal,
+                 "la lectura está redactando: la garantía de escritura dejó de "
+                 "ser la única, y entonces no sabemos cuál protege")
+
+        # --- (3) El bus limpia por dentro --------------------------------
+        bus = EventBus()
+        sesion = PlaybackSession(channel_key="espn", player_name="mpv")
+        sesion.oyente = ObservadorDeSesion(bus, sesion=sesion)
+        sesion.nota_fallo(StreamError(code=StreamErrorCode.AUTH_FAILED,
+                                      resumen="x", detalle=sentinelas["userinfo"],
+                                      observado=sentinelas["parametro"]))
+        sesion.end(EndReason.PLAYBACK_ERROR, sentinelas["token"])
+        _require(canario not in str([e.to_dict() for e in bus.events()]),
+                 "un centinela llegó al bus de eventos")
+
+        # --- (4) El fichero por defecto tiene los mismos riesgos ----------
+        with tempfile.TemporaryDirectory() as data_dir:
+            real = Path(data_dir) / "diagnostics.json"
+            original = config.DIAGNOSTICS_JSON
+            try:
+                config.DIAGNOSTICS_JSON = real  # type: ignore[misc]
+                default_historial().registrar(sentinelas["cookie"], False)
+                _require(canario not in real.read_text(encoding="utf-8"),
+                         "default_historial() escribe sin redactar")
+            finally:
+                config.DIAGNOSTICS_JSON = original  # type: ignore[misc]
+
+    # --- (5) Nadie escribe un historial por su cuenta --------------------
+    permitidos = {"history.py"}
+    ofensas: list[str] = []
+    for paquete in ("diagnostics", "player"):
+        directorio = Path(__file__).resolve().parents[1] / paquete
+        for ruta in sorted(directorio.rglob("*.py")):
+            if ruta.name in permitidos:
+                continue
+            texto = ruta.read_text(encoding="utf-8")
+            if "json.dump" in texto and ("diagnostics.json" in texto
+                                         or "DIAGNOSTICS_JSON" in texto):
+                ofensas.append(ruta.name)
+    _require(not ofensas, f"escritura de historial fuera de history.py: {ofensas}")
+
+    return (f"{len(sentinelas)} centinelas limpios en 3 destinos; la lectura no "
+            "redacta (comprobado); permisos 0600; 0 escrituras fuera de history.py")
+
+
 # ---------------------------------------------------------------------------
 # Registro
 # ---------------------------------------------------------------------------
@@ -1753,6 +1882,8 @@ CHECKS: tuple[tuple[str, str, Callable[[], str]], ...] = (
      check_historial_migracion_v2),
     ("historial_eventos_ciclo", "Playback lifecycle events",
      check_historial_eventos_ciclo_vida),
+    ("historial_redaccion", "History redaction at write time",
+     check_historial_redaccion_al_escribir),
 )
 
 
