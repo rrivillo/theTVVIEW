@@ -1025,8 +1025,80 @@ def check_catchup_capability_gate() -> str:
                     sondas.append(f"{path.name}:{node.lineno} {match.group(0)}")
     _require(not sondas, f"el paquete construye rutas de sonda de archivo: {sondas}")
 
+    # --- (5) Fase 1: el intervalo se rechaza y la plantilla se acota ----
+    # Lo que la Fase 0 encontró y la Fase 1 cerró: un intervalo invertido se
+    # normalizaba a un segundo y producía una URL. Si alguien relaja el
+    # `max(1, ...)` o quita la validación, este check tiene que ponerse rojo.
+    validar = getattr(catchup, "validar_intervalo", None)
+    _require(callable(validar),
+             "catchup.validar_intervalo no existe: el intervalo inválido "
+             "vuelve a normalizarse en silencio (CU-02)")
+    invertido = CatchupRequest("101", ahora, pasado)  # fin antes del inicio
+    try:
+        validar(invertido)
+    except IPTVError:
+        pass
+    else:
+        raise CheckFailure("un intervalo invertido pasó la validación (CU-02)")
+    try:
+        build_playback_request(con_archivo, cap, invertido, now=ahora)
+    except IPTVError:
+        pass
+    else:
+        raise CheckFailure("un intervalo invertido construyó una URL (CU-02)")
+
+    _require(int(getattr(catchup, "MAX_REQUEST_SECONDS", 0)) > 0,
+             "catchup.MAX_REQUEST_SECONDS no está declarado (CU-02)")
+    _require(int(getattr(catchup, "MAX_TEMPLATE_LENGTH", 0)) > 0,
+             "catchup.MAX_TEMPLATE_LENGTH no está declarado (CU-03)")
+
+    # La plantilla de un tercero es una entrada no confiable: ni esquema raro,
+    # ni salto de línea (que en una URL es una cabecera inyectada).
+    from thetvview.catchup import render_source_template
+    for plantilla in ("file:///etc/passwd?s={start}",
+                      "javascript:alert(1)?s={start}",
+                      "http://a.test/x?s={start}\nX-Inyectada: 1",
+                      "http://a.test/x?s={marcador_que_no_existe}"):
+        try:
+            salida = render_source_template(plantilla, CatchupRequest("101", pasado, ahora))
+        except IPTVError:
+            continue
+        raise CheckFailure(f"la plantilla de un tercero pasó sin revisarse: {plantilla!r}")
+    # El salto de línea se comprueba aparte: `validate_url` también lo
+    # rechaza, así que el test de arriba pasaría igual si el módulo dejara de
+    # mirarlo. Aquí se exige que el propio render no devuelva control alguno.
+    for plantilla in ("http://a.test/x?s={start}\nX: 1",
+                      "http://a.test/x?s={start}\r\nX: 1"):
+        try:
+            salida = render_source_template(plantilla, CatchupRequest("101", pasado, ahora))
+        except IPTVError:
+            continue
+        raise CheckFailure(
+            f"render_source_template devolvió caracteres de control: {salida!r}")
+    # Y una plantilla legítima sigue funcionando (el control no puede ser
+    # tan estricto que rompa el caso normal).
+    legitima = render_source_template("http://a.test/x?s={start}",
+                                      CatchupRequest("101", pasado, ahora))
+    _require(f"s={int(pasado.timestamp())}" in legitima,
+             "una plantilla legítima de catch-up dejó de renderizarse (CU-03)")
+
+    # Las causas de fallo se distinguen: sin eso, el modal dice «falló» y el
+    # usuario no sabe si recargar credenciales o esperar la red (CU-04).
+    from thetvview.catchup import describe_unavailable
+    from thetvview.player.errors import StreamErrorCode
+    _require(describe_unavailable(StreamErrorCode.AUTH_FAILED)
+             is CatchupState.AUTH_FAILED,
+             "un fallo de autenticación no se distingue (CU-04)")
+    _require(describe_unavailable(StreamErrorCode.CONNECTION_TIMEOUT)
+             is CatchupState.NETWORK,
+             "un fallo de red no se distingue (CU-04)")
+    _require(describe_unavailable(None) is CatchupState.UNKNOWN,
+             "un fallo sin clasificar no es «desconocido» (CU-04: "
+             "desconocido ≠ falso)")
+
     return (f"capacidad fail-closed, ventana respetada, referencia opaca "
-            f"({len(opaca)} chars) sin credenciales, 0 rutas de sonda")
+            f"({len(opaca)} chars) sin credenciales, 0 rutas de sonda, "
+            f"intervalo rechazado, plantilla acotada, causas separadas")
 
 
 # ---------------------------------------------------------------------------
