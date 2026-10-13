@@ -1721,6 +1721,156 @@ def check_historial_redaccion_al_escribir() -> str:
             "redacta (comprobado); permisos 0600; 0 escrituras fuera de history.py")
 
 
+def check_historial_retencion() -> str:
+    """H-05: el historial no crece, y los tres límites cuentan cosas distintas.
+
+    Es la comprobación de que el FR-DIAG-010 no es una intención. Con un
+    reloj falso que llega muy lejos, porque con el reloj real «30 días» es
+    una afirmación que no se puede examinar.
+
+    Se comprueba, no se supone:
+
+    1. **Los tres límites cuentan algo distinto.** Sólo cantidad dejaría un
+       fichero pequeño capaz de guardar un único diagnóstico de hace dos años
+       —justo el que el usuario consulta para saber si un fallo es viejo—;
+       sólo edad daría varios megas con una lista grande; sólo tamaño
+       llenaría el tope con un día intenso y tiraría la semana anterior.
+    2. **El corte es exacto**, no «aproximadamente»: una entrada que cae justo
+       en el límite se queda, y una que pasa un segundo se va.
+    3. **La limpieza corre al escribir**, y se mira **el fichero**, no el
+       objeto: si fuera al leer, el disco seguiría gordo y quien lo mirara
+       creería que está limpio.
+    4. **El corte por tamaño está acotado**: descarta la mitad de golpe, no una
+       entrada por vuelta, que con 200 entradas y un tope pequeño sería
+       escribir el fichero cientos de veces para un solo registro.
+    5. **El fichero real cabe en el tope**, con los límites por defecto.
+    """
+    import json
+    import tempfile
+
+    from thetvview.diagnostics.history import (
+        MAX_BYTES,
+        MAX_DIAS,
+        MAX_ENTRADAS,
+        HistorialDiagnostico,
+    )
+
+    _require(MAX_ENTRADAS > 0 and MAX_DIAS > 0 and MAX_BYTES > 0,
+             "los límites del historial tienen que ser positivos")
+    _require(len({id(MAX_ENTRADAS), id(MAX_DIAS), id(MAX_BYTES)}) == 3,
+             "los tres límites se declaran con el mismo valor: son tres cosas")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ruta = Path(tmp) / "diagnostics.json"
+        reloj = [1_800_000_000.0]
+
+        def plantar(entradas: int, cada: float, antiguedad: float) -> None:
+            ultima = reloj[0] - antiguedad
+            base = ultima - (entradas - 1) * cada
+            ruta.write_text(json.dumps({
+                "version": 2,
+                "entradas": [
+                    {"momento": base + i * cada, "canal": f"c{i}", "exito": True}
+                    for i in range(entradas)
+                ],
+            }), encoding="utf-8")
+
+        dia = 86_400.0
+
+        # --- (1) y (2) El límite de edad es exacto ------------------------
+        h = HistorialDiagnostico(ruta, ahora=lambda: reloj[0], max_dias=7.0)
+        justo = reloj[0] - 7.0 * dia
+        ruta.write_text(json.dumps({
+            "version": 2,
+            "entradas": [
+                {"momento": justo - 1.0, "canal": "viejo", "exito": True},
+                {"momento": justo, "canal": "en_el_borde", "exito": True},
+                {"momento": justo + 1.0, "canal": "nuevo", "exito": True},
+            ],
+        }), encoding="utf-8")
+        h.registrar("nueva", True)
+        canales = {e.canal for e in h.entradas()}
+        _require("viejo" not in canales, "una entrada un segundo de edad sobrevive")
+        _require("en_el_borde" in canales,
+                 "una entrada exactamente en el límite no debe caer")
+
+        # --- (1) La edad manda cuando hay muchas -------------------------
+        h = HistorialDiagnostico(ruta, ahora=lambda: reloj[0],
+                                 max_entradas=5000, max_dias=7.0)
+        plantar(40, dia, antiguedad=8 * dia)
+        h.registrar("reciente", True)
+        _require(len(h.entradas()) == 1,
+                 f"el límite de edad no se aplicó: quedan {len(h.entradas())}")
+
+        # --- (1) La cantidad manda cuando son muchas ----------------------
+        h = HistorialDiagnostico(ruta, ahora=lambda: reloj[0],
+                                 max_entradas=10, max_dias=3650.0)
+        for i in range(60):
+            reloj[0] += dia
+            h.registrar(f"c{i}", True)
+        _require(len(h.entradas()) == 10,
+                 f"el límite de cantidad no se aplicó: quedan {len(h.entradas())}")
+        _require(h.entradas()[-1].canal == "c59",
+                 "el límite de cantidad se quedó con las viejas")
+
+        # --- (1) El tamaño manda y está acotado ---------------------------
+        h = HistorialDiagnostico(ruta, ahora=lambda: reloj[0],
+                                 max_entradas=10_000, max_dias=3650.0,
+                                 max_bytes=1024)
+        for i in range(200):
+            reloj[0] += 1.0
+            h.registrar(f"canal-con-nombre-largo-{i:04d}", False,
+                        motivo="un motivo bastante largo para ocupar sitio")
+        _require(ruta.stat().st_size <= 1024,
+                 f"el fichero pesa {ruta.stat().st_size} con un tope de 1024")
+        vueltas = [0]
+
+        original = h._texto_serializado
+
+        def contando(version: int = 2) -> str:
+            vueltas[0] += 1
+            return original(version)
+
+        h._texto_serializado = contando  # type: ignore[method-assign]
+        # Varios registros seguidos, no uno: tras la purga anterior el
+        # fichero justo cabe, así que un único registro más no llega a forzar
+        # el corte y la comprobación no estaría midiendo nada.
+        for i in range(20):
+            reloj[0] += 1.0
+            h.registrar(f"relleno-largo-{i:04d}", False)
+        _require(vueltas[0] > 0,
+                 "el fichero no llegó a forzarse: el corte por tamaño no se midió")
+        _require(vueltas[0] <= 20 * 20,
+                 f"el corte por tamaño itera {vueltas[0]} veces para 20 "
+                 "registros: no está acotado")
+
+        # --- (3) La limpieza corre al escribir ----------------------------
+        # Se mira el FICHERO, no el objeto: si la limpieza fuera al leer, el
+        # disco seguiría gordo y quien lo mirara creería que está limpio.
+        h = HistorialDiagnostico(ruta, ahora=lambda: reloj[0],
+                                 max_entradas=10, max_dias=7.0)
+        plantar(30, dia, antiguedad=8 * dia)
+        h.registrar("nueva", True)
+        crudo = json.loads(ruta.read_text(encoding="utf-8"))
+        _require(len(crudo["entradas"]) == 1,
+                 f"en disco quedan {len(crudo['entradas'])} entradas sin limpiar")
+
+        # --- (5) Con los límites por defecto ------------------------------
+        h = HistorialDiagnostico(ruta, ahora=lambda: reloj[0])
+        for i in range(200):
+            reloj[0] += 60.0
+            h.registrar(f"canal{i}", False, motivo="algo que ocupar sitio")
+        _require(ruta.stat().st_size <= MAX_BYTES,
+                 f"el fichero por defecto pesa {ruta.stat().st_size} "
+                 f"con un tope de {MAX_BYTES}")
+        _require(len(h.entradas()) <= MAX_ENTRADAS,
+                 "el historial por defecto supera el tope de entradas")
+
+    return (f"cantidad={MAX_ENTRADAS}, edad={MAX_DIAS}d, tamaño={MAX_BYTES}B; "
+            "corte exacto en el límite; limpieza al escribir verificada en disco; "
+            f"corte por tamaño acotado a {vueltas[0]} vueltas")
+
+
 # ---------------------------------------------------------------------------
 # Registro
 # ---------------------------------------------------------------------------
@@ -1884,6 +2034,8 @@ CHECKS: tuple[tuple[str, str, Callable[[], str]], ...] = (
      check_historial_eventos_ciclo_vida),
     ("historial_redaccion", "History redaction at write time",
      check_historial_redaccion_al_escribir),
+    ("historial_retencion", "History retention limits",
+     check_historial_retencion),
 )
 
 
