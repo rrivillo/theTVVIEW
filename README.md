@@ -54,7 +54,11 @@ ver y con qué reproductor.
   los detalles finos se han ido puliendo en base a la metodología de trabajo
   por Spec-Driven Development (SDD). Esos documentos no serán subidos
   al reprositorio Git del proyecto, ya que considero que aumentan el tamaño
-  del proyecto, sin una justificación que lo sostenga.  
+  del proyecto, sin una justificación que lo sostenga. 
+- A partir del 13 de Octubre de 2026, se incorporó para algunas cosas funcionalidades
+  del proyecto https://github.com/Gentleman-Programming/gentle-ai , específicamente
+  los MCP de  context7 y engram. Aunque no los conozca,
+  agradezco el trabajo de Alan-TheGentleman y sus colaboradores en sus herramientas.
 
 ---
 
