@@ -2043,6 +2043,21 @@ class App:
                                    actions=modal_actions()))
         return res == "aceptar"
 
+    def _confirm_risk(self, title: str, message: str) -> bool:
+        """Modal de riesgo propio: el botón dice lo que va a pasar.
+
+        Un «Aceptar» genérico en una pregunta de riesgo hides el riesgo: el
+        usuario pulsa sin saber qué consiente. Por eso el botón de acción
+        derecha se llama «Intentar de todos modos».
+        """
+        from .widgets import Modal, modal_actions
+
+        res = self._run_modal(
+            Modal(title, message, ["Ver el directo", "Intentar de todos modos"],
+                  actions=modal_actions())
+        )
+        return res == "intentar de todos modos"
+
     def show_diagnose(self, channel: Channel, *, con_conexion: bool = False) -> None:
         """Informe de diagnóstico de un canal en un modal (SDD-M §21).
 
@@ -2797,7 +2812,13 @@ class App:
         for aviso in session.take_avisos():
             self.notify_warning(aviso)
 
-    def play_catchup(self, channel: Channel, program: Program) -> None:
+    def play_catchup(
+        self,
+        channel: Channel,
+        program: Program,
+        *,
+        permitir_no_soportada: bool = False,
+    ) -> None:
         """Pide al proveedor un programa ya emitido y lo reproduce (§8, §10).
 
         El orden es el del SDD y es lo importante: **primero** se valida la
@@ -2812,7 +2833,10 @@ class App:
         cap = catchup.capability_for(channel)
         now = datetime.now().astimezone()
         estado = catchup.classify(channel, program, now)
-        if estado is not catchup.CatchupState.AVAILABLE:
+        if estado is not catchup.CatchupState.AVAILABLE and not (
+            permitir_no_soportada
+            and estado is catchup.CatchupState.UNSUPPORTED_TEMPLATE
+        ):
             # Ninguna petición histórica sale por aquí: sólo el porqué (§17).
             self.notify_warning(catchup.describe_state(estado, cap))
             return
@@ -2826,6 +2850,7 @@ class App:
         try:
             playback = catchup.build_playback_request(
                 channel, cap, request, now=now,
+                permitir_no_soportada=permitir_no_soportada,
             )
         except catchup.CatchupError as exc:
             # Plantilla que no reconocemos, mecanismo desconocido, esquema
@@ -3004,7 +3029,12 @@ class App:
             case "recheck_tracks":
                 self.recheck_tracks(action.get("channel"))
             case "play_catchup":
-                self.play_catchup(action["channel"], action["program"])
+                self.play_catchup(
+                    action["channel"],
+                    action["program"],
+                    # CU-07: el usuario ya aceptó el riesgo en un modal.
+                    permitir_no_soportada=bool(action.get("permitir_no_soportada")),
+                )
             case "stop_playback":
                 cur = self.screen
                 if isinstance(cur, NowPlayingScreen):

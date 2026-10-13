@@ -3422,6 +3422,19 @@ class EpgScreen(Screen):
         """True si el proveedor declaró archivo utilizable para este canal."""
         return catchup.can_use_catchup(self.catchup)
 
+    @property
+    def plantilla_no_soportada(self) -> bool:
+        """CU-07: declaró archivo, pero no sabemos escribir su dirección.
+
+        En ese caso la guía **no** muestra el icono de «disponible»: ofrecer
+        algo que después falla es peor que no ofrecerlo. Lo que sí se ofrece es
+        el intento bajo riesgo propio, con su aviso.
+        """
+        return bool(
+            catchup.can_use_catchup(self.catchup)
+            and not self.catchup.plantilla_soportada
+        )
+
     def refresh_programs(self) -> None:
         self.programs = self.app.ensure_epg(self.channel, url_hint=self.epg_url)
         self._list.set_items(self._rows())
@@ -3477,6 +3490,12 @@ class EpgScreen(Screen):
                 marker = icons.ICON_LIVE
             elif self._state_of(prog, now) is catchup.CatchupState.AVAILABLE:
                 marker = icons.ICON_PLAY
+            elif self._state_of(prog, now) is (
+                catchup.CatchupState.UNSUPPORTED_TEMPLATE
+            ):
+                # Hay archivo, pero no sabemos pedirlo: se marca distinto del
+                # «no disponible» sin mentir (CU-07).
+                marker = icons.ICON_LIVE_OFF
             else:
                 marker = icons.ICON_LIVE_OFF
             label = f"{prog.title}: {prog.sub_title}" if prog.sub_title else prog.title
@@ -3520,11 +3539,42 @@ class EpgScreen(Screen):
                     "channel": self.channel,
                     "program": prog,
                 }
+            if state is catchup.CatchupState.UNSUPPORTED_TEMPLATE:
+                # La lista declara archivo pero su plantilla usa marcadores que
+                # no reconocemos. No se promete: se explica y se ofrece el
+                # intento bajo riesgo propio, con su aviso (CU-07).
+                return self._ofrecer_intento(prog, state)
             # Sin catch-up declarado, o fuera de la ventana: se explica por
             # qué en un modal, con el motivo exacto (§13). No se ofrece una
             # acción que no existe.
             _warn(self.app, catchup.describe_state(state, self.catchup))
         return None
+
+    def _ofrecer_intento(self, prog, state) -> dict | None:  # noqa: ANN001
+        """Modal de riesgo propio y, si el usuario acepta, el intento.
+
+        El aviso va **antes** de la pregunta, no después: quien acepta ya
+        tiene que saber lo que está aceptando. Cancelar no cuesta nada y
+        deja el directo disponible, que es la salida por defecto.
+        """
+        motivo = catchup.describe_state(state, self.catchup)
+        aviso = catchup.aviso_riesgo_propio(self.catchup.source_template)
+        fn = getattr(self.app, "_confirm_risk", None) or getattr(
+            self.app, "_confirm", None
+        )
+        if not callable(fn):
+            # Sin UI (tests, dobles): se explica y no se ofrece nada.
+            _warn(self.app, motivo)
+            return None
+        acepta = fn("Pedir el archivo bajo tu propio riesgo", f"{motivo}\n\n{aviso}")
+        if not acepta:
+            return {"action": "open_channel", "channel": self.channel}
+        return {
+            "action": "play_catchup",
+            "channel": self.channel,
+            "program": prog,
+            "permitir_no_soportada": True,
+        }
 
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
         max_y, max_x = self.app.stdscr.getmaxyx()

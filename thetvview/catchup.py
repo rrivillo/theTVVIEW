@@ -82,6 +82,10 @@ __all__ = [
     "validar_intervalo",
     "MAX_TEMPLATE_LENGTH",
     "MAX_TEMPLATE_VALUE_LENGTH",
+    "plantilla_soportada",
+    "motivo_plantilla_no_soportada",
+    "aviso_riesgo_propio",
+    "marcar_soportada",
     "StreamErrorCode",
     "describe_unavailable",
     "texto_indisponibilidad",
@@ -208,6 +212,17 @@ class CatchupCapability:
     archive_duration_seconds: int = 0
     source_template: str = ""
     protocol: str = PROTOCOL_GENERIC
+    #: CU-07: ¿sabe theTVVIEW construir esta plantilla?
+    #:
+    #: El proveedor puede declarar archivo con una plantilla que usa marcadores
+    #: que no reconocemos (``{lutc}``, ``{Y}``, ``{timestamp}``…). Entonces
+    #: ``enabled`` sigue siendo ``True`` —el proveedor sí lo declaró— pero
+    #: ``plantilla_soportada`` es ``False`` y la guía no promete un archivo que
+    #: no sabe construir.
+    #:
+    #: ``True`` es el valor por defecto y significa «no aplica»: los mecanismos
+    #: que no pasan por plantilla (Xtream) no tienen nada que comprobar.
+    plantilla_soportada: bool = True
 
     @property
     def archive_duration_days(self) -> int:
@@ -220,6 +235,19 @@ class CatchupCapability:
     def has_window(self) -> bool:
         """True si hay ventana declarada (sin ella no hay catch-up, §16)."""
         return self.archive_duration_seconds > 0
+
+    @property
+    def construible(self) -> bool:
+        """True si el mecanismo se puede construir con lo que sabemos.
+
+        Es la condición que la UI usa para **ofrecer** archivo. Distingue dos
+        cosas que antes iban juntas y que el usuario percibe distintas:
+
+        - el proveedor declaró archivo (``enabled``) — es un hecho del canal;
+        - nosotros sabemos construir la dirección (``construible``) — es un
+          límite nuestro, y se puede sortear avisando (§CU-07).
+        """
+        return bool(self.enabled and self.plantilla_soportada)
 
 
 #: Sin declaración del proveedor: la respuesta por defecto de todo el
@@ -245,6 +273,11 @@ class CatchupState(Enum):
     #: ``OUTSIDE_ARCHIVE_WINDOW`` porque la reacción es otra (informar del dato,
     #: no esperar a que vuelva la copia).
     INVALID_INTERVAL = "invalid_interval"
+    #: CU-07: el proveedor declaró archivo pero su plantilla usa marcadores
+    #: que no sabemos construir. No es «no hay archivo» ni «está fuera de
+    #: ventana»: el archivo probablemente está ahí, lo que falta es poder
+    #: escribir la dirección. Se puede intentar bajo riesgo propio.
+    UNSUPPORTED_TEMPLATE = "unsupported_template"
 
     # --- Estados de indisponibilidad (CU-04) --------------------------------
     #
@@ -373,7 +406,22 @@ def from_m3u_attrs(attrs: dict[str, str]) -> CatchupCapability:
         archive_duration_seconds=days * SECONDS_PER_DAY,
         source_template=template,
         protocol=PROTOCOL_M3U,
+        # CU-07: que el proveedor declare archivo no significa que sepamos
+        # construir su dirección. Se marca aparte en vez de rechazarlo, para
+        # poder ofrecer el intento bajo riesgo propio.
+        plantilla_soportada=plantilla_soportada(template),
     )
+
+
+def marcar_soportada(
+    capacidad: CatchupCapability, soportada: bool
+) -> CatchupCapability:
+    """Devuelve la capacidad con la marca de plantilla cambiada.
+
+    Existe para el caso de que otro sitio (un test, una migración) quiera
+    fijarla sin reconstruirla. :func:`capability_for` la calcula sola.
+    """
+    return replace(capacidad, plantilla_soportada=bool(soportada))
 
 
 def capability_for(channel: "Channel | object") -> CatchupCapability:
@@ -475,10 +523,13 @@ def classify(
 ) -> CatchupState:
     """Estado estable de catch-up para un programa concreto (§12).
 
-    Devuelve uno de los tres estados que dependen sólo del proveedor:
+    Devuelve uno de los estados que dependen sólo del proveedor y de lo que
+    sabemos construir:
 
     - :attr:`CatchupState.DISABLED_BY_PROVIDER` — no hay declaración, o la
       declaración llega sin ventana utilizable;
+    - :attr:`CatchupState.UNSUPPORTED_TEMPLATE` — sí hay declaración y
+      ventana, pero la plantilla usa marcadores que no reconocemos (CU-07);
     - :attr:`CatchupState.AVAILABLE` — declarado y dentro de la ventana;
     - :attr:`CatchupState.OUTSIDE_ARCHIVE_WINDOW` — declarado pero el
       programa queda fuera de la ventana.
@@ -490,6 +541,8 @@ def classify(
     capability = capability_for(channel)
     if not can_use_catchup(capability):
         return CatchupState.DISABLED_BY_PROVIDER
+    if not capability.plantilla_soportada:
+        return CatchupState.UNSUPPORTED_TEMPLATE
     if program is not None and is_within_archive_window(program, capability, now):
         return CatchupState.AVAILABLE
     return CatchupState.OUTSIDE_ARCHIVE_WINDOW
@@ -548,6 +601,24 @@ def describe_state(
             "El horario de este programa no sirve para pedir el archivo: la "
             "guía dice que termina antes de empezar, o dura demasiado. Es un "
             "dato de la guía, no un problema del proveedor."
+        )
+    if state is CatchupState.UNSUPPORTED_TEMPLATE:
+        plantilla = capability.source_template if capability else ""
+        if _marcadores_desconocidos(plantilla):
+            # Hay marcadores nuestros: se puede intentar algo, y el modal lo dice.
+            return (
+                f"Esta lista declara archivo, pero su plantilla usa "
+                f"{_lista_marcadores_desconocidos(plantilla)} y theTVVIEW no "
+                f"reconoce esos marcadores (sí reconoce: "
+                f"{', '.join(_TEMPLATE_PLACEHOLDERS)}). El contenido probablemente "
+                "está disponible: lo que no sabemos es escribir la dirección. "
+                "Puedes pedirlo de todos modos, a tu riesgo, o ver el directo."
+            )
+        # Sin ningún marcador nuestro no hay nada que intentar: sería adivinar.
+        return (
+            "Esta lista declara archivo, pero su plantilla no se puede usar: "
+            f"{motivo_plantilla_no_soportada(plantilla)} No hay forma segura de "
+            "pedirlo, así que sólo se puede ver el directo."
         )
     if state is CatchupState.ERROR:
         return (
@@ -823,6 +894,7 @@ def build_playback_request(
     request: "CatchupRequest",
     *,
     now: datetime | None = None,
+    permitir_no_soportada: bool = False,
 ) -> PlaybackRequest:
     """Valida (§10) y **después** construye la petición. Nunca al revés.
 
@@ -835,6 +907,10 @@ def build_playback_request(
         capability: resultado de :func:`capability_for`.
         request: intervalo solicitado (admite seek).
         now: instante de referencia; por defecto, ``datetime.now()``.
+        permitir_no_soportada: CU-07. Con ``True`` se construye la mejor
+            dirección posible aunque la plantilla use marcadores que no
+            reconocemos, omitiéndolos. Sólo tiene sentido si el usuario ya
+            aceptó el riesgo en un modal: aquí no se pregunta.
 
     Raises:
         CatchupNotAvailableError: el proveedor no declaró archivo (§10).
@@ -846,6 +922,10 @@ def build_playback_request(
         raise CatchupNotAvailableError(
             "Este canal no tiene archivo declarado por el proveedor, así que "
             "no se genera ninguna petición histórica."
+        )
+    if not capability.plantilla_soportada and not permitir_no_soportada:
+        raise CatchupError(
+            describe_state(CatchupState.UNSUPPORTED_TEMPLATE, capability)
         )
     moment = _aware(now) if now is not None else _aware(datetime.now())
     # CU-02: el intervalo se comprueba **antes** de la ventana. Un intervalo
@@ -863,7 +943,24 @@ def build_playback_request(
             "El proveedor declara archivo, pero theTVVIEW no reconoce su "
             "mecanismo; no se intenta construir la dirección."
         )
-    return adapter.build(channel, capability, request)
+    if not permitir_no_soportada:
+        return adapter.build(channel, capability, request)
+    # El mismo adaptador, pero con la plantilla tolerante a los marcadores que
+    # no sabemos. Se reusa el camino de siempre: no hay una segunda ruta.
+    if adapter.protocol != PROTOCOL_M3U:
+        # Sólo el mecanismo de plantilla tiene marcadores que omitir; los
+        # demás no cambian con este permiso.
+        return adapter.build(channel, capability, request)
+    rendered = render_source_template(
+        capability.source_template, request, permitir_desconocidos=True
+    )
+    return PlaybackRequest(
+        channel=channel,
+        url=rendered,
+        start=request.start,
+        duration=request.duration_seconds,
+        title="",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -932,16 +1029,33 @@ def _validar_valor_renderizado(nombre: str, valor: object) -> str:
     return texto
 
 
-def render_source_template(template: str, request: CatchupRequest) -> str:
+def render_source_template(
+    template: str,
+    request: CatchupRequest,
+    *,
+    permitir_desconocidos: bool = False,
+) -> str:
     """Rellena ``{start}``/``{end}``/``{duration}``/``{utc}`` de la plantilla.
 
     Se usa ``string.Formatter`` en vez de ``str.replace`` para poder
     **rechazar** lo que no se reconoce en vez de dejarlo pasar literal.
 
+    Args:
+        template: la plantilla declarada por el proveedor.
+        request: la petición, de donde salen los valores.
+        permitir_desconocidos: CU-07. Con ``True``, los marcadores que no
+            reconocemos **se omiten** en lugar de rechazar la plantilla. Es el
+            intento bajo riesgo propio: se entrega la mejor dirección posible,
+            no una adivinanza, y la UI lo avisa antes de preguntar.
+
+            Solo se omiten marcadores. Las protecciones de seguridad —esquema,
+            saltos de línea, longitud, valores reservados— siguen aplicando
+            igual: permitir esto no es «acepta cualquier cosa».
+
     Raises:
-        CatchupError: placeholder desconocido, especificadores de formato,
-            sintaxis rota, o plantilla sin ningún marcador de tiempo (eso
-            significaría una URL fija que no lleva a ninguna parte).
+        CatchupError: placeholder desconocido (salvo que se permita), esquema
+            no permitido, especificadores de formato, sintaxis rota, o
+            plantilla sin ningún marcador de tiempo.
     """
     if not isinstance(template, str) or not template.strip():
         raise CatchupError(
@@ -979,6 +1093,13 @@ def render_source_template(template: str, request: CatchupRequest) -> str:
                 "theTVVIEW no admite; no se intenta construir la dirección."
             )
         if field_name not in _TEMPLATE_PLACEHOLDERS:
+            if permitir_desconocidos:
+                # CU-07: se omite el marcador, se conserva el resto del texto.
+                # La decisión ya la tomó el usuario en un modal; aquí sólo se
+                # ejecuta. Los parámetros que el proveedor esperaba se
+                #quedan sin valor, que es mejor que mandar el nombre del
+                # marcador literal en la URL.
+                continue
             known = ", ".join(_TEMPLATE_PLACEHOLDERS)
             raise CatchupError(
                 f"La plantilla de archivo usa «{{{field_name}}}», que no es de "
@@ -993,6 +1114,120 @@ def render_source_template(template: str, request: CatchupRequest) -> str:
             "instante; no se intenta construir la dirección."
         )
     return CatchupAdapter._validate_playable("".join(chunks))
+
+
+# ---------------------------------------------------------------------------
+# Plantillas que no sabemos construir (CU-07)
+# ---------------------------------------------------------------------------
+
+
+def _marcadores_desconocidos(plantilla: str) -> set[str]:
+    """Marcadores que aparecen en la plantilla y no reconocemos.
+
+    No lanza: es una consulta sobre texto de terceros. Lo que no puede
+    juzgarse (una plantilla mal formada) se informa aparte.
+    """
+    try:
+        parsed = list(string.Formatter().parse(plantilla))
+    except ValueError:
+        return set()
+    return {
+        campo
+        for _, campo, _, _ in parsed
+        if campo and campo not in _TEMPLATE_PLACEHOLDERS
+    }
+
+
+def plantilla_soportada(plantilla: str) -> bool:
+    """¿Podemos construir una dirección con esta plantilla?
+
+    Es una **consulta**: devuelve ``False`` ante cualquier cosa rara y nunca
+    lanza. La usa la guía para no ofrecer un archivo que después fallaría.
+
+    Se considera soportada si la plantilla se puede parsear, trae al menos un
+    marcador de tiempo que reconocemos, no usa especificadores de formato y no
+    lleva caracteres de control.
+    """
+    if not isinstance(plantilla, str) or not plantilla.strip():
+        return False
+    if len(plantilla) > MAX_TEMPLATE_LENGTH:
+        return False
+    if _CONTROL_IN_TEMPLATE.intersection(plantilla):
+        return False
+    try:
+        parsed = list(string.Formatter().parse(plantilla))
+    except ValueError:
+        return False
+    conocidos = False
+    for _, campo, spec, conversion in parsed:
+        if spec or conversion:
+            return False
+        if campo is None:
+            continue
+        if campo in _TEMPLATE_PLACEHOLDERS:
+            conocidos = True
+        else:
+            return False
+    return conocidos
+
+
+def motivo_plantilla_no_soportada(plantilla: str) -> str:
+    """Por qué no sabemos construir esta plantilla. Vacío si sí sabemos.
+
+    El motivo nombra el marcador o el problema concreto: un modal que dice
+    «no se reconoce la plantilla» sin más obliga al usuario a adivinar.
+    """
+    if not isinstance(plantilla, str) or not plantilla.strip():
+        return "El proveedor declaró una plantilla de archivo vacía."
+    if len(plantilla) > MAX_TEMPLATE_LENGTH:
+        return (
+            f"La plantilla de archivo del proveedor es demasiado larga "
+            f"({len(plantilla)} caracteres)."
+        )
+    if _CONTROL_IN_TEMPLATE.intersection(plantilla):
+        return "La plantilla de archivo trae saltos de línea o caracteres raros."
+    try:
+        parsed = list(string.Formatter().parse(plantilla))
+    except ValueError:
+        return "La plantilla de archivo del proveedor está mal formada."
+    desconocidos = _marcadores_desconocidos(plantilla)
+    if desconocidos:
+        lista = ", ".join(sorted(f"{{{n}}}" for n in desconocidos))
+        conocidos = ", ".join(_TEMPLATE_PLACEHOLDERS)
+        return (
+            f"El proveedor usa {lista} en su plantilla de archivo y "
+            f"theTVVIEW no reconoce ese marcador. Las que sí reconoce son: "
+            f"{conocidos}."
+        )
+    for _, campo, spec, conversion in parsed:
+        if spec or conversion:
+            return (
+                f"La plantilla usa «{{{campo}{spec}}}», con formato que "
+                "theTVVIEW no admite."
+            )
+        if conversion:
+            return f"La plantilla usa una conversión en «{{{campo}!{conversion}}}»."
+    return ""
+
+
+def _lista_marcadores_desconocidos(plantilla: str) -> str:
+    """Los marcadores que no reconocemos, en texto legible para un modal."""
+    return ", ".join(sorted(f"{{{n}}}" for n in _marcadores_desconocidos(plantilla)))
+
+
+def aviso_riesgo_propio(plantilla: str) -> str:
+    """El aviso que se muestra **antes** de intentar una plantilla no soportada.
+
+    Tiene que decir tres cosas: qué se va a intentar, qué puede pasar y que la
+    decisión es del usuario. Sin la última, el aviso parece un error.
+    """
+    lista = _lista_marcadores_desconocidos(plantilla) or "algunos marcadores"
+    return (
+        f"Puedes pedir el archivo bajo tu propio riesgo. La plantilla de esta "
+        f"lista usa {lista}, que theTVVIEW no reconoce, así que se van a quitar "
+        f"de la dirección. Puede que funcione y puede que el proveedor te "
+        f"devuelva otra cosa o directamente nada. Si cancelas, verás el directo."
+    )
 
 
 # ---------------------------------------------------------------------------

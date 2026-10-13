@@ -299,7 +299,14 @@ class TestPlayCatchupEnApp(unittest.TestCase):
         self.assertIn("ya no está disponible", mensaje)
 
     def test_plantilla_inutilizable_es_error_no_advertencia(self) -> None:
-        """§20.13: "no lo soporta" y "falló la reproducción" se distinguen."""
+        """§20.13: "no lo soporta" y "falló la reproducción" se distinguen.
+
+        CU-07 cambió el grado de esta situación: una plantilla con marcadores
+        que no reconocemos ya no es un error duro sino un aviso con salida
+        (el intento bajo riesgo propio se pregunta en la pantalla de la guía).
+        Aquí, sin ese permiso explícito, sigue sin reproducirse nada y el
+        motivo se explica como aviso, no como fallo de reproducción.
+        """
         self.app.notify_warning.reset_mock()
         self.app.notify_error.reset_mock()
         canal = Channel(
@@ -310,8 +317,23 @@ class TestPlayCatchupEnApp(unittest.TestCase):
         with mock.patch.object(ui_app, "play_channel") as play:
             ui_app.App.play_catchup(self.app, canal, self._programa())
         play.assert_not_called()
-        self.app.notify_error.assert_called_once()
-        self.app.notify_warning.assert_not_called()
+        (mensaje,), _ = self.app.notify_warning.call_args
+        self.assertIn("episodio", mensaje)
+        self.assertNotIn("falló la reproducción", mensaje)
+
+    def test_con_el_permiso_del_usuario_si_se_intenta(self) -> None:
+        """El permiso llega desde el modal: entonces sí se construye."""
+        canal = Channel(
+            name="M3U", url="http://p/1.ts", tvg_id="c.1",
+            attrs={"catchup": "append", "catchup_days": "7",
+                   "catchup_source": "http://p/ts?s={start}&ep={episodio}"},
+        )
+        with mock.patch.object(ui_app, "play_channel") as play:
+            ui_app.App.play_catchup(
+                self.app, canal, self._programa(), permitir_no_soportada=True,
+            )
+        playback = play.call_args.kwargs["catchup_playback"]
+        self.assertNotIn("episodio", playback.url)
 
     def test_programa_sin_stop_usa_una_hora_por_defecto(self) -> None:
         sin_stop = Program("espanol.espn", "Indefinido", NOW - timedelta(hours=2), None)
