@@ -1,5 +1,8 @@
 """Fuentes alternativas y canales lógicos (Fase 5A)."""
 
+from .detection import *  # noqa: F401,F403
+from .failover import *  # noqa: F401,F403
+from .preferences import *  # noqa: F401,F403
 from .model import (
     ConfianzaCandidata,
     CandidateConfidence,
@@ -50,3 +53,19 @@ AssociationAlias = Association
 LogicalChannelModel = LogicalChannel
 SourceCandidateModel = SourceCandidate
 AssociationModel = Association
+
+
+# Ensure all public names from submodules are available.
+try:
+    from .detection import __all__ as _a1
+except Exception:
+    _a1 = []
+try:
+    from .failover import __all__ as _a2
+except Exception:
+    _a2 = []
+try:
+    from .preferences import __all__ as _a3
+except Exception:
+    _a3 = []
+__all__ = list(dict.fromkeys(list(globals().get("__all__", [])) + _a1 + _a2 + _a3))
