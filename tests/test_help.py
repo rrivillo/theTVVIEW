@@ -16,6 +16,7 @@ class TestHelpUnderstandable(unittest.TestCase):
         "PlaylistsScreen", "ChannelsScreen", "GroupsScreen",
         "FavoritesScreen", "RecentsScreen", "EpgScreen",
         "ResolutionScreen", "PlayerScreen", "NowPlayingScreen",
+        "SchedulerScreen",
     ]
 
     def test_help_is_contextual(self):

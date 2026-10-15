@@ -190,6 +190,92 @@ class TestNeedsRedactionForStorage(unittest.TestCase):
                 self.assertFalse(contains_password_param(url))
 
 
+class TestRutasDeStreamConCredenciales(unittest.TestCase):
+    """Fase 8 · U-02: la redacción en texto cubre más rutas que Xtream.
+
+    `redact_text` se usa en logs, modales y mensajes de estado. Ahí redactar
+    de más cuesta información en la presentación; redactar de menos pone una
+    contraseña delante del usuario. Este grupo cierra el segundo caso para las
+    rutas que los paneles de IPTV sirven a diario.
+    """
+
+    def test_hls_con_usuario_y_password_en_el_path(self) -> None:
+        out = redact_text("http://x/hls/alicia/secreto123/45678.m3u8")
+        self.assertNotIn("secreto123", out)
+        self.assertIn(REDACTED, out)
+
+    def test_streaming_con_credenciales(self) -> None:
+        out = redact_text("http://x/streaming/alicia/secreto123/channel/45678.m3u8")
+        self.assertNotIn("secreto123", out)
+
+    def test_panel_stream_con_credenciales(self) -> None:
+        out = redact_text("http://x/panel/stream/alicia/secreto123/45678.ts")
+        self.assertNotIn("secreto123", out)
+
+    def test_prefijos_de_stream_cubiertos(self) -> None:
+        for prefijo in ("live", "movie", "series", "hls", "stream", "streaming",
+                        "play", "vod", "timeshift", "catchup"):
+            with self.subTest(prefijo=prefijo):
+                url = f"http://x/{prefijo}/alicia/secreto123/45678.m3u8"
+                self.assertNotIn("secreto123", redact_text(url))
+
+    def test_una_url_sin_credenciales_no_se_toca(self) -> None:
+        """Sobre-redactar también es un fallo: borra información de verdad.
+
+        `/canales.m3u8` y `/panel/api.php` no llevan usuario ni contraseña, y
+        `***` en su lugar deja al usuario sin poder saber de qué lista habla.
+        """
+        for url in ("http://x/canales.m3u8", "http://x/panel/api.php",
+                    "http://cdn.example.com/live.m3u8"):
+            with self.subTest(url=url):
+                self.assertEqual(redact_text(url), url)
+
+    def test_idempotente_en_ruta_nueva(self) -> None:
+        url = "http://x/hls/alicia/secreto123/45678.m3u8"
+        una = redact_text(url)
+        self.assertEqual(redact_text(una), una)
+
+    def test_contains_secret_lo_detecta(self) -> None:
+        """El security-check usa este predicado: si no ve la ruta, no avisa."""
+        self.assertTrue(contains_secret("http://x/hls/alicia/secreto123/45678.m3u8"))
+
+
+class TestLoQueNoSeToca(unittest.TestCase):
+    """La separación que hace esto seguro: **texto** sí, **disco** no.
+
+    `needs_redaction_for_storage` decide si `favorites.py` y `recents.py`
+    **reescriben la URL en disco**, dejándola inservible. Ampliar ese predicado
+    destruiría el favorito de un canal cuyo path se parezca al de una ruta con
+    credenciales, y perder un favorito es peor que dejar una contraseña en un
+    log. Por eso la redacción amplia vive sólo en `redact_text`, y aquí se fija
+    esa frontera a propósito.
+    """
+
+    def test_ruta_nueva_no_dispara_la_reescritura_en_disco(self) -> None:
+        url = "http://x/hls/alicia/secreto123/45678.m3u8"
+        self.assertFalse(contains_embedded_login(url))
+        self.assertFalse(needs_redaction_for_storage(url))
+
+    def test_xtream_siempre_sigue_disparandola(self) -> None:
+        """Lo que ya se limpiaba antes, se sigue limpiando."""
+        for url in ("http://x/live/alicia/secreto123/45678.ts",
+                    "http://x/movie/alicia/secreto123/1.mkv",
+                    "rtsp://alicia:secreto123@host/live"):
+            with self.subTest(url=url):
+                self.assertTrue(contains_embedded_login(url))
+                self.assertTrue(needs_redaction_for_storage(url))
+
+    def test_la_frontera_esta_documentada_en_el_modulo(self) -> None:
+        """Que nadie lo 'arregle' después sin saber lo que rompe."""
+        import inspect
+
+        from thetvview.security import redaction
+
+        fuente = inspect.getsource(redaction).lower()
+        self.assertIn("favoritos", fuente)
+        self.assertIn("reescribe", fuente)
+
+
 class TestSecretStr(unittest.TestCase):
     def test_nunca_muestra_el_valor(self) -> None:
         s = SecretStr("hunter2")

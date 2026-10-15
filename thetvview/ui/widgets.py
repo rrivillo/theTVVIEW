@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import curses
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from . import colors
@@ -1024,6 +1025,42 @@ class SearchModal:
         return modal.render(stdscr, query=query, matched=matched, total=total)
 
 
+def checklist_actions(
+    *,
+    marcar: str = "Marcar",
+    cerrar: str = V.CERRAR,
+) -> list[Action]:
+    """`Espacio <marcar> · Esc <cerrar>`: el pie de :class:`ChecklistModal`.
+
+    Separate de `modal_actions` porque **aquí no hay botón de aceptar**: el
+    modal se guarda en cada marca, así que el pie no puede ofrecer un «Aceptar»
+    que no confirmaría nada. Ponerlo sería un botón que miente sobre lo que
+    hace (§35).
+    """
+    return [
+        Action("Espacio", marcar, P.PRIMARIA, essential=True),
+        Action("Esc", cerrar, P.NAVEGACION, essential=True),
+    ]
+
+
+def radio_actions(
+    *,
+    elegir: str = "Elegir",
+    cancelar: str = V.CANCELAR,
+) -> list[Action]:
+    """`Enter <elegir> · Esc <cancelar>`: el pie de un `ChecklistModal` en
+    modo ``radio`` (§35).
+
+    Separate de `checklist_actions` porque la casilla **no** guarda nada: acá
+    Enter elige una fila y se acabó. Ofrecer «Marcar» sería anunciar una
+    tecla que en este modal no existe.
+    """
+    return [
+        Action("Enter", elegir, P.PRIMARIA, essential=True),
+        Action("Esc", cancelar, P.NAVEGACION, essential=True),
+    ]
+
+
 def modal_actions(
     *,
     confirmar: str = V.CONFIRMAR,
@@ -1313,6 +1350,346 @@ class Modal:
                                       colors.pair(colors.PAIR_MUTED))
                     except curses.error:
                         pass
+
+
+@dataclass
+class ChecklistItem:
+    """Una fila de :class:`ChecklistModal`.
+
+    ``selectable=False`` no la esconde: la deja visible con su ``note`` al lado.
+    Una opción que no se puede tocar **y no aparece** parece un fallo de la
+    app; una que aparece y dice por qué es una respuesta.
+    """
+
+    key: str
+    label: str
+    checked: bool = False
+    note: str = ""
+    selectable: bool = True
+
+
+class ChecklistModal:
+    """Modal de lista con casillas: elegir varias cosas a la vez.
+
+    Es un widget **nuevo** y no una extensión de :class:`Modal`, a propósito.
+    ``Modal`` es mensaje + botones, y sus veinte usos actuales dependen de
+    ese contrato; meterle una lista sería tocar veinte modales para
+    resolver un caso que sólo es éste.
+
+    La casilla **no se marca sola**: :meth:`handle_key` devuelve
+    ``("toggle", índice, nuevo_estado)`` y quien lo llama decide si el cambio
+    ocurrió. Marcar antes de guardar enseñaría un «sí» sobre algo que quizá
+    falló, y una lista de casillas es justo donde esa mentira se hace
+    visible. Quien guarda —:meth:`App._run_checklist`— vuelve con
+    :meth:`set_checked` o :meth:`set_error`.
+
+    Con ``radio=True`` el widget deja de ser una lista de casillas y pasa a
+    ser **una elección entre varias**: se dibuja sin casilla y Enter devuelve
+    ``("pick", índice)``. Es el mismo control de lista con otra pregunta
+    detrás —«¿cuáles?» contra «¿cuál?»—, y por eso comparte navegación,
+    recorte y scroll en vez de ser otro widget.
+
+    Navegación: ↑/↓ (o ``k``/``j``) mueven saltando las filas no marcables,
+    Espacio y Enter devuelven el toggle, Esc cierra. Lógica pura en
+    ``handle_key``, testeable sin curses iniciado.
+    """
+
+    #: Checkbox lleno y vacío. No son `ICON_STAR`: una estrella «marcada» se
+    #: lee como favorito, y aquí no significa eso.
+    MARCADO = "[✓]"
+    VACIO = "[ ]"
+
+    def __init__(
+        self,
+        title: str,
+        items: list[ChecklistItem] | None = None,
+        *,
+        subtitle: str = "",
+        actions: list[Action] | None = None,
+        empty: str = "No hay nada que elegir.",
+        radio: bool = False,
+    ) -> None:
+        self.title = title
+        self.subtitle = subtitle
+        self.items: list[ChecklistItem] = list(items or [])
+        self.actions: list[Action] = list(actions or [])
+        self.empty = empty
+        self.radio = bool(radio)
+        self.selected = 0
+        self.top = 0
+        self.error = ""
+        self._normalizar_seleccion()
+
+    # --- estado ------------------------------------------------------------
+    def _normalizar_seleccion(self) -> None:
+        """Deja ``selected`` sobre una fila marcable, o en 0 si no hay ninguna.
+
+        Con la lista llena de filas no marcables el índice se queda en 0 y
+        ``handle_key`` no hace nada: es un estado real (elegir entre
+        colecciones que no admiten lo que eliges), no un caso que disimular.
+        """
+        self.selected = max(0, min(self.selected, len(self.items) - 1))
+        if self.items and not self.items[self.selected].selectable:
+            for paso in (1, -1):
+                idx = self.selected
+                for _ in range(len(self.items)):
+                    idx += paso
+                    if 0 <= idx < len(self.items):
+                        if self.items[idx].selectable:
+                            self.selected = idx
+                            return
+
+    def set_checked(self, index: int, checked: bool) -> None:
+        """Refleja un cambio **ya guardado**. Índice fuera de rango: no hace nada."""
+        if 0 <= index < len(self.items):
+            self.items[index].checked = bool(checked)
+        self.error = ""
+
+    def set_error(self, message: str) -> None:
+        """Muestra un fallo junto a la lista, sin mover ninguna casilla."""
+        self.error = message or ""
+
+    def checked_keys(self) -> list[str]:
+        return [i.key for i in self.items if i.checked]
+
+    # --- líneas ------------------------------------------------------------
+    def _linea_item(self, item: ChecklistItem) -> str:
+        if self.radio:
+            # Sin casilla: marcar una fila que no se marca sería un control
+            # que miente sobre lo que hace (§10).
+            caja = "  "
+        elif item.selectable:
+            caja = self.MARCADO if item.checked else self.VACIO
+        else:
+            # Una fila no marcable no enseña una casilla que no va a obedecer:
+            # el hueco del mismo ancho mantiene las etiquetas alineadas y deja
+            # claro que ahí no hay nada que marcar.
+            caja = "  "
+        texto = f"{caja} {item.label}"
+        if item.note:
+            texto = f"{texto}  ({item.note})"
+        return texto
+
+    def text(self) -> str:
+        """Todo el texto del modal como una cadena (tests y depuración)."""
+        partes = [self.title]
+        if self.subtitle:
+            partes.append(self.subtitle)
+        if self.items:
+            partes.extend(self._linea_item(i) for i in self.items)
+        else:
+            partes.extend(self.empty.split("\n"))
+        if self.error:
+            partes.append(self.error)
+        return "\n".join(partes)
+
+    # --- teclas ------------------------------------------------------------
+    def _mover(self, paso: int) -> None:
+        """Mueve el cursor ``paso`` filas, saltando las no marcables.
+
+        **No da la vuelta** al llegar al final, como `ScrollableList`: en una
+        lista de tres elementos dentro de un modal, volver al principio sin
+        querer hace perder la casilla donde se estaba.
+        """
+        total = len(self.items)
+        idx = self.selected
+        for _ in range(total):
+            idx += paso
+            if idx < 0 or idx >= total:
+                return
+            if self.items[idx].selectable:
+                self.selected = idx
+                self.error = ""
+                return
+
+    def handle_key(self, key: int):  # noqa: ANN201 - triple o str o None
+        if key in (curses.KEY_DOWN, ord("j")):
+            self._mover(1)
+        elif key in (curses.KEY_UP, ord("k")):
+            self._mover(-1)
+        elif key in (27,):
+            return "cerrar"
+        elif key in (ord(" "), curses.KEY_ENTER, 10, 13):
+            if not self.items:
+                return None
+            item = self.items[self.selected]
+            if not item.selectable:
+                # No devuelve nada en ninguno de los dos modos: el llamador no
+                # toca nada y la fila conserva su motivo a la vista. En radio,
+                # elegir una fila no marcable saltaría el motivo y devolvería
+                # una elección que la propia lista dice que no existe.
+                return None
+            if self.radio:
+                return ("pick", self.selected)
+            self.error = ""
+            return ("toggle", self.selected, not item.checked)
+        return None
+
+    # --- dibujo ------------------------------------------------------------
+    def _visible(self, max_y: int) -> int:
+        return max(1, int(max_y) - 6)
+
+    def _filas(self) -> list[str]:
+        if not self.items:
+            # El texto vacío puede traer saltos de línea a propósito (explica
+            # en dos frases por qué no hay nada); se parte aquí para que cada
+            # frase sea su fila y ninguna se derrame sobre el borde.
+            return self.empty.split("\n")
+        return [self._linea_item(i) for i in self.items]
+
+    def _extra(self) -> int:
+        """Filas que no son de la lista: subtítulo y mensaje de error."""
+        return (1 if self.subtitle else 0) + (1 if self.error else 0)
+
+    def _hay_marcables(self) -> bool:
+        """¿Queda algo que el usuario pueda marcar?
+
+        Sin esto, un modal bloqueado («esta colección la decide una regla»)
+        seguiría anunciando `Espacio Marcar`: un pie que anuncia una tecla que
+        no hace nada es exactamente lo que el pie no puede hacer (§10).
+        """
+        return any(i.selectable for i in self.items)
+
+    def _caben(self, max_y: int) -> int:
+        """Cuántas filas de la lista se dibujan.
+
+        Vive aquí y no en `_calc_rect` porque **los dos** necesitan la misma
+        respuesta: el que calcula la caja (para saber cuánto alto es el modal)
+        y el que dibuja (para saber cuántas filas pintar). Calcularlo dos
+        veces fue la forma de que dejaran de cuadrar.
+        """
+        return max(1, min(len(self._filas()), self._visible(max_y) - self._extra()))
+
+    def _calc_rect(self, max_y: int, max_x: int) -> tuple[int, int, int, int]:
+        filas = self._filas()
+        extra = self._extra()
+        caben = self._caben(max_y)
+        # La lista se recorta por el final: sobreviven el título y las primeras
+        # filas, que es donde está lo que el usuario viene a mirar (§12).
+        visibles = filas[:caben]
+        # +1 por la fila del borde superior, donde va pintado el título.
+        contenido = len(visibles) + 1 + extra
+        # El pie es contenido: si no hay nada marcable, no se reserva fila ni
+        # se mide su ancho, porque no se va a pintar.
+        con_pie = bool(self.actions) and self._hay_marcables()
+        inner_h = contenido + (1 if con_pie else 0)
+        total_h = inner_h + 1  # borde inferior
+        ancho = max(
+            [cell_width(self.title) + 4, cell_width(self.subtitle or " ") + 4]
+            + [cell_width(f) + 4 for f in visibles]
+            + ([sum(a.chip_cells() + 1 for a in self.actions) + 4]
+               if con_pie else [])
+        )
+        total_w = min(ancho, max(2, max_x - 2))
+        y = max(0, (max_y - total_h) // 2)
+        x = max(0, (max_x - total_w) // 2)
+        return y, x, total_h, total_w
+
+    def render(self, stdscr: curses.window) -> None:
+        max_y, max_x = stdscr.getmaxyx()
+        if max_y < 6 or max_x < 16:
+            # Demasiado pequeño para un diálogo con borde: no se dibuja nada.
+            return
+        y, x, h, w = self._calc_rect(max_y, max_x)
+        filas = self._filas()
+        extra = self._extra()
+
+        try:
+            for sy in range(y + 1, min(y + h + 1, max_y - 1)):
+                stdscr.addstr(sy, min(x + 1, max_x - 1),
+                              " " * max(0, min(w, max_x - x - 2)),
+                              colors.pair(colors.PAIR_MUTED) | curses.A_DIM)
+        except curses.error:
+            pass
+
+        borde = colors.pair(colors.PAIR_MODAL_BORDER)
+        try:
+            stdscr.addstr(y, x,
+                          icons.BOX_D_TL + icons.BOX_D_H * (w - 2)
+                          + icons.BOX_D_TR, borde)
+            for row in range(1, h - 1):
+                stdscr.addstr(y + row, x, icons.BOX_D_V, borde)
+                stdscr.addstr(y + row, x + w - 1, icons.BOX_D_V, borde)
+            stdscr.addstr(y + h - 1, x,
+                          icons.BOX_D_BL + icons.BOX_D_H * (w - 2)
+                          + icons.BOX_D_BR, borde)
+        except curses.error:
+            pass
+
+        titulo = f" {self.title} "
+        tx = x + max(0, (w - cell_width(titulo)) // 2)
+        try:
+            stdscr.addstr(y, tx, clip_cells(titulo, max(0, w - 2)),
+                          colors.pair(colors.PAIR_PRIMARY) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        fila = y + 1
+        if self.subtitle:
+            try:
+                stdscr.addstr(fila, x + 2, clip_cells(self.subtitle, max(0, w - 4)),
+                              colors.pair(colors.PAIR_MUTED))
+            except curses.error:
+                pass
+            fila += 1
+
+        # Recorte: cuántas filas caben antes de la de error o el pie.
+        caben = self._caben(max_y)
+        inicio = self._top(caben, len(filas))
+        for offset in range(caben):
+            if inicio + offset >= len(filas):
+                break
+            idx = inicio + offset
+            if not self.items:
+                # Sin items las filas son el texto vacío, no filas de lista:
+                # no hay nada que resaltar ni que atenuar.
+                attr = colors.pair(colors.PAIR_MUTED)
+            else:
+                attr = colors.pair(colors.PAIR_NORMAL)
+                if idx == self.selected:
+                    attr |= curses.A_REVERSE
+                elif not self.items[idx].selectable:
+                    attr = colors.pair(colors.PAIR_MUTED) | curses.A_DIM
+            try:
+                stdscr.addstr(fila + offset, x + 2,
+                              clip_cells(filas[idx], max(0, w - 4)), attr)
+            except curses.error:
+                pass
+
+        fila += caben
+        if self.error:
+            try:
+                stdscr.addstr(fila, x + 2,
+                              clip_cells(self.error, max(0, w - 4)),
+                              colors.pair(colors.PAIR_ERROR) | curses.A_BOLD)
+            except curses.error:
+                pass
+
+        # Se recalcula aquí y no se hereda del cálculo de la caja: la
+        # decisión tiene que ser la misma en los dos sitios, y por eso
+        # vive en un método y no duplicada.
+        con_pie = bool(self.actions) and self._hay_marcables()
+        if con_pie and (y + h - 2) < max_y - 1:
+            pie = SEPARATOR.join(a.chip() for a in fit_actions(self.actions,
+                                                              max(0, w - 4)))
+            if pie:
+                px = x + max(2, (w - cell_width(pie)) // 2)
+                try:
+                    stdscr.addstr(y + h - 2, px,
+                                  clip_cells(pie, max(0, min(w - 4,
+                                                            max_x - 1 - px))),
+                                  colors.pair(colors.PAIR_MUTED))
+                except curses.error:
+                    pass
+
+    def _top(self, caben: int, total: int) -> int:
+        """Primera fila visible: mantiene el cursor dentro de la ventana."""
+        if self.selected < self.top:
+            self.top = self.selected
+        elif self.selected >= self.top + caben:
+            self.top = self.selected - caben + 1
+        self.top = max(0, min(self.top, max(0, total - caben)))
+        return self.top
 
 
 class FormModal:

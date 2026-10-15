@@ -33,6 +33,8 @@ __all__ = [
     "validate_favorites",
     "validate_recents",
     "validate_collections",
+    "validate_scheduled_tasks",
+    "validate_sources",
     "get_validator",
     "stamped",
     "ensure_version",
@@ -173,6 +175,130 @@ def validate_collections(data: Any) -> None:
                 raise StorageError("schema_version inválido en collections.") from None
 
 
+def validate_scheduled_tasks(data: Any) -> None:
+    """Valida ``scheduled_tasks.json``: documento versionado del planificador.
+
+    Acepta las dos formas que :class:`thetvview.scheduler.TaskStore` sabe
+    leer: el documento versionado ``{"version": N, "tasks": [...]}`` y la
+    lista simple de una versión anterior. Comprobar sólo que cada tarea es un
+    objeto con ``task_id`` y ``source`` en texto deja que un ``start_at``
+    corrupto llegue hasta la interfaz; por eso el instante se comprueba aquí
+    también.
+    """
+    if isinstance(data, dict):
+        _require(
+            isinstance(data.get("tasks"), list),
+            "scheduled_tasks.json debe contener una lista de tareas.",
+        )
+        tareas = data["tasks"]
+    elif isinstance(data, list):
+        tareas = data
+    else:
+        raise StorageError("scheduled_tasks.json debe contener una lista o un objeto.")
+
+    estados = {
+        "pending", "scheduled", "running", "completed",
+        "failed", "cancelled", "missed", "conflict", "skipped",
+    }
+    for i, tarea in enumerate(tareas):
+        _require(isinstance(tarea, dict), f"la tarea {i} no es un objeto.")
+        _require(
+            isinstance(tarea.get("task_id"), str) and tarea["task_id"].strip(),
+            f"task_id inválido en la tarea {i}.",
+        )
+        _require(
+            isinstance(tarea.get("source"), str) and tarea["source"].strip(),
+            f"source inválido en la tarea {i}.",
+        )
+        if "start_at" in tarea and tarea["start_at"] is not None:
+            _require(
+                isinstance(tarea["start_at"], (int, float))
+                and not isinstance(tarea["start_at"], bool),
+                f"start_at inválido en la tarea {i}.",
+            )
+        if "status" in tarea and tarea["status"] is not None:
+            _require(
+                str(tarea["status"]) in estados,
+                f"status inválido en la tarea {i}.",
+            )
+        if "conflicts" in tarea and tarea["conflicts"] is not None:
+            _require(
+                isinstance(tarea["conflicts"], list)
+                and all(isinstance(c, str) for c in tarea["conflicts"]),
+                f"conflicts inválido en la tarea {i}.",
+            )
+
+
+#: Tope de canales con asociación guardada. Está por el mismo motivo que en
+#: `validate_prefs`: un archivo que crece sin control es un archivo que
+#: alguien está llenando a mano o que viene de una versión con otro criterio.
+_MAX_CLAVES_FUENTES = 5_000
+_MAX_RECHAZOS_FUENTES = 50
+
+
+def validate_sources(data: Any) -> None:
+    """Valida ``sources.json``: fuente preferida y descartes, por canal.
+
+    Es un formato de **dos mapas de texto**, y se validan como tales: no una
+    lista de objetos donde el nombre pueda ser cualquier cosa. La
+    comprobación cara aquí no es el tipo sino el **tope**: un archivo con un
+    millón de descartes es un archivo que se ha llenado solo, y aceptarlo en
+    memoria es la forma de que la app se quede sin memoria justo al abrir el
+    modal que los muestra.
+    """
+    _require(isinstance(data, dict), "sources.json debe contener un objeto.")
+    max_claves = _MAX_CLAVES_FUENTES
+    for campo in ("asociaciones", "rechazos"):
+        if campo not in data:
+            continue
+        bloque = data[campo]
+        _require(
+            isinstance(bloque, dict),
+            f"{campo} en sources.json debe ser un objeto.",
+        )
+        _require(
+            len(bloque) <= max_claves,
+            f"sources.json trae {len(bloque)} claves en {campo}: "
+            f"el tope son {max_claves}.",
+        )
+        for clave, valor in bloque.items():
+            _require(
+                isinstance(clave, str) and clave.strip(),
+                f"las claves de {campo} deben ser texto no vacío.",
+            )
+            if campo == "asociaciones":
+                _require(
+                    isinstance(valor, dict),
+                    f"la asociación de «{clave}» no es un objeto.",
+                )
+                if "fuente" in valor:
+                    _require(
+                        isinstance(valor["fuente"], str),
+                        f"la fuente de «{clave}» debe ser texto.",
+                    )
+                if "candidata" in valor:
+                    _require(
+                        valor["candidata"] is None or isinstance(valor["candidata"], str),
+                        f"la candidata de «{clave}» debe ser texto o nulo.",
+                    )
+                if "fecha" in valor:
+                    _require(
+                        valor["fecha"] is None or isinstance(valor["fecha"], str),
+                        f"la fecha de «{clave}» debe ser texto o nulo.",
+                    )
+            else:
+                _require(
+                    isinstance(valor, list)
+                    and all(isinstance(v, str) for v in valor),
+                    f"los descartes de «{clave}» deben ser una lista de texto.",
+                )
+                _require(
+                    len(valor) <= _MAX_RECHAZOS_FUENTES,
+                    f"«{clave}» acumula {len(valor)} descartes: "
+                    f"el tope son {_MAX_RECHAZOS_FUENTES}.",
+                )
+
+
 #: Formato -> validador. Los nombres coinciden con el nombre de fichero sin
 #: extensión, que es como se registran en :mod:`thetvview.storage.json_store`.
 SCHEMAS: dict[str, Callable[[Any], None]] = {
@@ -182,6 +308,8 @@ SCHEMAS: dict[str, Callable[[Any], None]] = {
     "favorites": validate_favorites,
     "recents": validate_recents,
     "collections": validate_collections,
+    "scheduled_tasks": validate_scheduled_tasks,
+    "sources": validate_sources,
 }
 
 

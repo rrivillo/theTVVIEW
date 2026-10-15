@@ -35,6 +35,23 @@ DIAGNOSTICS_JSON: Path = DATA_DIR / "diagnostics.json"
 XTREAM_CACHE_DIR: Path = DATA_DIR / "xtream_cache"
 TRACK_CACHE_DIR: Path = DATA_DIR / "track_cache"
 IPC_DIR: Path = DATA_DIR / "ipc"
+#: Colecciones inteligentes (Fase 4 del plan P2, UI en Fase 8). El backend
+#: `collections/manager.py` exige la ruta como argumento: no impone ninguna,
+#: y sin ella la colección viviría sólo en memoria.
+COLLECTIONS_JSON: Path = DATA_DIR / "collections.json"
+#: Tareas del planificador de grabaciones (Fase 7, UI en Fase 8). Lo escribe
+#: `scheduler.TaskStore`, que lo trata como documento versionado.
+SCHEDULED_TASKS_JSON: Path = DATA_DIR / "scheduled_tasks.json"
+#: Destino por omisión de las grabaciones (Fase 6). Es una **propuesta**, no
+#: una política: la interfaz pide la carpeta y sólo entonces se valida con
+#: `recording.validar_destino()`. Por eso `ensure_dirs()` **no** lo crea: una
+#: carpeta vacía que el usuario nunca pidió sería ruido en su disco.
+RECORDINGS_DIR: Path = DATA_DIR / "grabaciones"
+#: Fuente preferida y descartes por canal lógico (Fase 5A · A-03, UI en Fase 8).
+#: Lo escribe `sources.AssociationStore`. Sólo guarda **claves derivadas del
+#: contenido** (identidad del canal + nombre de la lista) y el nombre de la
+#: fuente elegida: ninguna URL, ningún token, ningún `candidate_id`.
+SOURCES_JSON: Path = DATA_DIR / "sources.json"
 
 SUPPORTED_PLAYERS: tuple[str, ...] = ("mpv", "mplayer", "vlc")
 

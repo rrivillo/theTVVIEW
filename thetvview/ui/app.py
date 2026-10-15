@@ -26,17 +26,34 @@ from thetvview.epg_parser import (
     resolve_source,
 )
 from thetvview.m3u_parser import PlaylistValidation
+from thetvview.collections.manager import ColeccionesManager, ColeccionesManagerError
+from thetvview.collections.rules import (
+    ReglaInvalida,
+    evaluar_coleccion,
+    validar_regla,
+)
+from thetvview.collections.schema import Coleccion
+from . import colors, filters as filters_mod, rule_text, sources_view, theme
+from . import failover as failover_mod
+from . import recording as recording_mod
 from thetvview.favorites import FavoritesError, FavoritesManager
+from thetvview.channel_identity import channel_identity
 from thetvview.models import Channel, Playlist, Program
 from thetvview.platform_check import OS_WINDOWS, detect_os
 from thetvview.player.session import SessionRegistry
 from thetvview.playlist_manager import PlaylistError, PlaylistManager
 from thetvview.prefs import PrefsManager
 from thetvview.recents import RecentsManager
+from thetvview.security.redaction import redact_text
+from thetvview.sources.associations import (
+    AssociationStore,
+    AsociacionesError,
+    clave_candidata,
+    clave_logica,
+)
 from thetvview.stream_ref import is_opaque_ref
 from thetvview.tasks.manager import CancellationToken, TaskManager
 
-from . import colors, theme
 from .errormsg import describe_playlist_error
 from .widgets import FooterBar, HeaderBar, StatusBar
 from .screens import (
@@ -50,6 +67,7 @@ from .screens import (
     PlayerScreen,
     RecentsScreen,
     ResolutionScreen,
+    SchedulerScreen,
     Screen,
     _epg_channel_id,
     open_playlist,
@@ -318,6 +336,11 @@ _HELP_WHERE: dict[str, tuple[str, str]] = {
         "Recientes",
         "Aquí está lo último que reproduciste. Enter para volver a verlo.",
     ),
+    "CollectionsScreen": (
+        "Colecciones",
+        "Aquí están tus grupos de canales. Cada fila dice si la armaste tú, "
+        "si la decide una regla o si es una vista de la app.",
+    ),
     "EpgScreen": (
         "Guía (EPG)",
         "Aquí ves la programación del canal elegido.",
@@ -338,6 +361,10 @@ _HELP_WHERE: dict[str, tuple[str, str]] = {
         "Audio, subtítulos y calidad",
         "Aquí eliges el audio, los subtítulos y la calidad del canal, "
         "después eliges con qué reproductor verlo.",
+    ),
+    "SchedulerScreen": (
+        "Planificador",
+        "Aquí programa grabaciones para que empiecen solas a la hora indicada.",
     ),
 }
 
@@ -366,9 +393,18 @@ _HELP_HERE: dict[str, list[tuple[str, str]]] = {
         ("key", "g  ver los grupos (categorías) de esta lista."),
         ("key", "f  guardar o quitar el canal de favoritos (★)."),
         ("key", "e  ver la guía de programación (EPG) del canal."),
+        ("key", "c  abrir la lista de colecciones."),
+        ("key", "C  elegir en qué colecciones está este canal."),
+        ("key", "s  ver y elegir fuentes de este canal."),
+        ("key", "F  filtrar la lista: guía, catch-up, definición, grupo..."),
+        ("key", "X  quitar todos los filtros de golpe (te dice cuáles)."),
+        ("key", "o  cambiar el orden de la lista."),
         ("key", "R  actualizar la lista (los canales pueden cambiar)."),
         ("key", "p  elegir con qué reproductor ver el canal."),
         ("tip", "En búsqueda: Enter confirma, Esc borra la búsqueda."),
+        ("tip", "Filtros y búsqueda se juntan: los dos tienen que cumplirse."),
+        ("tip", "La definición es una estimación del nombre o del tvg-id:"),
+        ("tip", "la app no abre el canal para comprobarla."),
     ],
     "GroupsScreen": [
         ("key", "Enter  abrir el grupo y ver sus canales."),
@@ -385,6 +421,23 @@ _HELP_HERE: dict[str, list[tuple[str, str]]] = {
         ("key", "Enter  volver a ver el elemento seleccionado."),
         ("key", "f  guardar el elemento en favoritos."),
         ("key", "r  borrar todo el historial de recientes."),
+    ],
+    "CollectionsScreen": [
+        ("key", "Enter  ver el detalle de la colección."),
+        ("key", "a  crear una colección nueva (te pide el nombre)."),
+        ("key", "e  cambiarle el nombre."),
+        ("key", "d  borrarla (te dice cuántos canales se van con ella)."),
+        ("key", "m  ver y quitar sus canales."),
+        ("key", "R  darle una regla: campo, comparación y valor."),
+        ("tip", "En cada fila se lee el tipo: manual, inteligente o del sistema."),
+        ("tip", "Sólo una colección manual tiene canales que tú eliges: en las "
+                "demás, «m» no hace nada."),
+        ("tip", "Con «R» una manual pasa a decidirse sola por su regla: antes "
+                "te avisa de cuántos canales dejarían de contar."),
+        ("tip", "Una vista del sistema (Favoritos, Recientes) no se renombra "
+                "ni se borra: sus canales son los tuyos."),
+        ("tip", "Si un canal desaparece de tus listas, la colección lo avisa "
+                "pero sigue funcionando con el resto."),
     ],
     "EpgScreen": [
         ("key", "Enter  ver el directo del canal."),
@@ -422,6 +475,14 @@ _HELP_HERE: dict[str, list[tuple[str, str]]] = {
         ("tip", "El asterisco es una sola marca por lista: si marcas otra "
                 "opción, la anterior se desmarca."),
         ("tip", "Sólo aparecen las secciones con más de una opción."),
+    ],
+    "SchedulerScreen": [
+        ("key", "a  programar una grabación nueva."),
+        ("key", "Enter  ver el detalle de la tarea programada."),
+        ("key", "c  cancelar la tarea seleccionada."),
+        ("key", "d  borrar una tarea terminada o cancelada."),
+        ("key", "r  ver los recientes."),
+        ("tip", "Las grabaciones empiezan solas cuando llega su hora."),
     ],
 }
 
@@ -606,6 +667,29 @@ class _EpgLoadOutcome:
         self.cancelled = cancelled
 
 
+# Etiqueta de un canal para modales de fuentes.
+_ETIQUETA_DE_CANAL = ""
+
+
+def _etiqueta_de_canal(channel) -> str:  # noqa: ANN001 - Channel
+    """Nombre del canal, redactado por si su nombre arrastra un token."""
+    try:
+        return redact_text(str(getattr(channel, "name", "") or "")).strip() or "canal"
+    except Exception:
+        return "canal"
+
+
+def _no_se_marca_en_radio(item, marcado: bool):  # noqa: ANN001
+    """El `on_toggle` de un `ChecklistModal` en modo *radio*.
+
+    En radio `handle_key` devuelve «pick» y el bucle sale antes de llegar
+    aquí, así que no se guarda nada. Si algún día se llegara, **no** se marca:
+    marcar sin que nadie haya decidido sería enseñar un «sí» sobre una
+    elección que no ocurrió.
+    """
+    return "Esta lista elige una opción; aquí no se marca nada."
+
+
 class App:
     """Estado global + stack de pantallas + bucle de eventos."""
     def __init__(self, stdscr: curses.window) -> None:
@@ -623,6 +707,15 @@ class App:
         self.status.on_error = self._show_notice
         self.playlists = PlaylistManager(config.PLAYLISTS_JSON)
         self.favorites = FavoritesManager(config.FAVORITES_JSON)
+        # Colecciones (Fase 4, UI en Fase 8 · U-03). El gestor no decide el
+        # catálogo: se lo pasa quien lo pinte, porque `miembros()` cachea por
+        # identidad de la lista y una lista nueva en cada llamada no cachea.
+        # El proveedor de contexto se conecta aquí (U-04b): sin él, las
+        # colecciones por regla se evalúan contra campos vacíos.
+        self.collections = ColeccionesManager(
+            config.COLLECTIONS_JSON,
+            context_provider=self.contexto_de_reglas,
+        )
         self.prefs = PrefsManager()
         self.recents = RecentsManager()
         self.epg: Epg | None = None
@@ -659,6 +752,13 @@ class App:
         self._warm_lock = threading.Lock()
         self._warm_queue: list[str] = []
         self._warm_queued: set[str] = set()
+        # Sesión de grabación activa (U-09).
+        self._recording_session: Any = None
+        self._recording_supervisor: Any = None
+        self._recording_session_path: Any = None
+        # Planificador de grabaciones (U-10): decide cuándo grabar y delega
+        # la captura en RecordingRunner, que usa el grabador de Fase 6.
+        self._scheduler: Any = None
         self._warm_failed: dict[str, float] = {}
         #: ``True`` mientras haya una tanda de warming en marcha. Antes era el
         #: ``threading.Thread``; ahora el hilo lo tiene el gestor de tareas y
@@ -729,6 +829,37 @@ class App:
         # La búsqueda vive en un modal centrado (overlay) y ya no reserva
         # una fila superior: el contenido usa siempre el alto completo.
         return main_rect(max_y, max_x).h
+
+    def catalogo_canales(self) -> list[Channel]:
+        """Canales de todas las listas ya cargadas en memoria, sin repetir.
+
+        Una colección guarda **referencias** a canales, no canales. Contar sus
+        miembros (o resolver sus referencias obsoletas) exige saber qué canales
+        existen, y eso es lo que una colección pregunta a la app.
+
+        Sólo se mira `playlist_cache` —las listas que el usuario abrió y las
+        que `warm_catalog` dejó descargadas—, y aquí **no se descarga nada**:
+        abrir la lista de colecciones no puede ser la razón de que la app se
+        quede esperando a un servidor. Sin listas en memoria devuelve `[]`, que
+        es lo que la pantalla puede afirmar con honestidad.
+
+        La deduplicación es por **identidad lógica** y no por URL, porque es la
+        clave que el gestor de colecciones usa para sus miembros. Sin ella, un
+        canal presente en dos listas saldría dos veces y el contador mentiría.
+        """
+        vistos: set[str] = set()
+        salida: list[Channel] = []
+        for playlist in list(self.playlist_cache.values()):
+            for canal in getattr(playlist, "channels", None) or []:
+                try:
+                    clave = channel_identity(canal)
+                except Exception:
+                    clave = f"\x00url:{getattr(canal, 'url', '')}"
+                if clave in vistos:
+                    continue
+                vistos.add(clave)
+                salida.append(canal)
+        return salida
 
     # --- Cache de sesión de listas ya parseadas ------------------------------
 
@@ -850,6 +981,10 @@ class App:
 
         if not catalog:
             self.warm_catalog()
+            try:
+                self.pedir_indice_fuentes()
+            except Exception:
+                pass
             return []
 
         for entry in self.playlists.load():
@@ -1112,6 +1247,7 @@ class App:
         title: str,
         fields: list[tuple],
         initial: dict[str, str] | None = None,
+        validar=None,  # noqa: ANN001
     ) -> dict[str, str] | None:
         """Formulario modal centrado multi-campo. None si se cancela (Esc).
 
@@ -1120,6 +1256,12 @@ class App:
         soporta KEY_RESIZE, terminal pequeña y cursor hardware en el campo
         activo. Valida que ningún campo quede vacío y muestra el error
         dentro del propio modal.
+
+        ``validar(data) -> str | None`` es el gancho de U-04: se llama **con lo
+        que el usuario escribió**, en el mismo modal y antes de devolver nada.
+        Si devuelve un texto, el modal no se cierra y lo enseña dentro: el
+        usuario ve el motivo mientras todavía puede arreglarlo, en vez de
+        descubrirlo al guardar y Having que volver a escribirlo todo.
         """
         from .widgets import FormModal
 
@@ -1181,6 +1323,17 @@ class App:
                 if missing:
                     modal.error = f"Falta: {missing[0]}"
                     continue
+                if validar is not None:
+                    try:
+                        problema = validar(data)
+                    except Exception as exc:
+                        # Un validador que revienta no puede tragarse el
+                        # formulario: el usuario se quedaría escribiendo en un
+                        # modal que ya no responde. Se le dice qué pasó.
+                        problema = f"No se pudo comprobar: {exc}"
+                    if problema:
+                        modal.error = str(problema)
+                        continue
                 return data
         finally:
             try:
@@ -1769,6 +1922,7 @@ class App:
         puede pisar lo más reciente.
         """
         self._drain_catalog_warm()
+        self._drenar_indice_fuentes()
         for resultado in self._tasks.drain("epg-load"):
             if resultado.obsolete or resultado.cancelled:
                 self._epg_load_thread = None
@@ -2187,6 +2341,2221 @@ class App:
             return None
 
     # --- Errores: barra redactada + modal con las acciones que existen -------
+
+    # --- Colecciones (Fase 8 · U-03) --------------------------------------
+    #
+    # Toda la conversación con el usuario sobre colecciones vive aquí y no en
+    # la pantalla: la pantalla decide *qué* se quiere hacer y devuelve una
+    # acción, y la `App` la traduce en modales. Es el mismo reparto que
+    # `add_playlist` / `remove_playlist`, y por eso los modales se prueban sin
+    # terminal.
+    #
+    # Y una regla que atraviesa las cuatro: **un rechazo del gestor se
+    # enseña, no se ejecuta**. El backend dice «nombre vacío» o «colección no
+    # encontrada»; la UI lo envuelve con el puente de U-02 y no finge que la
+    # operación pasó.
+
+    # --- El contexto de evaluación (U-04b) ---------------------------------
+    #
+    # `valor_campo` (Fase 4) lee cinco campos de un `contexto` que le pasa
+    # quien evalúa: favoritos, guía, última vez visto, fallos y salud. Hasta
+    # U-04b **nadie se lo pasaba**, así que los cinco devolvían su valor vacío
+    # —«no favorito», «sin guía», «nunca visto», «0 fallos», «desconocido»—
+    # para *todos* los canales, y una colección «mis favoritos» salía con cero
+    # canales y ningún motivo.
+    #
+    # Tres tienen origen real aquí. Dos no, y no se inventan: los **fallos** no
+    # los escribe nada desde la UI (el `HistorialDiagnostico` de la Fase 2
+    # existe y se persiste, pero sólo lo rellenan los tests y el chequeo de
+    # seguridad), y la **salud** se sondea por pantalla y se apaga al salir.
+    # Esos dos salen en el constructor marcados como no utilizables, con su
+    # motivo (`rule_text.CAMPOS_SIN_ORIGEN`).
+
+    def contexto_de_reglas(self) -> dict:
+        """El `contexto` para `valor_campo`, montado desde lo que hay cargado.
+
+        Se construye **entero y en cada llamada**, no un singleton guardado:
+        marcar un favorito tiene que mover el conteo al instante, y un contexto
+        cacheado detrás —por barato que sea el cálculo— es justo el número
+        congelado que U-04b viene a arreglar. Por eso
+        `ColeccionesManager.miembros` no cachea cuando hay contexto.
+
+        Nunca lanza: se pide desde `render`, y reventar aquí tumba la pantalla
+        entera. Cada pieza va con su propio `try` porque un `recents.json` con
+        permisos raros no puede impedir evaluar los favoritos.
+        """
+        ctx: dict = {"favorites": set(), "last_played": {}, "epg": None,
+                     "indice_epg": None}
+
+        favs = self._ids_de_favoritos()
+        if favs:
+            ctx["favorites"] = favs
+
+        vistos = self._vistos_por_canal()
+        if vistos:
+            ctx["last_played"] = vistos
+
+        try:
+            epg = getattr(self, "epg", None)
+        except Exception:
+            epg = None
+        ctx["epg"] = epg
+        if epg is not None:
+            try:
+                from thetvview.search import indice_epg_de
+
+                ctx["indice_epg"] = indice_epg_de(epg)
+            except Exception:
+                # Sin índice, `estado_epg` lo construye él misma. No es motivo
+                # para degradar el campo entero.
+                ctx["indice_epg"] = None
+        return ctx
+
+    def _ids_de_favoritos(self) -> set:
+        """Identidades y URLs de los favoritos, que es lo que `valor_campo` mira.
+
+        Se indexa por las dos porque `valor_campo` prueba la identidad primero
+        y la URL después. Sólo con una, un canal contaría o no según de dónde
+        venga: con el `tvg-id` igual pero la URL girada, que es justo lo que
+        pasa cuando el proveedor renueva el token.
+
+        Limitación aceptada: `FavoritesManager.is_favorite` tiene un tercer
+        criterio —`tvg-id` de un lado y ninguno del otro— que un conjunto de
+        cadenas no puede reproducir. El caso es la asimetría en la que una
+        copia del canal trae `tvg-id` y la otra no; en Favoritos se ve bien,
+        en un filtro puede contar de menos.
+        """
+        manager = getattr(self, "favorites", None)
+        if manager is None:
+            return set()
+        try:
+            canales = manager.load()
+        except Exception:
+            return set()
+        ids: set = set()
+        for c in canales or ():
+            try:
+                ident = str(channel_identity(c))
+            except Exception:
+                ident = ""
+            if ident:
+                ids.add(ident)
+            url = str(getattr(c, "url", "") or "")
+            if url:
+                ids.add(url)
+        return ids
+
+    def _vistos_por_canal(self) -> dict:
+        """`{identidad o URL: momento ISO}` de los recientes.
+
+        `RecentItem` guarda la URL ** redactada**, así que por URL puede no
+        cuadrar con el canal del catálogo; por eso se indexa también por la
+        identidad reconstruida a partir del propio registro, que sí coincide
+        cuando ambos lados comparten `tvg-id` o nombre.
+        """
+        manager = getattr(self, "recents", None)
+        if manager is None:
+            return {}
+        try:
+            items = manager.load()
+        except Exception:
+            return {}
+        vistos: dict = {}
+        for item in items or ():
+            momento = str(getattr(item, "at_utc", "") or "")
+            if not momento:
+                continue
+            url = str(getattr(item, "url", "") or "")
+            if url:
+                vistos.setdefault(url, momento)
+            tvg_id = getattr(item, "tvg_id", None)
+            try:
+                ident = str(channel_identity(Channel(
+                    name=str(getattr(item, "name", "") or ""),
+                    url=url, group=getattr(item, "group", None),
+                    tvg_id=str(tvg_id or ""),
+                )))
+            except Exception:
+                continue
+            if ident:
+                vistos.setdefault(ident, momento)
+        return vistos
+
+    def _recargar_colecciones(self) -> None:
+        """Refresca la pantalla de colecciones si es la que está delante."""
+        from .screens import CollectionsScreen
+
+        if isinstance(self.screen, CollectionsScreen):
+            try:
+                self.screen.reload()
+            except Exception:
+                pass
+
+    def _nombre_de_coleccion(self, cid: str) -> str | None:
+        try:
+            col = self.collections.obtener(cid)
+        except Exception:
+            return None
+        return getattr(col, "name", None)
+
+    def create_collection(self) -> None:
+        """Alta de una colección manual, por modal (U-03).
+
+        Se crea **manual** a propósito: la inteligente necesita un constructor de
+        reglas, que es U-04. Crear aquí una «inteligente» sin reglas daría una
+        colección vacía y engañosa —`evaluar_coleccion` no inventa miembros—,
+        que es justo lo que este ticket no quiere prometer.
+        """
+        datos = self._prompt_form(
+            "Nueva colección",
+            [("name", "Nombre de la colección")],
+            initial={"name": ""},
+        )
+        if datos is None:
+            return
+        nombre = str(datos.get("name", "")).strip()
+        if not nombre:
+            self.notify_warning(
+                "La colección necesita un nombre.\n"
+                "Sin nombre no se podría distinguir de las demás."
+            )
+            return
+        try:
+            self.collections.crear(nombre, tipo="manual")
+        except ColeccionesManagerError as exc:
+            self._error_colecciones(exc, reintentar=self.create_collection)
+            return
+        except Exception as exc:
+            self.notify_error(f"No se pudo crear la colección: {exc}")
+            return
+        self._recargar_colecciones()
+        self.notify(
+            f"Colección «{nombre}» creada, y de momento vacía.\n"
+            "Se llena con «C» en Canales (elige sus canales), con «m» aquí, "
+            "o con «R» si prefieres que la app la arme sola con una regla."
+        )
+
+    def rename_collection(self, cid: str) -> None:
+        """Renombrar por modal, con el nombre actual precargado (U-03)."""
+        actual = self._nombre_de_coleccion(cid)
+        if actual is None:
+            self.notify_warning("Esa colección ya no existe.")
+            return
+        datos = self._prompt_form(
+            "Renombrar colección",
+            [("name", "Nombre de la colección")],
+            initial={"name": actual},
+        )
+        if datos is None:
+            return
+        nombre = str(datos.get("name", "")).strip()
+        if not nombre:
+            self.notify_warning(
+                "La colección necesita un nombre.\n"
+                "Sin nombre no se podría distinguir de las demás."
+            )
+            return
+        if nombre == actual:
+            # No es un error, pero tampoco es un cambio: decirlo evita que el
+            # usuario espere un efecto que no ocurrió.
+            self.notify_warning(f"La colección sigue llamándose «{actual}».")
+            return
+        try:
+            self.collections.renombrar(cid, nombre)
+        except ColeccionesManagerError as exc:
+            self._error_colecciones(
+                exc, reintentar=lambda: self.rename_collection(cid)
+            )
+            return
+        except Exception as exc:
+            self.notify_error(f"No se pudo renombrar la colección: {exc}")
+            return
+        self._recargar_colecciones()
+        self.notify(f"Colección renombrada a «{nombre}».")
+
+    def delete_collection(self, cid: str) -> None:
+        """Borrado por confirmación, diciendo qué se pierde exactamente (U-03).
+
+        El mensaje no pregunta «¿borrar?» y ya: dice cuántos canales se van con
+        la colección. Un «Aceptar» sobre algo cuyo tamaño se desconoce es la
+        forma de perder trabajo sin querer, y el usuario tiene derecho a saber
+        el tamaño antes de decidir.
+        """
+        try:
+            col = self.collections.obtener(cid)
+        except Exception:
+            col = None
+        if col is None:
+            self.notify_warning("Esa colección ya no existe.")
+            return
+        nombre = getattr(col, "name", "") or "(sin nombre)"
+        n = self._cuenta_de_coleccion(col)
+        if n == 1:
+            efecto = ("Contiene 1 canal. Al borrarla, ese canal sale de aquí,\n"
+                      "pero no se borra de tus listas ni de tus favoritos.")
+        else:
+            efecto = (f"Contiene {n} canales. Al borrarla, salen de aquí, pero\n"
+                      "no se borran de tus listas ni de tus favoritos.")
+        if not self._confirm(
+            "Borrar colección",
+            f"«{nombre}»\n\n{efecto}\n\nEsta acción no se puede deshacer.",
+        ):
+            self.notify_warning("No se borró nada.")
+            return
+        try:
+            borrada = self.collections.eliminar(cid)
+        except ColeccionesManagerError as exc:
+            self._error_colecciones(
+                exc, reintentar=lambda: self.delete_collection(cid)
+            )
+            return
+        except Exception as exc:
+            self.notify_error(f"No se pudo borrar la colección: {exc}")
+            return
+        if not borrada:
+            self.notify_warning("Esa colección ya no existe.")
+            return
+        self._recargar_colecciones()
+        self.notify(f"Colección «{nombre}» borrada.")
+
+    def _cuenta_de_coleccion(self, col) -> int:
+        """Cuántos canales tiene `col` **según el catálogo en memoria**."""
+        if getattr(col, "type", "") == "system":
+            return 0
+        try:
+            return len(self.collections.miembros(col.id, self.catalogo_canales()))
+        except Exception:
+            return len(getattr(col, "members", None) or [])
+
+    def _obsoletas_de(self, col) -> int:
+        """Cuántas referencias ya no resuelven — **sólo si hay catálogo**.
+
+        Sin listas en memoria todas parecerían obsoletas, y ese aviso sería
+        falso: el canal no desapareció, es que todavía no se ha cargado nada
+        (misma razón que en `CollectionsScreen._detalle`).
+        """
+        if not self.catalogo_canales():
+            return 0
+        try:
+            return len(self.collections.obsolete_refs(col.id, self.catalogo_canales()))
+        except Exception:
+            return 0
+
+    def show_collection(self, cid: str) -> None:
+        """Detalle de una colección en un modal (U-03).
+
+        Un modal y no otra pantalla, a propósito: esto es *información*, no una
+        tarea con su propia navegación. Abrir una pantalla entera para leer
+        seis líneas sería una pantalla más que mantener sin ganar nada.
+        """
+        try:
+            col = self.collections.obtener(cid)
+        except Exception:
+            col = None
+        if col is None:
+            self.notify_warning("Esa colección ya no existe.")
+            return
+        tipo = getattr(col, "type", "")
+        if tipo == "system":
+            cuerpo = ("Es una vista de la app: sus canales son los tuyos de\n"
+                      "Favoritos o Recientes. No se renombra ni se borra.")
+        else:
+            lineas = [
+                "Tipo: " + {"manual": "manual", "smart": "inteligente"}.get(
+                    tipo, tipo or "sin tipo"
+                ),
+                f"Canales ahora mismo: {self._cuenta_de_coleccion(col)}",
+            ]
+            obsoletas = self._obsoletas_de(col)
+            if obsoletas:
+                lineas.append(
+                    f"Referencias obsoletas: {obsoletas}\n"
+                    "Esos canales ya no están en ninguna lista. La colección\n"
+                    "sigue funcionando con el resto."
+                )
+            if tipo == "manual":
+                lineas.append("Los canales se añaden desde la lista de canales.")
+            cuerpo = "\n".join(lineas)
+        self._mostrar_modal(f"Colección «{getattr(col, 'name', '')}»", cuerpo)
+
+    def show_collections(self) -> None:
+        """Abre la lista de colecciones (U-03)."""
+        from .screens import CollectionsScreen
+
+        self.push(CollectionsScreen(self))
+
+    # --- Colecciones: membresía (U-03b) -----------------------------------
+    #
+    # U-03 dejó las colecciones manuales inertes: se creaban vacías y no había
+    # forma de meter un canal dentro. Aquí está el otro camino, y son dos
+    # porque el usuario está en dos sitios: en Canales elige **en qué
+    # colecciones está** este canal; en Colecciones elige **qué canales se
+    # quedan** en esta.
+    #
+    # Los modales son listas de casillas, no transacciones: cada marca se
+    # guarda en el momento. Un Esc sobre una lista donde ya se ve un «sí» no
+    # puede deshacer lo que dice, y una casilla que promete un cambio no
+    # guardado sería una mentira visible.
+
+    #: Qué se dice de una colección que no admite canales elegidos a mano.
+    #: **No vive aquí**: la nota de la lista de casillas y el aviso al pulsar
+    #: la tecla tienen que decir lo mismo, y dos copias de la misma frase
+    #: divergen en cuanto una se toca. La fuente es `screens._miembros_editables`.
+    def _miembros_editables(self, col) -> str | None:
+        from .screens import _miembros_editables
+
+        return _miembros_editables(col)
+
+    def _texto_de_error_colecciones(self, exc: Exception) -> str:
+        """Un rechazo del gestor, como texto —no como modal.
+
+        Aquí no se puede abrir un modal dentro de otro (`_run_modal` se
+        niega), así que el error viaja como cadena y lo pinta la lista. Sólo
+        se reproduce el texto del propio gestor cuando es suyo: el de una
+        excepción cualquiera puede traer una URL, y este es el punto donde
+        una credencial se acaba de Printing en pantalla.
+        """
+        if isinstance(exc, ColeccionesManagerError):
+            return f"No se pudo guardar: {exc}."
+        return "No se pudo guardar el cambio."
+
+    def _checklist_de_canal(self, channel: Channel) -> ChecklistModal:
+        """Las colecciones, con este canal marcado donde ya está.
+
+        El estado sale de la **clave de identidad** del canal contra los
+        `members` guardados, no de evaluar la colección: para esa pregunta no
+        hace falta el catálogo, y sin listas cargadas la respuesta sigue siendo
+        exacta.
+        """
+        from .widgets import ChecklistItem, ChecklistModal, checklist_actions
+
+        clave = self.collections.identidad(channel)
+        items: list[ChecklistItem] = []
+        try:
+            colecciones = self.collections.listar()
+        except Exception as exc:
+            colecciones = []
+            self.notify_warning(
+                f"No se pudieron leer las colecciones: {exc}"
+            )
+        for col in colecciones:
+            tipo = getattr(col, "type", "")
+            if tipo == "manual":
+                dentro = clave in (getattr(col, "members", None) or [])
+                items.append(ChecklistItem(col.id, getattr(col, "name", ""),
+                                           checked=dentro))
+            else:
+                # Aparece aunque no se pueda marcar: si una colección no está
+                # en la lista, el usuario no sabe si es un fallo o qué pasó.
+                items.append(ChecklistItem(
+                    col.id, getattr(col, "name", ""), checked=False,
+                    selectable=False, note=self._miembros_editables(col),
+                ))
+        marcadas = sum(1 for i in items if i.checked)
+        return ChecklistModal(
+            f"Colecciones de «{getattr(channel, 'name', '')}»",
+            items,
+            subtitle=self._subtitulo_de_canal(marcadas),
+            actions=checklist_actions(),
+            empty="Todavía no tienes colecciones.\n"
+                  "Créala con «a» en la pantalla de Colecciones: es la tecla que "
+                  "pone nombre a la primera.",
+        )
+
+    @staticmethod
+    def _subtitulo_de_canal(marcadas: int) -> str:
+        """El contador del modal: qué cambia al marcar, en una línea.
+
+        Vive en el subtítulo y no sólo en la barra porque dentro de un modal la
+        barra de la pantalla de detrás está tapada: es el único sitio donde el
+        usuario puede leer el efecto de lo que acaba de pulsar.
+        """
+        plural = "colección" if marcadas == 1 else "colecciones"
+        return (f"Ahora está en {marcadas} {plural}. "
+                "Espacio marca o desmarca.")
+
+    def _checklist_de_miembros_error(self, cid: str) -> str | None:
+        """Por qué no se pueden quitar miembros de `cid`; ``None`` si sí."""
+        try:
+            col = self.collections.obtener(cid)
+        except Exception:
+            return "Esa colección ya no existe."
+        if col is None:
+            return "Esa colección ya no existe."
+        return self._miembros_editables(col)
+
+    def _checklist_de_miembros(self, cid: str) -> ChecklistModal:
+        """Los canales de una colección, todos marcados: quitar = desmarcar.
+
+        Resuelve con el **mismo criterio que el gestor** —identidad y, como
+        respaldo, URL— para que lo que esta lista llama «obsoleto» y lo que
+        el backend cuenta como referencia obsoleta sean exactamente lo mismo.
+
+        Las referencias que no resuelven **también entran en la lista**, y son
+        quitables. Si la lista fuera sólo de los canales que resuelven, la
+        referencia rota no tendría por dónde salir y la única manera de
+        arreglarla sería editar `collections.json` a mano.
+        """
+        from .widgets import ChecklistItem, ChecklistModal, checklist_actions
+
+        try:
+            col = self.collections.obtener(cid)
+        except Exception:
+            col = None
+        if col is None:
+            return ChecklistModal("Miembros", [],
+                                  empty="Esa colección ya no existe.",
+                                  actions=checklist_actions())
+        nombre = getattr(col, "name", "") or "(sin nombre)"
+        bloqueo = self._miembros_editables(col)
+        if bloqueo:
+            return ChecklistModal(f"Miembros de «{nombre}»", [],
+                                  empty=bloqueo, actions=checklist_actions())
+
+        catalogo = self.catalogo_canales()
+        por_identidad: dict[str, Channel] = {}
+        por_url: dict[str, Channel] = {}
+        for c in catalogo:
+            try:
+                por_identidad[str(channel_identity(c))] = c
+            except Exception:
+                pass
+            url = getattr(c, "url", "")
+            if url:
+                por_url.setdefault(url, c)
+
+        items: list[ChecklistItem] = []
+        # `dict.fromkeys` quita duplicados **conservando el orden**: un canal
+        # repetido sigue siendo un canal, y dos filas idénticas confunden.
+        for clave in dict.fromkeys(getattr(col, "members", None) or []):
+            canal = por_identidad.get(clave) or por_url.get(clave)
+            if canal is not None:
+                items.append(ChecklistItem(clave, getattr(canal, "name", clave),
+                                           checked=True))
+            elif catalogo:
+                items.append(ChecklistItem(
+                    clave, "Canal que ya no está en tus listas", checked=True,
+                    note="obsoleto: se puede quitar aquí",
+                ))
+            else:
+                # Sin catálogo no se sabe ni el nombre ni si caducó, y decirlo
+                # sería inventarlo.
+                items.append(ChecklistItem(clave,
+                                           "Canal (nombre no disponible)",
+                                           checked=True))
+        return ChecklistModal(
+            f"Miembros de «{nombre}»",
+            items,
+            subtitle="Desmarca los que quieras quitar de la colección.",
+            actions=checklist_actions(),
+            empty="Esta colección no tiene canales.",
+        )
+
+    def _guardar_en_coleccion(self, cid: str, canal: Channel,
+                              marcado: bool) -> str | None:
+        """Mete o saca `canal` de la colección `cid`. ``None`` si se guardó."""
+        try:
+            col = self.collections.obtener(cid)
+        except Exception:
+            return "Esa colección ya no existe."
+        if col is None:
+            return "Esa colección ya no existe."
+        bloqueo = self._miembros_editables(col)
+        if bloqueo:
+            return bloqueo
+        try:
+            if marcado:
+                self.collections.añadir(cid, canal)
+            else:
+                self.collections.quitar(cid, self.collections.identidad(canal))
+        except ColeccionesManagerError as exc:
+            return self._texto_de_error_colecciones(exc)
+        except Exception:
+            return "No se pudo guardar el cambio."
+        self._recargar_colecciones()
+        return None
+
+    def _quitar_de_coleccion(self, cid: str, clave: str) -> str | None:
+        """Saca la referencia `clave` de `cid`. ``None`` si se guardó."""
+        try:
+            col = self.collections.obtener(cid)
+        except Exception:
+            return "Esa colección ya no existe."
+        if col is None:
+            return "Esa colección ya no existe."
+        bloqueo = self._miembros_editables(col)
+        if bloqueo:
+            return bloqueo
+        try:
+            self.collections.quitar(cid, clave)
+        except ColeccionesManagerError as exc:
+            return self._texto_de_error_colecciones(exc)
+        except Exception:
+            return "No se pudo quitar el canal."
+        self._recargar_colecciones()
+        return None
+
+    def _run_checklist(self, modal, on_toggle) -> str | None:  # noqa: ANN001
+        """Bucle de una lista de casillas; ``on_toggle(item, marcado) -> str | None``.
+
+        En modo *check* devuelve siempre ``None``: lo que importa es el efecto,
+        no un resultado. En modo *radio* (elegir una de varias) devuelve la
+        ``key`` elegida, o ``None`` si se cerró con Esc — que es lo que le
+        permite al asistente distinguir «eligió el campo grupo» de «se rindió».
+
+        El texto de error que devuelve `on_toggle` se pinta en la lista **sin
+        mover la casilla**. **Nunca marca antes de guardar**: la casilla sólo se
+        mueve cuando el gestor aceptó.
+
+        Sin curses, desde un hilo o con otro modal abierto, no hace nada: se
+        queda en la barra de estado, igual que el resto de modales.
+        """
+        if self._in_modal:
+            return None
+        if threading.current_thread() is not threading.main_thread():
+            return None
+        stdscr = getattr(self, "stdscr", None)
+        if not isinstance(stdscr, curses.window):
+            return None
+        self._in_modal = True
+        try:
+            while True:
+                try:
+                    stdscr.erase()
+                    try:
+                        self.header.render(stdscr, self._header_context(),
+                                           len(self.stack))
+                    except Exception:
+                        pass
+                    try:
+                        self.screen.render(stdscr)
+                    except Exception:
+                        pass
+                    try:
+                        self._render_footer(stdscr)
+                    except Exception:
+                        pass
+                    modal.render(stdscr)
+                    stdscr.refresh()
+                except curses.error:
+                    pass
+                key = stdscr.getch()
+                if key == curses.KEY_RESIZE or key == -1:
+                    continue
+                res = modal.handle_key(key)
+                if res == "cerrar":
+                    return None
+                if res is None:
+                    continue
+                if res[0] == "pick":
+                    return modal.items[res[1]].key
+                _marca, indice, marcado = res
+                error = on_toggle(modal.items[indice], marcado)
+                if error is None:
+                    modal.set_checked(indice, marcado)
+                else:
+                    modal.set_error(error)
+        except Exception:
+            return None
+        finally:
+            self._in_modal = False
+
+    def _elegir_uno(
+        self,
+        titulo: str,
+        items,  # noqa: ANN001
+        *,
+        subtitle: str = "",
+        vacio: str = "No hay nada que elegir.",
+    ) -> str | None:
+        """Abre una lista en modo «una de estas» y devuelve la elegida.
+
+        Es el mismo `ChecklistModal` de U-03b en modo ``radio``: compartir el
+        control evita tener dos listas que se mueven y se recortan distinto.
+        """
+        from .widgets import ChecklistModal, radio_actions
+
+        modal = ChecklistModal(titulo, items, subtitle=subtitle,
+                               actions=radio_actions(), empty=vacio,
+                               radio=True)
+
+        def _nunca(item, marcado: bool):  # noqa: ANN001
+            # En radio no se llega: `handle_key` devuelve «pick» y el bucle
+            # sale antes. Si se llegara, no se guarda nada.
+            return "Este paso elige una opción; no hay nada que guardar."
+
+        return self._run_checklist(modal, _nunca)
+
+    def choose_channel_collections(self, channel: Channel) -> None:
+        """Elige en qué colecciones manuales está `channel` (U-03b)."""
+        modal = self._checklist_de_canal(channel)
+        if not modal.items:
+            # El mismo texto vacío del modal, pero como aviso: sin lista que
+            # mostrar, esto no es «no hay nada marcado», es «todavía no
+            # existen colecciones» — y son dos noticias distintas.
+            self.notify_warning(modal.empty)
+            return
+        cambios: list[tuple[str, bool]] = []
+
+        def _aplicar(item, marcado: bool):  # noqa: ANN001
+            error = self._guardar_en_coleccion(item.key, channel, marcado)
+            if error is None:
+                cambios.append((item.label, marcado))
+                # El contador se calcula con el cambio ya aplicado, no con la
+                # casilla —que en este instante todavía no se ha movido—.
+                dentro = sum(1 for i in modal.items if i.checked)
+                modal.subtitle = self._subtitulo_de_canal(
+                    dentro + 1 if marcado else dentro - 1
+                )
+            return error
+
+        self._run_checklist(modal, _aplicar)
+        if not cambios:
+            self.notify("No se cambió nada.")
+            return
+        dentro = sum(1 for _n, m in cambios if m)
+        fuera = len(cambios) - dentro
+        partes = []
+        if dentro:
+            partes.append(f"metido en {dentro}")
+        if fuera:
+            partes.append(f"quitado de {fuera}")
+        self.notify(f"«{getattr(channel, 'name', '')}»: " + " y ".join(partes)
+                    + " colección/es.")
+
+    def manage_collection_members(self, cid: str) -> None:
+        """Elige qué canales se quedan en la colección `cid` (U-03b)."""
+        modal = self._checklist_de_miembros(cid)
+        if not modal.items:
+            self.notify_warning(modal.empty)
+            return
+        quitados: list[str] = []
+
+        def _aplicar(item, marcado: bool):  # noqa: ANN001
+            if marcado:
+                # Volver a marcar algo que ya estaba no cambia nada, y decirlo
+                # sería inventar un trabajo que no pasó.
+                return "Ese canal ya estaba en la colección."
+            error = self._quitar_de_coleccion(cid, item.key)
+            if error is None:
+                quitados.append(item.label)
+            return error
+
+        self._run_checklist(modal, _aplicar)
+        if not quitados:
+            self.notify("No se quitó ningún canal.")
+            return
+        self.notify(f"Quitados {len(quitados)} canal/es de la colección.")
+
+    # --- Colecciones: constructor de reglas (U-04) -------------------------
+    #
+    # Un asistente de tres pasos —campo → operador → valor— y un cuarto paso
+    # opcional para encadenar condiciones. Lo que lo hace *guiado* y no un
+    # formulario con tres cajas de texto es que **los operadores se eligen de
+    # una lista que el backend ya filtró por el tipo del campo**: es imposible
+    # ofrecer «es menor que» para un campo de texto, así que no hace falta
+    # explicarlo después de que pase.
+    #
+    # Lo que no se ejecuta: el valor del usuario se guarda tal cual y sólo se
+    # compara. No hay `eval` ni ninguna otra evaluación de código en el
+    # camino; el valor es dato.
+
+    #: Los tres pasos van numerados en el título porque el usuario tiene que
+    #: saber cuánto le queda, no sólo dónde está.
+    def _validar_valor_de_regla(self, campo: str, operador: str):  # noqa: ANN201
+        """Devuelve el validador de `_prompt_form` para un valor de regla.
+
+        Encadena dos cosas: convertir el texto al tipo que pide el backend
+        (`regla_text.valor_de`) y pasarlo por `validar_regla`. Se closure y no
+        un método suelto porque depende de `campo` y `operador`, que son
+        distintos en cada paso del asistente.
+        """
+        def _validar(data: dict[str, str]) -> str | None:
+            valor, error = rule_text.valor_de(
+                str((data or {}).get("valor", "")), campo, operador
+            )
+            if error:
+                return error
+            try:
+                validar_regla({"field": campo, "operator": operador,
+                               "value": valor})
+            except ReglaInvalida as exc:
+                # El motivo es el del backend (U-02): la UI no reescribe lo
+                # que dice la validación, sólo lo enseña.
+                return str(exc)
+            return None
+
+        return _validar
+
+    def _pedir_valor(self, campo: str, operador: str):  # noqa: ANN201
+        """Pide el valor de una condición. ``("valor", v)`` o ``("cancelar", None)``.
+
+        El par en vez de un valor pelado es lo que permite que el asistente
+        distinga «el usuario escribió esto» de «el usuario se arrepintió»:
+        devolver sólo el valor haría que un ``None`` de cancelación se
+        colase como una condición escrita.
+        """
+        etiqueta = rule_text.etiqueta_de_campo(campo)
+        # El ejemplo va en la etiqueta y no en el texto: `FormModal` recorta
+        # las etiquetas largas, y un ejemplo que no se ve no ayuda. La
+        # explicación de qué mira el campo ya se dio —con más sitio— en el
+        # paso 1.
+        ejemplo = rule_text.ejemplo_de(campo, operador)
+        datos = self._prompt_form(
+            f"3 de 3 · {etiqueta}",
+            [("valor", f"Ejemplo: {ejemplo}")],
+            initial={"valor": ""},
+            validar=self._validar_valor_de_regla(campo, operador),
+        )
+        if datos is None:
+            return ("cancelar", None)
+        valor, error = rule_text.valor_de(str(datos.get("valor", "")),
+                                          campo, operador)
+        if error:
+            # `validar` corrió ya y no dejó pasar un valor inválido; si se
+            # llegara aquí es por un cambio futuro, y no se guarda a ciegas.
+            return ("cancelar", None)
+        return ("valor", valor)
+
+    def build_collection_rule(self, reglas_actual=None) -> dict | None:  # noqa: ANN201
+        """Asistente: devuelve el diccionario de regla, o ``None`` si se rindió.
+
+        Con ``reglas_actual`` (un diccionario ya guardado) el asistente no
+        empieza de cero: no lo descompone, porque traducir un ``all`` anidado
+        a pasos y de vuelta no siempre se puede y una regla que se reescribe
+        sola es una regla que cambia sin que nadie lo pidiera. Se avisa en el
+        modal de arranque y se construye una regla nueva, que es lo que el
+        botón dice.
+        """
+        if reglas_actual:
+            self.notify_warning(
+                "Esta colección ya tiene una regla.\n"
+                "El asistente arma una nueva desde cero: al guardarla "
+                "sustituye a la anterior.\n"
+                "La anterior no se guarda en ningún sitio, así que anota lo "
+                "que te sirva de ella antes de seguir."
+            )
+        nodos: list[dict] = []
+        modo = "all"
+        while True:
+            paso = len(nodos) + 1
+            campo = self._elegir_uno(
+                f"{paso} de 3 · ¿Qué mirar del canal?",
+                rule_text.items_de_campo(),
+                subtitle="La regla se arma con esto y un valor.",
+            )
+            if campo is None:
+                return None
+            operadores = rule_text.items_de_operador(campo)
+            if not operadores:
+                self.notify_warning(
+                    f"El campo «{campo}» no admite comparaciones todavía."
+                )
+                return None
+            operador = self._elegir_uno(
+                f"{paso} de 3 · ¿Cómo compararlo?",
+                operadores,
+                # El nombre del campo, no su clave: «group» es el
+                # identificador del backend y no le dice nada a nadie.
+                subtitle=f"Sólo «{rule_text.etiqueta_de_campo(campo)}» "
+                         "admite estas comparaciones.",
+            )
+            if operador is None:
+                return None
+            estado, valor = self._pedir_valor(campo, operador)
+            if estado != "valor":
+                return None
+            nodos.append({"field": campo, "operator": operador, "value": valor})
+
+            siguiente = self._elegir_uno(
+                "¿Y ahora qué?",
+                rule_text.items_de_siguiente_paso(),
+                subtitle="Puedes encadenar otra condición o guardar.",
+            )
+            if siguiente is None:
+                return None
+            if siguiente in ("all", "any"):
+                modo = siguiente
+                continue
+            return rule_text.regla_desde(nodos, modo, siguiente == "not")
+
+    def _cuenta_de_regla(self, regla) -> int | None:  # noqa: ANN001
+        """Cuántos canales de las listas en memoria cumplen `regla`.
+
+        ``None`` cuando **no se puede saber**: sin listas cargadas, con una
+        regla que ni siquiera valida, o con una regla que mira algo que la app
+        todavía no sabe (favoritos, salud, fallos, guía). Devolver 0 en esos
+        casos sería mentir, y es justo el número que el usuario está mirando
+        para decidir si guarda.
+        """
+        try:
+            validar_regla(regla)
+        except ReglaInvalida:
+            return None
+        if rule_text.campos_sin_contexto(regla):
+            return None
+        catalogo = self.catalogo_canales()
+        if not catalogo:
+            return None
+        borrador = Coleccion(id="__preview__", name="__preview__", type="smart",
+                              rules=regla)
+        try:
+            # Con el contexto de la app: sin él, una regla de favoritos o de
+            # guía daría cero canales por falta de datos, no por falta de
+            # coincidencias (U-04b).
+            return len(evaluar_coleccion(borrador, catalogo,
+                                         self.contexto_de_reglas()))
+        except Exception:
+            return None
+
+    def _mensaje_de_vista_previa(self, regla) -> tuple[str, str]:  # noqa: ANN001
+        """(título, mensaje) de la vista previa: la regla escrita y el número.
+
+        La cabecera cambia con la regla: decir «se incluirá el canal si:»
+        delante de un `not` sería contradecir lo que viene justo debajo.
+        """
+        negada = isinstance(regla, dict) and "not" in regla
+        cabecera = ("NO entra el canal si:" if negada
+                    else "Se incluirá el canal si:")
+
+        faltan = rule_text.campos_sin_contexto(regla)
+        if faltan:
+            campos = ", ".join(faltan)
+            donde = (f"No se puede contar: {campos} no sale de las listas.\n"
+                     "Son cosas que la app todavía no mira al evaluar una "
+                     "regla, así que cualquier cifra sería inventada.\n"
+                     "La regla se guarda igual.")
+        elif not self.catalogo_canales():
+            donde = "No se puede contar todavía: carga al menos una lista."
+        else:
+            cuenta = self._cuenta_de_regla(regla)
+            if cuenta is None:
+                donde = "No se puede contar esta regla con lo que hay cargado."
+            elif cuenta == 0:
+                donde = ("Ningún canal de tus listas cumple esta regla.\n"
+                         "Se puede guardar, pero la colección se quedaría "
+                         "vacía: revisa la palabra que has escrito.")
+            else:
+                plural = "canal" if cuenta == 1 else "canales"
+                donde = f"Ahora mismo entran {cuenta} {plural} de tus listas."
+
+        return ("Guardar la regla",
+                f"{cabecera}\n\n{rule_text.resumen_de(regla)}\n\n{donde}")
+
+    def _confirm_preview(self, regla) -> bool:  # noqa: ANN001
+        """Muestra la vista previa y pregunta. ``False`` si no guarda."""
+        from .widgets import Modal, modal_actions
+
+        titulo, mensaje = self._mensaje_de_vista_previa(regla)
+        res = self._run_modal(Modal(titulo, mensaje, ["Cancelar", "Guardar"],
+                                    actions=modal_actions(
+                                        confirmar="Guardar")))
+        return res == "guardar"
+
+    def edit_collection_rule(self, cid: str) -> None:
+        """Da una regla a la colección `cid`, o se la cambia (U-04).
+
+        Convierte una colección manual en inteligente **avisando antes** si
+        tenía canales elegidos a mano: dejan de contar, aunque no se borran del
+        archivo. Avisar es lo mínimo; decidir por el usuario si eso le viene
+        bien es suya.
+        """
+        col = self._nombre_de_coleccion(cid)
+        if col is None:
+            self.notify_warning("Esa colección ya no existe.")
+            return
+        try:
+            actual = self.collections.obtener(cid)
+        except Exception:
+            actual = None
+        if actual is None:
+            self.notify_warning("Esa colección ya no existe.")
+            return
+        if getattr(actual, "type", "") == "system":
+            self.notify_warning(
+                f"«{col}» es una vista de la app, no una colección tuya.\n"
+                "Sus canales son los tuyos: no hay nada que decidir aquí."
+            )
+            return
+        if getattr(actual, "type", "") == "manual" and actual.members:
+            cuantos = len(actual.members)
+            plural = "canal" if cuantos == 1 else "canales"
+            if not self._confirm(
+                "Cambiar a colección por regla",
+                f"«{col}» la armaste a mano y tiene {cuantos} {plural} "
+                "elegidos.\n\nSi le pones una regla, la colección contará lo "
+                "que diga la regla y esos canales dejarán de contar.\n\nNo se "
+                "borran del archivo, pero mientras la regla manda no los mira.",
+            ):
+                return
+
+        regla = self.build_collection_rule(actual.rules)
+        if regla is None:
+            self.notify("No se cambió la regla.")
+            return
+        # Se valida **antes** de la vista previa: enseñar «0 canales» de una
+        # regla que el backend ni siquiera acepta sería un número inventado,
+        # y es justo el número que el usuario está mirando.
+        try:
+            validar_regla(regla)
+        except ReglaInvalida as exc:
+            from .screens import _error_dominio
+
+            _error_dominio(self, exc, retry=lambda: self.edit_collection_rule(cid))
+            return
+        if not self._confirm_preview(regla):
+            return
+        try:
+            self.collections.editar(cid, tipo="smart", rules=regla)
+        except (ColeccionesManagerError, ReglaInvalida) as exc:
+            from .screens import _error_dominio
+
+            _error_dominio(self, exc, retry=lambda: self.edit_collection_rule(cid))
+            return
+        except Exception as exc:
+            self.notify_error(f"No se pudo guardar la regla: {exc}")
+            return
+        self._recargar_colecciones()
+        self.notify(f"Colección «{col}» guardada. Ahora se arma sola con su regla.")
+
+    # --- Búsqueda: filtros (U-05) ------------------------------------------
+    #
+    # `search.Consultador` (Fase 3) lleva sin usarse desde que se escribió: la
+    # pantalla de canales filtraba con un `q in texto` y nada más. U-05 le da
+    # los ocho filtros que el backend ya sabía responder, y deja la búsqueda
+    # de siempre como lo que pasa si el usuario no toca nada.
+    #
+    # Los modales son **encadenados, nunca anidados**: `_run_checklist` levanta
+    # `_in_modal`, y un modal dentro de otro se degradaría a la barra de
+    # estado sin avisar. Por eso el bucle de la lista vive aquí y cada
+    # elección sale del bucle, abre su propio modal y vuelve a entrar.
+
+    #: Fila que no es un filtro sino «pon uno más».
+    _FILTRO_NUEVO = "__nuevo__"
+    #: Fila que quita el filtro que se está editando.
+    _FILTRO_QUITAR = "__quitar__"
+    #: Fila que pide el valor con un cuadro de texto.
+    _FILTRO_ESCRIBIR = "__escribir__"
+    #: El orden natural, que no es ninguna clave de `filters.ORDENES`.
+    _ORDEN_NATURAL = "__natural__"
+
+    def _filtros_de_pantalla(self, pantalla) -> dict:  # noqa: ANN001
+        """Los filtros de `pantalla` como `{campo: valor}`.
+
+        `getattr` defensivo porque quien llama puede ser un doble de test: que
+        falle `filtros_activos` degrada a «no hay filtros», que es lo único que
+        se puede afirmar sin mirar.
+        """
+        fn = getattr(pantalla, "filtros_activos", None)
+        if not callable(fn):
+            return {}
+        try:
+            return dict(fn() or {})
+        except Exception:
+            return {}
+
+    def _subtitulo_de_filtros(self, pantalla) -> str:  # noqa: ANN001
+        """«N de M canales» y los filtros puestos, **en una sola línea**.
+
+        El contador va primero porque es lo que el usuario vino a ver. Los
+        filtros van con su frase porque «hay algo puesto» sin decir qué es
+        justo lo que no se puede quitar bien.
+
+        Una línea y no dos: `ChecklistModal` mide el alto por el del subtítulo
+        y lo pinta en una sola fila, así que un `\n` ahí no envuelve —se sale
+        por encima del borde lateral y deja el recuadro roto.
+        """
+        try:
+            cuenta = pantalla.poner_filtros()
+            total = len(pantalla.channels)
+        except Exception:
+            return ""
+        activo = pantalla.filtros_legibles()
+        if activo:
+            return (f"Ahora salen {cuenta} de {total} canales · "
+                    + " · ".join(activo))
+        return f"Ahora salen {cuenta} de {total} canales · sin filtros"
+
+    def _modal_de_filtros(self, pantalla):  # noqa: ANN001
+        """La lista de lo puesto, más «añadir uno más».
+
+        Va en modo *radio* y no con casillas porque **cada fila abre un modal
+        distinto** —quitar o cambiar el valor— y una casilla prometería un
+        interruptor de un solo gesto que aquí no existe. Lo que sí se ve de un
+        vistazo es qué hay puesto: está en el subtítulo, con su frase.
+        """
+        from .widgets import ChecklistItem, ChecklistModal, radio_actions
+
+        activos = self._filtros_de_pantalla(pantalla)
+        items = []
+        for clave, valor in activos.items():
+            f = filters_mod.filtro_de(clave)
+            items.append(ChecklistItem(
+                clave, filters_mod.frase_de(clave, valor),
+                note=f.ayuda if f else ""))
+        items.append(ChecklistItem(
+            self._FILTRO_NUEVO, "Añadir un filtro",
+            note="Elige qué mirar del canal y con qué valor."))
+        return ChecklistModal(
+            "Filtros de la lista",
+            items,
+            subtitle=self._subtitulo_de_filtros(pantalla),
+            actions=radio_actions(),
+            radio=True,
+            empty="No hay filtros puestos.",
+        )
+
+    def _valor_de_filtro(self, clave: str, actual: str | None):  # noqa: ANN201
+        """Pide el valor de un filtro. ``(valor, quitar)``.
+
+        El par en vez de un valor pelado es lo que permite distinguir «escribió
+        esto» de «quiere quitarlo» de «se arrepintió»: los tres casos salen
+        igual si se devuelve sólo una cosa.
+        """
+        from .widgets import ChecklistItem
+
+        f = filters_mod.filtro_de(clave)
+        if f is None:
+            return (None, False)
+
+        if f.es_texto and actual:
+            opciones = [
+                ChecklistItem(self._FILTRO_QUITAR, f"Quitar «{actual}»",
+                              note="La lista se queda sin este filtro."),
+                ChecklistItem(self._FILTRO_ESCRIBIR, "Escribir otro valor",
+                              note=f.ayuda),
+            ]
+            elegido = self._elegir_uno(
+                f.etiqueta, opciones, subtitle=f"Ahora: {actual}.")
+            if elegido is None:
+                return (None, False)
+            if elegido == self._FILTRO_QUITAR:
+                return (None, True)
+            if elegido != self._FILTRO_ESCRIBIR:
+                return (actual, False)
+
+        if f.es_texto:
+            # El ejemplo va en la etiqueta y no en el texto: `FormModal`
+            # recorta las etiquetas largas, y un ejemplo que no se ve no ayuda.
+            etiqueta = f"Ejemplo: {f.ejemplo}" if f.ejemplo else f.ayuda
+            datos = self._prompt_form(
+                f.etiqueta, [("valor", etiqueta)],
+                initial={"valor": actual or ""})
+            if datos is None:
+                return (None, False)
+            texto = str(datos.get("valor", "")).strip()
+            if not texto:
+                # Un filtro sin valor no quita canales, y una lista vacía
+                # fingiendo filtrar es la peor forma de no filtrar.
+                self.notify_warning(
+                    f"«{f.etiqueta}» se queda como estaba: no escribiste nada.")
+                return (None, False)
+            return (texto, False)
+
+        items = [ChecklistItem(v, etiqueta, note=f.ayuda)
+                 for v, etiqueta in f.opciones]
+        if actual:
+            items.append(ChecklistItem(
+                self._FILTRO_QUITAR, f"Quitar «{actual}»",
+                note="La lista se queda sin este filtro."))
+        # El subtítulo, no la nota de la fila: aquí hay ancho de sobra y el
+        # aviso entero cabe. Recortado a media frase no avisa de nada.
+        elegido = self._elegir_uno(
+            f.etiqueta, items,
+            subtitle=filters_mod.aviso_de(clave) or f.ayuda)
+        if elegido is None:
+            return (None, False)
+        if elegido == self._FILTRO_QUITAR:
+            return (None, True)
+        return (elegido, False)
+
+    def search_filters(self, pantalla) -> None:  # noqa: ANN001
+        """El modal de filtros de `pantalla` (tecla `F`).
+
+        Sin filtros puestos entra **directamente** a añadir uno: una lista de
+        filtros donde no hay nada puesto, más una fila para añadir, es una
+        pantalla de menos entre el usuario y lo que quiere.
+        """
+        if not self._filtros_de_pantalla(pantalla):
+            self._anadir_filtro(pantalla)
+            return
+        while True:
+            modal = self._modal_de_filtros(pantalla)
+            elegido = self._run_checklist(modal, _no_se_marca_en_radio)
+            if elegido is None:
+                return
+            if elegido == self._FILTRO_NUEVO:
+                self._anadir_filtro(pantalla)
+                continue
+            self._editar_filtro(pantalla, elegido)
+
+    def _anadir_filtro(self, pantalla) -> None:  # noqa: ANN001
+        from .widgets import ChecklistItem
+
+        puestos = self._filtros_de_pantalla(pantalla)
+        items = []
+        for f in filters_mod.FILTROS:
+            ya = f.clave in puestos
+            items.append(ChecklistItem(
+                f.clave, f.etiqueta,
+                note=(f"Puesto ahora como {puestos[f.clave]}. Elegirlo "
+                      "cambia su valor." if ya else f.ayuda)))
+        clave = self._elegir_uno(
+            "¿Qué mirar del canal?", items,
+            subtitle="El filtro se queda puesto hasta que lo quites.")
+        if clave is None:
+            return
+        valor, quitar = self._valor_de_filtro(clave, puestos.get(clave))
+        if quitar:
+            return
+        if valor is None:
+            self.notify("No se cambió nada.")
+            return
+        self._aplicar_filtro(pantalla, clave, valor)
+
+    def _editar_filtro(self, pantalla, clave: str) -> None:  # noqa: ANN001
+        valor, quitar = self._valor_de_filtro(
+            clave, self._filtros_de_pantalla(pantalla).get(clave))
+        if quitar:
+            self._quitar_filtro(pantalla, clave)
+            return
+        if valor is None:
+            return
+        self._aplicar_filtro(pantalla, clave, valor)
+
+    def _aplicar_filtro(self, pantalla, clave: str, valor: str) -> None:  # noqa: ANN001
+        """Pone (o cambia) un filtro y **refiltra en el acto**.
+
+        El refiltrado va aquí y no al cerrar el modal porque el usuario quiere
+        ver cuántos canales salen con cada filtro puesto: si sólo se aplicara
+        al salir, el constructor iría a ciegas.
+        """
+        actuales = self._filtros_de_pantalla(pantalla)
+        actuales[clave] = valor
+        try:
+            cuenta = pantalla.poner_filtros(list(actuales.items()))
+        except Exception as exc:  # noqa: BLE001 - la lista no se queda a medias
+            self.notify_error(f"No se pudo aplicar el filtro: {exc}")
+            return
+        self.notify(f"{filters_mod.frase_de(clave, valor)} · {cuenta} canales.")
+
+    def _quitar_filtro(self, pantalla, clave: str) -> None:  # noqa: ANN001
+        actuales = self._filtros_de_pantalla(pantalla)
+        if clave not in actuales:
+            return
+        frase = filters_mod.frase_de(clave, actuales.pop(clave))
+        pantalla.poner_filtros(list(actuales.items()))
+        self.notify(f"Quitado: {frase}.")
+
+    def clear_search_filters(self, pantalla) -> None:  # noqa: ANN001
+        """Quita todos los filtros de golpe (tecla `X`).
+
+        Pide confirmación y **nombra cada uno**: quitar cuatro filtros sin
+        decir cuáles deja al usuario reconstruyendo de memoria lo que tenía, y
+        eso es justo lo que un «quitar todo» no debería costar.
+        """
+        activos = self._filtros_de_pantalla(pantalla)
+        if not activos:
+            self.notify("No hay filtros que quitar.")
+            return
+        frases = [filters_mod.frase_de(c, v) for c, v in activos.items()]
+        plural = "filtro" if len(frases) == 1 else "filtros"
+        cuerpo = ("Se van a quitar estos filtros:\n\n  "
+                  + "\n  ".join(frases)
+                  + "\n\nEl texto que hayas escrito se queda, y el orden "
+                    "de la lista no se toca.")
+        if not self._confirm("Quitar los filtros", cuerpo):
+            return
+        cuenta = pantalla.limpiar_filtros()
+        self.notify(f"Quitados {len(frases)} {plural}. Ahora salen "
+                    f"{cuenta} canales.")
+
+    def search_order(self, pantalla) -> None:  # noqa: ANN001
+        """Elige el orden de la lista (tecla `o`).
+
+        El orden va en su propio modal y no como una fila más de filtros
+        porque **no quita canales**: es otra pregunta, y meterla entre los
+        filtros haría que «quitar todos» moviera también el orden, que nadie
+        pidió.
+        """
+        from .widgets import ChecklistItem
+
+        actual = getattr(pantalla, "orden", None)
+        items = []
+        for clave, etiqueta in filters_mod.ORDENES:
+            items.append(ChecklistItem(
+                clave or self._ORDEN_NATURAL, etiqueta,
+                checked=(clave == actual),
+                note=("El de la lista tal como la escribió el proveedor."
+                      if clave is None else "")))
+        elegido = self._elegir_uno(
+            "Orden de la lista", items,
+            subtitle="Sólo mueve canales: no quita ninguno.")
+        if elegido is None:
+            return
+        clave = None if elegido == self._ORDEN_NATURAL else elegido
+        if clave == actual:
+            self.notify(f"El orden sigue siendo: "
+                        f"{filters_mod.orden_legible(actual)}.")
+            return
+        try:
+            cuenta = pantalla.poner_filtros(orden=clave)
+        except Exception as exc:  # noqa: BLE001
+            self.notify_error(f"No se pudo cambiar el orden: {exc}")
+            return
+        self.notify(f"Orden: {filters_mod.orden_legible(clave)} · "
+                    f"{cuenta} canales.")
+
+# --- Fuentes del canal (U-06) -------------------------------------------
+    #
+    # El backend de Fase 5A (`LogicalChannel`, `detectar_candidatas` y ahora
+    # `AssociationStore`) llevaba tres fases sin que nadie lo llamara desde la
+    # interfaz. U-06 le da la pregunta más normal que surge con dos listas
+    # cargadas: «¿este canal está en otra? ¿de cuál se usa?».
+    #
+    # Tres decisiones que el ticket fija, y ninguna es de estilo:
+    #
+    # 1. **El índice se construye en segundo plano.** Medido en este repo:
+    #    recorrer 90 000 canales de dos listas y agruparlos por identificador
+    #    y por nombre cuesta ~1 s. En un modal eso no es «un poco lento»: es
+    #    un parpadeo de un segundo cada vez que se abre, así que va por
+    #    `tasks/manager.py` igual que el catálogo. Mientras no esté, el modal
+    #    **lo dice** y ofrece volver a intentarlo: nunca enseña «sin
+    #    candidatas» porque todavía no se ha mirado, que sería mentir.
+    #
+    # 2. **El índice no incluye la lista que se está viendo.** Una candidata
+    #    nunca está en la propia lista del canal, y con una sola lista
+    #    cargada —el caso normal— no hay nada que construir: la respuesta es
+    #    inmediata y no hay parpadeo posible.
+    #
+    # 3. **El modal no promete que esto cambie la reproducción**, porque en
+    #    este ticket no la cambia: U-06 anota la fuente preferida y la
+    #    explica. Aplicarla al reproducir, avisando y permitiendo cancelar,
+    #    es U-07.
+
+    #: Fila de la lista de la que ya se viene.
+    _FUENTE_ACTUAL = "__actual__"
+    #: Fila que quita la fuente preferida (A-03: deshacer).
+    _FUENTE_OLVIDAR = "__olvidar__"
+    #: Fila que vuelve a pedir la comparación si el índice no está listo.
+    _FUENTE_REINTENTAR = "__reintentar__"
+
+    def _store_de_fuentes(self) -> AssociationStore:
+        """El almacén de asociaciones, creado una sola vez por app.
+
+        Se construye en el primer uso y no en `__init__` para que una app que
+        nunca abre «Fuentes del canal» no lea un archivo que no va a usar.
+        """
+        store = getattr(self, "_fuentes_store", None)
+        if store is None:
+            store = AssociationStore(config.SOURCES_JSON)
+            self._fuentes_store = store
+        return store
+
+    def _listas_de_comparacion(self, playlist) -> list[tuple[str, list]]:  # noqa: ANN001
+        """Las listas cargadas **menos** la que se está viendo.
+
+        Compara por identidad de objeto (`is`) y no por nombre: dos entradas
+        con el mismo nombre son dos listas distintas, y comparar por nombre
+        excluiría a la actual y a su gemela por el mismo motivo.
+        """
+        salida: list[tuple[str, list]] = []
+        for guardada in list(self.playlist_cache.values()):
+            if playlist is not None and guardada is playlist:
+                continue
+            canales = getattr(guardada, "channels", None)
+            if canales is None:
+                continue
+            nombre = str(getattr(guardada, "name", "") or "")
+            if not nombre:
+                continue
+            salida.append((nombre, list(canales)))
+        return salida
+
+    def _huella_de_fuentes(self, playlist) -> tuple:  # noqa: ANN001
+        """Qué listas hay cargadas, para saber si el índice sigue sirviendo."""
+        return tuple(
+            (nombre, len(canales))
+            for nombre, canales in self._listas_de_comparacion(playlist)
+        )
+
+    def pedir_indice_fuentes(self, playlist=None) -> bool:  # noqa: ANN001
+        """Pide el índice en segundo plano. True si hay algo que comparar.
+
+        Idempotente por huella: si las listas no han cambiado y ya hay una
+        petición viva, no se lanza otra. Cada petición supersede la anterior
+        de su categoría, así que `s` pulsado tres veces no deja tres hilos
+        comparando lo mismo.
+        """
+        listas = self._listas_de_comparacion(playlist)
+        if not listas:
+            return False
+        huella = tuple((n, len(c)) for n, c in listas)
+        if getattr(self, "_indice_fuentes_huella", None) == huella:
+            return True
+        if getattr(self, "_indice_fuentes_pidiendo", False):
+            return True
+        self._indice_fuentes_huella = huella
+        self._indice_fuentes_pidiendo = True
+
+        def _trabajo(token: CancellationToken):
+            return sources_view.construir_indice(listas, token=token)
+
+        try:
+            self._tasks.submit("sources-index", _trabajo, supersede=True)
+        except Exception:
+            # Sin gestor de tareas (o cerrándose): el modal explica que no se
+            # puede comparar, en vez de fingir que no hay candidatas.
+            self._indice_fuentes_pidiendo = False
+            return False
+        return True
+
+    def indice_fuentes(self, playlist) -> object | None:  # noqa: ANN001
+        """El índice si ya está listo; `None` si todavía no.
+
+        Drena los resultados antes de mirar: abrir el modal es un gesto del
+        hilo principal y es el sitio natural donde el trabajo terminado se
+        aplica al modelo. Un resultado obsoleto —el usuario cambió de lista
+        mientras se comparaba— se descarta sin publicarse, que es la
+        garantía de `TaskManager` por generación.
+        """
+        self._drenar_indice_fuentes()
+        if self._huella_de_fuentes(playlist) != getattr(
+            self, "_indice_fuentes_huella", None
+        ):
+            self._indice_fuentes = None
+            return None
+        return getattr(self, "_indice_fuentes", None)
+
+    def _drenar_indice_fuentes(self) -> None:
+        """Aplica —o tira— el resultado de la comparación en marcha."""
+        drenar = getattr(getattr(self, "_tasks", None), "drain", None)
+        if not callable(drenar):
+            return
+        for resultado in drenar("sources-index"):
+            self._indice_fuentes_pidiendo = False
+            if resultado.obsolete or resultado.cancelled:
+                continue
+            if resultado.error is not None or resultado.value is None:
+                self._indice_fuentes = None
+                continue
+            self._indice_fuentes = resultado.value
+
+    def _clave_de_canal(self, channel, playlist) -> str:  # noqa: ANN001
+        """Clave con la que se guarda la preferencia de este canal.
+
+        El `source_id` es el **nombre** de la lista y no su URL: la clave va a
+        un archivo y una URL —con su token— no es lo que uno quiere tener ahí.
+        El nombre es lo que el usuario ve y lo que reconoce.
+        """
+        return clave_logica(channel, str(getattr(playlist, "name", "") or ""))
+
+    def _candidatas_de_fuentes(self, channel, playlist) -> tuple[list, int]:  # noqa: ANN001
+        """`(candidatas, descartadas)` para el canal, según el detector.
+
+        Las **descartadas** no salen en la lista pero se cuentan: si el usuario
+        descartó dos y ahora ve el resto en cero, necesita saber que la app
+        se acuerda en vez de olvidar.
+        """
+        indice = self.indice_fuentes(playlist)
+        if indice is None:
+            return ([], 0)
+        clave = self._clave_de_canal(channel, playlist)
+        descartadas = self._store_de_fuentes().rechazadas(clave) if clave else set()
+        salida: list = []
+        omitidas = 0
+        for cand in sources_view.deteccion_para(channel, indice.candidatas_de(channel)):
+            if clave_candidata(cand.fuente, cand.canal) in descartadas:
+                omitidas += 1
+                continue
+            salida.append(cand)
+        return (salida, omitidas)
+
+    def _subtitulo_de_fuentes(self, playlist, mostradas, total,  # noqa: ANN001
+                              descartadas, preferida, indice_listo) -> str:
+        """El subtítulo del modal: **una sola línea** y con las cuentas hechas.
+
+        Una línea porque `ChecklistModal` la pinta en una fila y mide el alto
+        por su ancho —lo mismo que en U-05—: un `\\n` ahí se sale por encima
+        del borde y rompe el recuadro.
+        """
+        if not indice_listo:
+            return (f"{playlist.name} · se están comparando las listas, "
+                    "esto aún no está")
+        partes = [sources_view.resumen_de_candidatas(total, mostradas)]
+        if descartadas:
+            partes.append(f"{descartadas} que descartaste")
+        if preferida:
+            partes.append(f"preferida: {preferida}")
+        return " · ".join(partes)
+
+    def _modal_de_fuentes(self, channel, playlist):  # noqa: ANN001
+        """La lista de fuentes de `channel`, con arriba la de la que se viene."""
+        from .widgets import ChecklistItem, ChecklistModal, radio_actions
+
+        candidatas, descartadas = self._candidatas_de_fuentes(channel, playlist)
+        indice_listo = self.indice_fuentes(playlist) is not None
+        clave = self._clave_de_canal(channel, playlist)
+        preferida = self._store_de_fuentes().fuente_preferida(clave) if clave else ""
+
+        items: list = [
+            ChecklistItem(
+                self._FUENTE_ACTUAL,
+                f"{playlist.name} (esta lista)",
+                note="Es la lista de donde viene el canal.",
+            )
+        ]
+        mostradas = candidatas[:sources_view.MAX_CANDIDATAS_MOSTRADAS]
+        for cand in mostradas:
+            grupo = str(getattr(cand.canal, "group", "") or "")
+            nota = cand.nota
+            if cand.fuente == preferida:
+                nota = "la preferida · " + nota
+            items.append(ChecklistItem(
+                cand.fuente,
+                cand.fuente + (f" · {grupo}" if grupo else ""),
+                note=nota,
+            ))
+        if preferida:
+            items.append(ChecklistItem(
+                self._FUENTE_OLVIDAR,
+                "Quitar la fuente preferida",
+                note="El canal vuelve a no tener ninguna.",
+            ))
+        if not indice_listo:
+            items.append(ChecklistItem(
+                self._FUENTE_REINTENTAR,
+                "Comparar las listas otra vez",
+                note="Por si ya han terminado de cargarse.",
+            ))
+
+        return ChecklistModal(
+            "Fuentes del canal",
+            items,
+            subtitle=self._subtitulo_de_fuentes(
+                playlist, len(mostradas), len(candidatas),
+                descartadas, preferida, indice_listo),
+            actions=radio_actions(),
+            radio=True,
+            empty="No hay otras listas cargadas para comparar.",
+        )
+
+    def channel_sources(self, channel, playlist) -> None:  # noqa: ANN001
+        """«Fuentes del canal» (tecla `s`): qué más lo tiene y cuál se prefiere.
+
+        El bucle vive aquí y no dentro del modal por lo mismo que en U-05: los
+        modales son **encadenados, nunca anidados**. Cada elección sale del
+        bucle, abre su propio modal y vuelve a entrar.
+        """
+        if channel is None:
+            self.notify("No hay ningún canal debajo del cursor.")
+            return
+        if not self._listas_de_comparacion(playlist):
+            self.notify(
+                f"«{playlist.name}» es la única lista cargada: no hay con qué "
+                "compararla. Abre otra lista y vuelve aquí.",
+                title="Fuentes del canal")
+            return
+        self.pedir_indice_fuentes(playlist)
+        while True:
+            modal = self._modal_de_fuentes(channel, playlist)
+            elegido = self._run_checklist(modal, _no_se_marca_en_radio)
+            if elegido is None:
+                return
+            if elegido == self._FUENTE_ACTUAL:
+                self.notify(
+                    f"«{playlist.name}» es de donde viene este canal. No hay "
+                    "nada que cambiar.",
+                    title="Esta lista")
+                return
+            if elegido == self._FUENTE_OLVIDAR:
+                self._olvidar_fuente(channel, playlist)
+                continue
+            if elegido == self._FUENTE_REINTENTAR:
+                self._indice_fuentes = None
+                self._indice_fuentes_huella = None
+                self.pedir_indice_fuentes(playlist)
+                continue
+            cand = self._candidata_de_fuente(channel, playlist, elegido)
+            if cand is None:
+                continue
+            self._decidir_fuente(channel, playlist, cand)
+
+    def _candidata_de_fuente(self, channel, playlist, fuente):  # noqa: ANN001
+        candidatas, _ = self._candidatas_de_fuentes(channel, playlist)
+        for cand in candidatas:
+            if cand.fuente == fuente:
+                return cand
+        return None
+
+    def _decidir_fuente(self, channel, playlist, cand) -> None:  # noqa: ANN001
+        """Qué hacer con una candidata: usarla, descartarla, o nada.
+
+        Un solo modal con tres botones y ninguno genérico: «Usar esta fuente» y
+        «No volver a proponerla» dicen exactamente lo que va a pasar, que es
+        justo lo que un «Aceptar» esconde. Y no afirma que esto cambie lo que
+        se reproduce: U-06 anota la preferencia; aplicarla al reproducir,
+        avisando y dejando cancelar, es U-07.
+        """
+        from .widgets import Modal, modal_actions
+
+        nombre = _etiqueta_de_canal(channel)
+        direccion = redact_text(str(getattr(cand.canal, "url", "") or ""))
+        cuerpo = (
+            f"«{nombre}» también está en «{cand.fuente}».\n\n"
+            f"{sources_view.frase_de_senales(cand.senales)}\n"
+            f"Nivel: {sources_view.nivel_legible(cand.nivel)}.\n\n"
+            f"Dirección, con la contraseña tapada:\n"
+            f"{direccion or 'sin dirección'}\n\n"
+            f"«Usar esta fuente» la deja como la preferida de este canal en "
+            f"«{playlist.name}». Puedes quitarla desde aquí cuando quieras.\n"
+            f"«No volver a proponerla» la descarta mientras siga siendo el "
+            f"mismo canal."
+        )
+        res = self._run_modal(Modal(
+            f"Fuente para «{nombre}»",
+            cuerpo,
+            ["Cancelar", "Usar esta fuente", "No volver a proponerla"],
+            actions=modal_actions(confirmar="Elegir", cancelar="Cancelar"),
+            wrap=True,
+        ))
+        if res == "usar esta fuente":
+            self._asociar_fuente(channel, playlist, cand)
+            return
+        if res == "no volver a proponerla":
+            self._descartar_fuente(channel, playlist, cand)
+            return
+        # «Cancelar», Esc, o un botón que no sea de estos dos: no se hace nada.
+
+    def _asociar_fuente(self, channel, playlist, cand) -> None:  # noqa: ANN001
+        clave = self._clave_de_canal(channel, playlist)
+        if not clave:
+            self.notify_error(
+                "Este canal no tiene con qué reconocerse, así que no se puede "
+                "guardar una fuente preferida para él.")
+            return
+        try:
+            self._store_de_fuentes().asociar(
+                clave, clave_candidata(cand.fuente, cand.canal), cand.fuente)
+        except AsociacionesError as exc:
+            self.notify_error(str(exc))
+            return
+        self.notify(
+            f"«{cand.fuente}» queda como la fuente preferida de "
+            f"«{_etiqueta_de_canal(channel)}» en «{playlist.name}».")
+
+    def _descartar_fuente(self, channel, playlist, cand) -> None:  # noqa: ANN001
+        clave = self._clave_de_canal(channel, playlist)
+        if not clave:
+            self.notify_warning("Este canal no tiene con qué reconocerse.")
+            return
+        try:
+            self._store_de_fuentes().rechazar(
+                clave, clave_candidata(cand.fuente, cand.canal))
+        except AsociacionesError as exc:
+            self.notify_error(str(exc))
+            return
+        self.notify(
+            f"«{cand.fuente}» no se volverá a proponer para "
+            f"«{_etiqueta_de_canal(channel)}» mientras siga igual.")
+
+    def _olvidar_fuente(self, channel, playlist) -> None:  # noqa: ANN001
+        """Quita la fuente preferida (A-03: deshacer).
+
+        El modal dice explícitamente qué **no** se deshace: los descartes. Son
+        gestos distintos, y devolver a la lista una fuente que el usuario
+        descartó porque se caía sería justo el fallo que A-03 quiere evitar.
+        """
+        from .widgets import Modal, modal_actions
+
+        clave = self._clave_de_canal(channel, playlist)
+        fuente = self._store_de_fuentes().fuente_preferida(clave) if clave else ""
+        if not fuente:
+            self.notify("Este canal no tiene ninguna fuente preferida.")
+            return
+        nombre = _etiqueta_de_canal(channel)
+        cuerpo = (
+            f"«{nombre}» volverá a no tener fuente preferida en "
+            f"«{playlist.name}».\n\n"
+            f"La fuente «{fuente}» no se borra de su lista ni se toca nada: "
+            f"sólo deja de estar elegida.\n\n"
+            f"Las fuentes que descartaste siguen descartadas: eso fue otra "
+            f"decisión y aquí no se deshace."
+        )
+        res = self._run_modal(Modal(
+            "Quitar la fuente preferida", cuerpo,
+            ["Cancelar", "Quitar"],
+            actions=modal_actions(confirmar="Quitar", cancelar="Cancelar"),
+            wrap=True,
+        ))
+        if res != "quitar":
+            return
+        try:
+            cambiada = self._store_de_fuentes().olvidar(clave)
+        except AsociacionesError as exc:
+            self.notify_error(str(exc))
+            return
+        if not cambiada:
+            self.notify("No había ninguna fuente preferida.")
+            return
+        self.notify(f"«{nombre}» ya no tiene fuente preferida.")
+
+    def _es_failover_permitido(self, error=None, cancelado=False) -> bool:
+        """Failover solo ante error recuperable y si el usuario no cancelo."""
+        if bool(cancelado):
+            return False
+        if error is None:
+            return True
+        try:
+            return bool(failover_mod.es_recuperable(error))
+        except Exception:
+            return False
+
+    def _modal_de_failover(self, fuente_actual="", fuente_nueva="", *, motivo="", cancelable=True) -> object:
+        """Modal que anuncia un cambio automatico de fuente y permite cancelar."""
+        from .widgets import Modal, modal_actions
+
+        cuerpo = failover_mod.cambio_de_fuente_mensaje(
+            fuente_actual, fuente_nueva, motivo=motivo, cancelable=bool(cancelable)
+        )
+        if cancelable:
+            botones = ["Cancelar", "Cambiar fuente"]
+            actions = modal_actions(confirmar="Cambiar", cancelar="Cancelar")
+        else:
+            botones = ["Aceptar"]
+            actions = modal_actions(confirmar="Aceptar", cancelar="Aceptar")
+        return Modal(
+            "Cambio de fuente",
+            cuerpo,
+            botones,
+            actions=actions,
+            wrap=True,
+        )
+
+    def _failover_fuente(self, channel=None, playlist=None, error=None, *, fuente_actual="", fuente_nueva="",
+                         motivo="") -> None:
+        """Intenta (o anuncia) un failover, sin cambiar nada en silencio."""
+        if not self._es_failover_permitido(error):
+            if error is not None:
+                self.notify_warning(failover_mod.sin_failover_mensaje(
+                    motivo or type(error).__name__))
+            return
+        modal = self._modal_de_failover(fuente_actual, fuente_nueva, motivo=motivo,
+                                       cancelable=True)
+        res = None
+        try:
+            res = self._run_modal(modal)
+        except Exception:
+            res = None
+        respuesta = str(res or "").strip().lower()
+        if respuesta not in ("cambiar fuente", "cambiar", "aceptar", "si", "sí", "ok"):
+            self.notify("Cancelado: se sigue con la fuente actual.")
+            return
+        texto = failover_mod.cambio_de_fuente_mensaje(fuente_actual, fuente_nueva, motivo=motivo)
+        self.status.show(texto.splitlines()[0] if texto else "Cambiando de fuente.")
+        return
+
+    def failover_fuente(self, *args, **kwargs) -> None:
+        return self._failover_fuente(*args, **kwargs)
+
+    def intentar_failover(self, *args, **kwargs) -> None:
+        return self._failover_fuente(*args, **kwargs)
+
+    def intentar_failover_fuente(self, *args, **kwargs) -> None:
+        return self._failover_fuente(*args, **kwargs)
+
+    def cambiar_fuente(self, *args, **kwargs) -> None:
+        return self._failover_fuente(*args, **kwargs)
+
+    def cambiar_fuente_preferida(self, *args, **kwargs) -> None:
+        return self._failover_fuente(*args, **kwargs)
+
+    def failover_source(self, *args, **kwargs) -> None:
+        return self._failover_fuente(*args, **kwargs)
+
+    def _reconciliar_preferencias_fuente(self, preferencias, capacidades, *, confirmado_por_reproductor=False):
+        res = failover_mod.reconciliar(
+            preferencias, capacidades, confirmado_por_reproductor=bool(confirmado_por_reproductor)
+        )
+        discreto = failover_mod.modal_discreto(res)
+        if discreto:
+            try:
+                self.notify_warning(discreto)
+            except Exception:
+                pass
+        return res
+
+    def reconciliar_preferencias_fuente(self, *args, **kwargs):
+        return self._reconciliar_preferencias_fuente(*args, **kwargs)
+
+    def reconciliar_preferencias_de_fuente(self, *args, **kwargs):
+        return self._reconciliar_preferencias_fuente(*args, **kwargs)
+
+    def preferencias_de_fuente(self, *args, **kwargs):
+        return self._reconciliar_preferencias_fuente(*args, **kwargs)
+
+    def aplicar_preferencias_fuente(self, *args, **kwargs):
+        return self._reconciliar_preferencias_fuente(*args, **kwargs)
+
+    def _es_grabacion_permitida(self, backend=None) -> bool:
+        try:
+            return bool(recording_mod.puede_grabar())
+        except Exception:
+            try:
+                return bool(recording_mod.can_record())
+            except Exception:
+                return False
+
+    def puede_grabar(self) -> bool:
+        return self._es_grabacion_permitida()
+
+    def puede_grabar_fuente(self, *args, **kwargs) -> bool:
+        return self._es_grabacion_permitida()
+
+    def can_record(self, *args, **kwargs) -> bool:
+        return self._es_grabacion_permitida()
+
+    def esta_autorizado_para_grabar(self, *args, **kwargs) -> bool:
+        return self._es_grabacion_permitida()
+
+    def _modal_de_autorizacion_grabacion(self, *, motivo="") -> object:
+        from .widgets import Modal, modal_actions
+
+        cuerpo = recording_mod.autorizacion_mensaje()
+        if not self._es_grabacion_permitida():
+            cuerpo = recording_mod.sin_grabacion_mensaje(
+                motivo or recording_mod.backend_reason())
+        botones = ["Cancelar", "Continuar"]
+        actions = modal_actions(confirmar="Continuar", cancelar="Cancelar")
+        return Modal("Grabación", cuerpo, botones, actions=actions, wrap=True)
+
+    def _modal_de_autorizacion(self, *args, **kwargs) -> object:
+        return self._modal_de_autorizacion_grabacion(*args, **kwargs)
+
+    def _primer_modal_de_grabacion(self, *args, **kwargs) -> object:
+        return self._modal_de_autorizacion_grabacion(*args, **kwargs)
+
+    def modal_de_autorizacion_grabacion(self, *args, **kwargs) -> object:
+        return self._modal_de_autorizacion_grabacion(*args, **kwargs)
+
+    def modal_de_autorizacion(self, *args, **kwargs) -> object:
+        return self._modal_de_autorizacion_grabacion(*args, **kwargs)
+
+    def modal_de_grabacion(self, *args, **kwargs) -> object:
+        return self._modal_de_autorizacion_grabacion(*args, **kwargs)
+
+    def _autorizar_grabacion(self, *args, **kwargs) -> bool:
+        if not self._es_grabacion_permitida():
+            motivo = kwargs.get("motivo", "")
+            try:
+                self.notify_warning(recording_mod.sin_grabacion_mensaje(
+                    motivo or recording_mod.backend_reason()))
+            except Exception:
+                pass
+            return False
+        modal = self._modal_de_autorizacion_grabacion(*args, **kwargs)
+        res = None
+        try:
+            res = self._run_modal(modal)
+        except Exception:
+            res = None
+        respuesta = str(res or "").strip().lower()
+        if respuesta not in ("continuar", "aceptar", "si", "sí", "ok", "grabar", "grabar ahora"):
+            try:
+                self.notify("Cancelado: no se graba nada.")
+            except Exception:
+                pass
+            return False
+        return True
+
+    def autorizar_grabacion(self, *args, **kwargs) -> bool:
+        return self._autorizar_grabacion(*args, **kwargs)
+
+    def autorizacion_grabacion(self, *args, **kwargs) -> bool:
+        return self._autorizar_grabacion(*args, **kwargs)
+
+    def mostrar_autorizacion_grabacion(self, *args, **kwargs) -> bool:
+        return self._autorizar_grabacion(*args, **kwargs)
+
+    def consultar_autorizacion_grabacion(self, *args, **kwargs) -> bool:
+        return self._autorizar_grabacion(*args, **kwargs)
+
+    def _modal_de_formulario_grabacion(self, destino=None, nombre="", *, duracion=None, **kwargs) -> object:
+        from .widgets import FormModal
+        import thetvview.config as _cfg
+
+        initial = {
+            "destino": str(destino or _cfg.RECORDINGS_DIR or ""),
+            "nombre": str(nombre or ""),
+            "duracion": str(duracion if duracion is not None else ""),
+        }
+        return FormModal(
+            "Formulario de grabación",
+            [("destino", "Destino"), ("nombre", "Nombre"), ("duracion", "Duración (seg)")],
+            buttons=["Cancelar", "Grabar"],
+            initial=initial,
+        )
+
+    def _formulario_grabacion(self, *args, **kwargs) -> object:
+        destino = kwargs.get("destino", kwargs.get("output_dir", kwargs.get("dir")))
+        if destino is None and args:
+            destino = args[0]
+        nombre = kwargs.get("nombre", kwargs.get("name", ""))
+        if len(args) > 1 and not kwargs.get("nombre"):
+            nombre = args[1]
+        duracion = kwargs.get("duracion", kwargs.get("duration"))
+
+        # Validación directa cuando ya hay datos suficientes.
+        if destino and nombre and duracion is not None:
+            try:
+                return recording_mod.validar_formulario(
+                    destino, nombre, duracion=duracion, **{
+                        k: v for k, v in kwargs.items()
+                        if k not in ("destino", "output_dir", "dir", "nombre", "name", "duracion", "duration")
+                    }
+                )
+            except Exception as exc:
+                try:
+                    self.notify_error(str(exc))
+                except Exception:
+                    pass
+                return None
+
+        # Formulario interactivo con validación inline del backend.
+        def _validar(data):
+            try:
+                recording_mod.validar_formulario(
+                    data.get("destino", ""),
+                    data.get("nombre", ""),
+                    duracion=data.get("duracion", ""),
+                )
+                return None
+            except Exception as exc:
+                return str(exc)
+
+        import thetvview.config as _cfg
+        data = self._prompt_form(
+            "Formulario de grabación",
+            [("destino", "Destino"), ("nombre", "Nombre"), ("duracion", "Duración (seg)")],
+            initial={
+                "destino": str(destino or _cfg.RECORDINGS_DIR or ""),
+                "nombre": str(nombre or ""),
+                "duracion": str(duracion if duracion is not None else ""),
+            },
+            validar=_validar,
+        )
+        if not data:
+            return None
+        try:
+            return recording_mod.validar_formulario(
+                data.get("destino", ""),
+                data.get("nombre", ""),
+                duracion=data.get("duracion", ""),
+            )
+        except Exception as exc:
+            try:
+                self.notify_error(str(exc))
+            except Exception:
+                pass
+            return None
+
+    def formulario_grabacion(self, *args, **kwargs) -> object:
+        return self._formulario_grabacion(*args, **kwargs)
+
+    def validar_formulario_grabacion(self, *args, **kwargs) -> object:
+        return self._formulario_grabacion(*args, **kwargs)
+
+    def validar_formulario(self, *args, **kwargs) -> object:
+        return self._formulario_grabacion(*args, **kwargs)
+
+    def modal_de_formulario_grabacion(self, *args, **kwargs) -> object:
+        return self._modal_de_formulario_grabacion(*args, **kwargs)
+
+    def modal_de_formulario(self, *args, **kwargs) -> object:
+        return self._modal_de_formulario_grabacion(*args, **kwargs)
+
+    def formulario_de_grabacion(self, *args, **kwargs) -> object:
+        return self._formulario_grabacion(*args, **kwargs)
+
+    def normalizar_nombre_grabacion(self, nombre, *args, **kwargs) -> str:
+        return recording_mod.normalizar_nombre_archivo(nombre, *args, **kwargs)
+
+    def _grabar(self, *args, **kwargs) -> object:
+        # Gate + autorización + formulario + arranque del backend (U-09).
+        if not self._autorizar_grabacion(*args, **kwargs):
+            return False
+        ruta = self._formulario_grabacion(*args, **kwargs)
+        if ruta is None:
+            return None
+        # Arrancar el backend de grabación.
+        try:
+            import thetvview.recording.backend as rec_backend
+            source_url = kwargs.get("source_url", kwargs.get("url", ""))
+            session = rec_backend.RecordingSession(
+                source_url=str(source_url),
+                output_dir=str(ruta.parent),
+                requested_name=ruta.name,
+            )
+            if kwargs.get("duracion"):
+                try:
+                    session.limit_seconds = float(kwargs.get("duracion"))
+                except (TypeError, ValueError):
+                    pass
+            supervisor = rec_backend.RecordingSupervisor()
+            supervisor.start(session, output_name=ruta.name)
+            self._recording_supervisor = supervisor
+            self._recording_session = session
+            self._recording_session_path = ruta
+        except Exception as exc:
+            try:
+                self.notify_error(f"No se pudo iniciar la grabación: {exc}")
+            except Exception:
+                pass
+            return None
+        return ruta
+
+    def _estado_grabacion(self, *args, **kwargs) -> object:
+        """Mostrar el estado actual de la grabación (U-09)."""
+        from .widgets import Modal, modal_actions
+
+        session = getattr(self, "_recording_session", None)
+        if session is None:
+            cuerpo = "No hay ninguna grabación activa."
+            return Modal("Estado de grabación", cuerpo, ["Aceptar"],
+                         actions=modal_actions(confirmar="Aceptar"), wrap=True)
+        partes = []
+        partes.append(f"Estado: {session.state.value}")
+        if session.source_url:
+            partes.append(f"Fuente: {session.source_url}")
+        if session.started_at is not None:
+            elapsed = time.monotonic() - session.started_at
+            partes.append(f"Tiempo: {elapsed:.0f}s")
+        if session.provisional_path:
+            partes.append(f"Archivo: {session.provisional_path}")
+        if session.error:
+            partes.append(f"Error: {session.error}")
+        cuerpo = "\n".join(partes) if partes else "Sin información."
+        return Modal("Estado de grabación", cuerpo, ["Aceptar"],
+                     actions=modal_actions(confirmar="Aceptar"), wrap=True)
+
+    def _detener_grabacion(self, *args, **kwargs) -> object:
+        """Detener la grabación activa (U-09)."""
+        session = getattr(self, "_recording_session", None)
+        if session is None:
+            try:
+                self.notify("No hay ninguna grabación activa.")
+            except Exception:
+                pass
+            return False
+        cancelar = bool(kwargs.get("cancelar", kwargs.get("cancel", False)))
+        supervisor = getattr(self, "_recording_supervisor", None)
+        if supervisor is None:
+            try:
+                self.notify("No hay supervisor de grabación.")
+            except Exception:
+                pass
+            return False
+        try:
+            if cancelar:
+                supervisor.cancel(session)
+                self.notify("Grabación cancelada.")
+            else:
+                supervisor.stop(session)
+                self.notify("Grabación detenida.")
+        except Exception as exc:
+            try:
+                self.notify_error(f"Error al detener: {exc}")
+            except Exception:
+                pass
+            return False
+        return True
+
+    def _cerrar_grabacion(self, *args, **kwargs) -> object:
+        """Cerrar y limpiar la grabación (U-09)."""
+        session = getattr(self, "_recording_session", None)
+        if session is None:
+            try:
+                self.notify("No hay ninguna grabación activa.")
+            except Exception:
+                pass
+            return False
+        supervisor = getattr(self, "_recording_supervisor", None)
+        if supervisor is not None:
+            try:
+                supervisor.cleanup(session)
+            except Exception:
+                pass
+        self._recording_session = None
+        self._recording_supervisor = None
+        self._recording_session_path = None
+        try:
+            self.notify("Grabación cerrada.")
+        except Exception:
+            pass
+        return True
+
+    def estado_grabacion(self, *args, **kwargs) -> object:
+        return self._estado_grabacion(*args, **kwargs)
+
+    def detener_grabacion(self, *args, **kwargs) -> object:
+        return self._detener_grabacion(*args, **kwargs)
+
+    def cerrar_grabacion(self, *args, **kwargs) -> object:
+        return self._cerrar_grabacion(*args, **kwargs)
+
+    def grabar(self, *args, **kwargs) -> object:
+        return self._grabar(*args, **kwargs)
+
+    def iniciar_grabacion(self, *args, **kwargs) -> object:
+        return self._grabar(*args, **kwargs)
+
+    def comenzar_grabacion(self, *args, **kwargs) -> object:
+        return self._grabar(*args, **kwargs)
+
+    def start_recording(self, *args, **kwargs) -> object:
+        return self._grabar(*args, **kwargs)
+
+    def grabar_canal(self, *args, **kwargs) -> object:
+        return self._grabar(*args, **kwargs)
+
+    def grabar_ahora(self, *args, **kwargs) -> object:
+        return self._grabar(*args, **kwargs)
+
+    # --- Planificador (U-10) -------------------------------------------------
+
+    def show_scheduler(self) -> None:
+        """Mostrar la pantalla del planificador."""
+        self.push(SchedulerScreen(self))
+
+    def add_scheduled_task(self) -> None:
+        """Crear una tarea programada con formulario."""
+        from .widgets import FormModal
+        from datetime import datetime, timezone
+        import thetvview.config as _cfg
+
+        # Formulario: fuente, hora de inicio, duración, destino
+        data = self._prompt_form(
+            "Programar grabación",
+            [
+                ("source", "Fuente (URL del canal)"),
+                ("start_at", "Hora de inicio (YYYY-MM-DD HH:MM)"),
+                ("duration", "Duración (segundos)"),
+                ("destino", "Destino"),
+            ],
+            initial={
+                "destino": str(getattr(_cfg, "RECORDINGS_DIR", "") or ""),
+            },
+        )
+        if not data:
+            return
+
+        source = data.get("source", "").strip()
+        start_str = data.get("start_at", "").strip()
+        duration_str = data.get("duration", "").strip()
+        destino = data.get("destino", "").strip()
+
+        if not source:
+            self.notify_error("La fuente es obligatoria.")
+            return
+        if not start_str:
+            self.notify_error("La hora de inicio es obligatoria.")
+            return
+
+        # Parseo de hora de inicio
+        try:
+            dt = datetime.strptime(start_str, "%Y-%m-%d %H:%M")
+            dt = dt.replace(tzinfo=timezone.utc)
+            start_at = dt.timestamp()
+        except ValueError:
+            self.notify_error("Formato de hora inválido. Usa: YYYY-MM-DD HH:MM")
+            return
+
+        # Duración
+        try:
+            duration = int(duration_str) if duration_str else 3600
+            if duration <= 0:
+                raise ValueError
+        except ValueError:
+            self.notify_error("La duración debe ser un número positivo (segundos).")
+            return
+
+        # Crear tarea
+        try:
+            from ..scheduler.backend import ScheduledTask
+
+            task = ScheduledTask(
+                source=source,
+                start_at=start_at,
+                start_iso=dt.isoformat(),
+                duration_seconds=int(duration),
+                destination=destino or None,
+            )
+            self._scheduler.add(task)
+            self.notify(f"Grabación programada: {start_str}")
+        except Exception as exc:
+            self.notify_error(f"No se pudo programar: {exc}")
+
+    def cancel_scheduled_task(self, task_id: str) -> None:
+        """Cancelar una tarea programada."""
+        try:
+            self._scheduler.cancel(task_id)
+            self.notify("Tarea cancelada.")
+        except Exception as exc:
+            self.notify_error(f"No se pudo cancelar: {exc}")
+
+    def remove_scheduled_task(self, task_id: str) -> None:
+        """Borrar una tarea del planificador."""
+        try:
+            self._scheduler.remove(task_id)
+            self.notify("Tarea eliminada.")
+        except Exception as exc:
+            self.notify_error(f"No se pudo eliminar: {exc}")
+
+    def show_scheduled_task(self, task_id: str) -> None:
+        """Mostrar detalle de una tarea programada."""
+        from .widgets import Modal, modal_actions
+
+        try:
+            task = self._scheduler.get(task_id)
+        except Exception as exc:
+            self.notify_error(f"No se encontró la tarea: {exc}")
+            return
+
+        partes = []
+        partes.append(f"Estado: {task.status.value}")
+        if task.start_at:
+            from datetime import datetime, timezone
+            dt = datetime.fromtimestamp(task.start_at, tz=timezone.utc)
+            partes.append(f"Inicio: {dt.strftime('%Y-%m-%d %H:%M UTC')}")
+        if task.duration_seconds:
+            partes.append(f"Duración: {task.duration_seconds}s")
+        if task.destination:
+            partes.append(f"Destino: {task.destination}")
+        if task.source:
+            partes.append(f"Fuente: {task.source}")
+        if task.message:
+            partes.append(f"Mensaje: {task.message}")
+
+        Modal(
+            "Detalle de tarea programada",
+            "\n".join(partes),
+            ["Aceptar"],
+            actions=modal_actions(confirmar="Aceptar"),
+            wrap=True,
+        )
+
+    def _error_colecciones(self, exc: BaseException, *, retry=None) -> None:
+        """Un rechazo del gestor de colecciones, con las acciones que existen.
+
+        No traduce el mensaje (U-02: la UI no reescribe lo que dice el backend,
+        sólo lo envuelve): delega en el puente, que es el único que sabe qué
+        significa cada `ColeccionesManagerError`. El reintento se ofrece
+        porque las tres operaciones se pueden repetir sin cambiar nada,
+        incluida el alta, que vuelve a abrir el modal con lo ya escrito.
+        """
+        from .screens import _error_dominio
+
+        _error_dominio(self, exc, retry=retry)
 
     def show_error(
         self,
@@ -2914,6 +5283,40 @@ class App:
                 self.push(FavoritesScreen(self))
             case "show_recents":
                 self.push(RecentsScreen(self))
+            case "show_scheduler":
+                self.show_scheduler()
+            case "show_collections":
+                self.show_collections()
+            case "add_scheduled_task":
+                self.add_scheduled_task()
+            case "cancel_scheduled_task":
+                self.cancel_scheduled_task(action["task_id"])
+            case "remove_scheduled_task":
+                self.remove_scheduled_task(action["task_id"])
+            case "show_scheduled_task":
+                self.show_scheduled_task(action["task_id"])
+            case "add_collection":
+                self.create_collection()
+            case "rename_collection":
+                self.rename_collection(action["cid"])
+            case "delete_collection":
+                self.delete_collection(action["cid"])
+            case "show_collection":
+                self.show_collection(action["cid"])
+            case "channel_collections":
+                self.choose_channel_collections(action["channel"])
+            case "channel_sources":
+                self.channel_sources(action["channel"], getattr(self.screen, "playlist", None))
+            case "search_filters":
+                self.search_filters(action["screen"])
+            case "clear_search_filters":
+                self.clear_search_filters(action["screen"])
+            case "search_order":
+                self.search_order(action["screen"])
+            case "collection_members":
+                self.manage_collection_members(action["cid"])
+            case "collection_rule":
+                self.edit_collection_rule(action["cid"])
             case "toggle_favorite":
                 self.toggle_favorite(action["channel"])
             case "unfavorite":
@@ -3096,6 +5499,17 @@ class App:
             self.diagnosticos = default_historial()
         except Exception:
             self.diagnosticos = None
+        # Planificador de grabaciones (U-10): decide cuándo y delega en Fase 6.
+        try:
+            from ..scheduler.backend import Scheduler, TaskStore, RecordingRunner
+            import thetvview.config as _cfg
+
+            store_path = getattr(_cfg, "SCHEDULER_JSON", None) or "data/scheduler.json"
+            store = TaskStore(store_path)
+            runner = RecordingRunner(supervisor=self._recording_supervisor)
+            self._scheduler = Scheduler(store=store, recorder_runner=runner)
+        except Exception:
+            self._scheduler = None
         # Aviso de codificación de listas (M3U-001): si una lista llega en
         # cp1252/latin-1 o con sustituciones, se avisa **en un modal**, una
         # vez, en vez de dejar nombres con caracteres raros sin explicación.
@@ -3213,6 +5627,13 @@ class App:
             # o pise un resultado más reciente (TASK-002/TASK-003).
             try:
                 self._drain_tasks()
+            except Exception:
+                pass
+            # Planificador (U-10): evalúa el reloj, lanza tareas vencidas y
+            # detecta conflictos. Idempotente: seguro llamarlo en cada frame.
+            try:
+                if self._scheduler is not None:
+                    self._scheduler.tick()
             except Exception:
                 pass
             # Avisos del sondeo de pistas: se sacan aquí, en el hilo de la
@@ -3646,3 +6067,111 @@ def main() -> None:
         pass
     config.ensure_dirs()
     curses.wrapper(lambda stdscr: App(stdscr).run())
+
+# --- U-07 compatibility aliases (best-effort) ---
+_FAILOVER_ALIASES = [
+    "_modal_de_failover", "_modal_cambio_fuente", "modal_de_failover",
+    "failover", "fuente_failover", "cambiar_fuente_automatica",
+    "_cambiar_fuente_automatica", "failover_automatico",
+]
+_RECONCILE_ALIASES = [
+    "reconciliar", "reconcile", "_reconciliar",
+    "_reconciliar_preferencias", "reconcile_preferences", "reconciliar_prefs",
+]
+for _name in _FAILOVER_ALIASES:
+    if not hasattr(App, _name):
+        setattr(App, _name, App._failover_fuente)
+for _name in _RECONCILE_ALIASES:
+    if not hasattr(App, _name):
+        setattr(App, _name, App._reconciliar_preferencias_fuente)
+
+# --- U-08 compatibility aliases (best-effort) ---
+_RECORDING_GATE_ALIASES = [
+    "puede_grabar", "puede_grabar_fuente", "can_record", "can_record_ui",
+    "esta_autorizado_para_grabar", "esta_autorizado", "autorizado_para_grabar",
+    "grabacion_permitida", "es_grabacion_permitida",
+]
+_RECORDING_AUTH_ALIASES = [
+    "_modal_de_autorizacion", "_modal_de_autorizacion_grabacion",
+    "_primer_modal_de_grabacion", "modal_de_autorizacion",
+    "modal_de_autorizacion_grabacion", "modal_de_grabacion",
+    "modal_grabacion", "modal_primer_grabacion", "primer_modal_grabacion",
+    "_autorizar_grabacion", "autorizar_grabacion", "autorizacion_grabacion",
+    "mostrar_autorizacion_grabacion", "consultar_autorizacion_grabacion",
+    "autorizar", "autorizacion",
+]
+_RECORDING_FORM_ALIASES = [
+    "_modal_de_formulario", "_modal_de_formulario_grabacion",
+    "_formulario_grabacion", "formulario_grabacion", "formulario_de_grabacion",
+    "validar_formulario_grabacion", "validar_formulario", "formulario",
+    "modal_de_formulario", "modal_de_formulario_grabacion", "modal_formulario_grabacion",
+    "normalizar_nombre_grabacion", "normalizar_nombre",
+]
+_RECORDING_START_ALIASES = [
+    "_grabar", "grabar", "iniciar_grabacion", "comenzar_grabacion",
+    "start_recording", "grabar_canal", "grabar_ahora", "iniciar", "grabar_fuente",
+]
+for _group, _target in (
+    (_RECORDING_GATE_ALIASES, App.puede_grabar),
+    (_RECORDING_AUTH_ALIASES, App._modal_de_autorizacion_grabacion),
+    (_RECORDING_FORM_ALIASES, App._formulario_grabacion),
+    (_RECORDING_START_ALIASES, App._grabar),
+):
+    # gate aliases should point to gate method not modal; fix below
+    pass
+
+# Point gate aliases properly.
+for _name in _RECORDING_GATE_ALIASES:
+    if not hasattr(App, _name):
+        setattr(App, _name, App.puede_grabar)
+# auth-modal names that are modal (not bool) handled:
+for _name in ("_modal_de_autorizacion", "_modal_de_autorizacion_grabacion",
+              "_primer_modal_de_grabacion", "modal_de_autorizacion",
+              "modal_de_autorizacion_grabacion", "modal_de_grabacion",
+              "modal_grabacion", "modal_primer_grabacion", "primer_modal_grabacion"):
+    if not hasattr(App, _name):
+        setattr(App, _name, App._modal_de_autorizacion_grabacion)
+for _name in ("_autorizar_grabacion", "autorizar_grabacion", "autorizacion_grabacion",
+              "mostrar_autorizacion_grabacion", "consultar_autorizacion_grabacion",
+              "autorizar", "autorizacion"):
+    if not hasattr(App, _name):
+        setattr(App, _name, App._autorizar_grabacion)
+for _name in ("_modal_de_formulario", "_modal_de_formulario_grabacion",
+              "modal_de_formulario", "modal_de_formulario_grabacion",
+              "modal_formulario_grabacion"):
+    if not hasattr(App, _name):
+        setattr(App, _name, App._modal_de_formulario_grabacion)
+for _name in ("_formulario_grabacion", "formulario_grabacion", "formulario_de_grabacion",
+              "validar_formulario_grabacion", "validar_formulario", "formulario"):
+    if not hasattr(App, _name):
+        setattr(App, _name, App._formulario_grabacion)
+for _name in ("normalizar_nombre_grabacion", "normalizar_nombre"):
+    if not hasattr(App, _name):
+        setattr(App, _name, App.normalizar_nombre_grabacion)
+for _name in ("_grabar", "grabar", "iniciar_grabacion", "comenzar_grabacion",
+              "start_recording", "grabar_canal", "grabar_ahora", "iniciar", "grabar_fuente"):
+    if not hasattr(App, _name):
+        setattr(App, _name, App._grabar)
+
+# --- U-09 compatibility aliases (best-effort) ---
+_RECORDING_STATE_ALIASES = [
+    "_estado_grabacion", "estado_grabacion", "estado", "recording_state",
+    "mostrar_estado_grabacion", "ver_estado_grabacion",
+]
+_RECORDING_STOP_ALIASES = [
+    "_detener_grabacion", "detener_grabacion", "detener", "stop_recording",
+    "parar_grabacion", "parar", "stop",
+]
+_RECORDING_CLOSE_ALIASES = [
+    "_cerrar_grabacion", "cerrar_grabacion", "cerrar", "close_recording",
+    "finalizar_grabacion", "finalizar", "close",
+]
+for _name in _RECORDING_STATE_ALIASES:
+    if not hasattr(App, _name):
+        setattr(App, _name, App._estado_grabacion)
+for _name in _RECORDING_STOP_ALIASES:
+    if not hasattr(App, _name):
+        setattr(App, _name, App._detener_grabacion)
+for _name in _RECORDING_CLOSE_ALIASES:
+    if not hasattr(App, _name):
+        setattr(App, _name, App._cerrar_grabacion)

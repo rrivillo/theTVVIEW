@@ -12,7 +12,7 @@ que `handle_key` ignora, la suite lo ve aquí — no el usuario en producción
 
 Además cubre:
 
-- `? Ayuda` presente y `essential` en las 10 pantallas;
+- `? Ayuda` presente y `essential` en las 11 pantallas;
 - etiqueta dinámica de favorito: `Favorito` ↔ `Quitar` según el estado real;
 - EPG sin catch-up **no** anuncia «Archivo»;
 - navegación Canales→Favoritos→EPG→Pistas→volver: el subconjunto visible
@@ -37,6 +37,7 @@ from thetvview.ui.actions import V, fit_actions
 from thetvview.ui.app import App
 from thetvview.ui.screens import (
     ChannelsScreen,
+    CollectionsScreen,
     EpgScreen,
     FavoritesScreen,
     GroupsScreen,
@@ -45,6 +46,7 @@ from thetvview.ui.screens import (
     PlaylistsScreen,
     RecentsScreen,
     ResolutionScreen,
+    SchedulerScreen,
     Screen,
     TrackOptionsScreen,
 )
@@ -289,6 +291,7 @@ class BaseApp(unittest.TestCase):
             "Channels": canales,
             "Favorites": FavoritesScreen(app),
             "Recents": RecentsScreen(app),
+            "Collections": CollectionsScreen(app, playlist_canales().channels),
             "Groups": grupos,
             "Resolution": ResolutionScreen(app, canal("La 1"),
                                         [canal("La 1 HD"), canal("La 1 SD")]),
@@ -296,6 +299,7 @@ class BaseApp(unittest.TestCase):
             "Pistas": pistas,
             "NowPlaying": NowPlayingScreen(app, canal("La 1"), "mpv", mock.Mock()),
             "Epg": self.epg_pantalla(),
+            "Scheduler": SchedulerScreen(app),
         }
 
     def epg_pantalla(self, screen_channel=None) -> EpgScreen:
@@ -543,9 +547,11 @@ class TestInvarianteTeclas(BaseApp):
 
 
 class TestAyudaEsencial(BaseApp):
-    def test_ayuda_presente_y_esencial_en_las_diez(self):
+    def test_ayuda_presente_y_esencial_en_todas(self):
         pantallas = self.pantallas()
-        self.assertEqual(len(pantallas), 10)
+        # El número sube con cada pantalla nueva: relajarlo dejaría que la
+        # próxima se cuele sin que nadie lo note.
+        self.assertEqual(len(pantallas), 12)
         for nombre, screen in pantallas.items():
             with self.subTest(pantalla=nombre):
                 ayuda = [a for a in screen.actions() if a.key == "?"]

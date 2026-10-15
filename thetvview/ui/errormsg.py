@@ -73,6 +73,14 @@ class ErrorKind(str, Enum):
 
     PLAYLIST = "playlist"
     PLAYBACK = "playback"
+    #: Colecciones inteligentes (Fase 4). No es «playlist» ni «playback»: un
+    #: error al guardar una colección o al validar su regla no se arregla
+    #: reintentando la descarga ni eligiendo otro reproductor.
+    COLECCIONES = "colecciones"
+    #: Grabación manual y planificador (Fases 6 y 7). Un fallo al grabar o al
+    #: programar no tiene nada que ver con reproducir un canal: depende de si
+    #: hay espacio, si VLC existe y si la tarea sigue viva.
+    GRABACION = "grabacion"
 
 
 @dataclass(frozen=True)
@@ -119,6 +127,12 @@ _TITULO_REPRODUCCION = "No se pudo reproducir este canal"
 _TITULOS: dict[ErrorKind, str] = {
     ErrorKind.PLAYLIST: _TITULO_LISTA,
     ErrorKind.PLAYBACK: _TITULO_REPRODUCCION,
+    # Los dos flujos nuevos nunca pasan por `_titulo()`: quien los produce es
+    # `ui.domain_errors`, que pone su propio título. Se declaración aquí para
+    # que el diccionario sea total y un `kind` nuevo no reviente con un KeyError
+    # si algún día alguien lo consulta.
+    ErrorKind.COLECCIONES: "No se pudo trabajar con la colección",
+    ErrorKind.GRABACION: "No se pudo grabar",
 }
 
 

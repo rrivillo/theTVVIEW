@@ -75,10 +75,13 @@ class ColeccionesManager:
         *,
         identity_fn: Callable[[Channel], str] = channel_identity,
         catalog_provider: Callable[[], Any] | None = None,
+        context_provider: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self.path = Path(path)
         self.identity_fn = identity_fn
         self.catalog_provider = catalog_provider
+        #: Callable que devuelve el contexto de evaluación (U-04b).
+        self.context_provider = context_provider
         self._cache: list[Coleccion] | None = None
         self._cache_mtime = None
         self._cache_result: dict[str, list[Channel]] = {}
@@ -356,6 +359,22 @@ class ColeccionesManager:
             return id(chans)
         return id(catalogo)
 
+    def _contexto_actual(self, contexto: Any = None) -> Any:
+        """El contexto a usar: el que le pasan, o el que aporta la app.
+
+        Un `context_provider` que revienta no puede tumbar la evaluación: se
+        degrada a `None`, que es lo que pasaba antes de que existiera y es
+        peor que nada —pero no es una mentira, es una ausencia.
+        """
+        if contexto is not None:
+            return contexto
+        if self.context_provider is not None:
+            try:
+                return self.context_provider()
+            except Exception:
+                return None
+        return None
+
     def miembros(
         self,
         cid: str,
@@ -368,11 +387,22 @@ class ColeccionesManager:
         col = self.obtener(cid)
         if col is None:
             return []
+        contexto = self._contexto_actual(contexto)
         ck = self._catalog_key(catalogo)
         cache_key = (cid, ck, id(contexto))
-        if (not force and not self._invalidated and cache_key in self._cache_result
-                and self._last_catalog_id == ck):
-            return list(self._cache_result[cache_key])
+        # Una **manual** resuelve sus `members` contra el catálogo y ya: el
+        # contexto no interviene, así que su caché sigue igual que siempre.
+        # En cualquier otro tipo el contexto manda, y el contexto cambia sin
+        # que cambie la lista (el usuario marca un favorito y el conteo tiene
+        # que moverse), mientras que la clave de caché sólo mira la identidad
+        # del diccionario. Cachearlo dejaría un número congelado en pantalla,
+        # que es justo lo que U-04b viene a arreglar.
+        depende_del_contexto = contexto is not None and col.type != "manual"
+        if not depende_del_contexto:
+            if (not force and not self._invalidated
+                    and cache_key in self._cache_result
+                    and self._last_catalog_id == ck):
+                return list(self._cache_result[cache_key])
         try:
             res = evaluar_coleccion(col, catalogo, contexto)
         except Exception:
@@ -380,9 +410,10 @@ class ColeccionesManager:
         # referencias obsoletas para manuales
         if col.type == "manual":
             self._referencias_obsoletas(cid, col, catalogo)
-        self._cache_result[cache_key] = list(res)
-        self._last_catalog_id = ck
-        self._invalidated = False
+        if not depende_del_contexto:
+            self._cache_result[cache_key] = list(res)
+            self._last_catalog_id = ck
+            self._invalidated = False
         return list(res)
 
     def members(self, *a, **k):

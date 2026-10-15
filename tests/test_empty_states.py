@@ -32,6 +32,7 @@ from thetvview.ui.screens import (
     GroupsScreen,
     PlaylistsScreen,
     RecentsScreen,
+    SchedulerScreen,
 )
 from thetvview.ui.textwidth import cell_width
 from thetvview.ui.widgets import EmptyState, wrap_block
@@ -631,6 +632,7 @@ class TestReglasTransversales(unittest.TestCase):
             canales,
             grupos,
             ChannelsScreen(AppFalso(), Playlist(name="P", channels=[])),
+            SchedulerScreen(AppFalso()),
         ]
 
     def test_ningun_estado_vacio_usa_emoji(self):

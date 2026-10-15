@@ -3,6 +3,15 @@
 from .detection import *  # noqa: F401,F403
 from .failover import *  # noqa: F401,F403
 from .preferences import *  # noqa: F401,F403
+from .associations import (
+    AsociacionesError,
+    Asociacion,
+    AssociationStore,
+    SourcesStore,
+    MAX_RECHAZOS_POR_CANAL,
+    clave_logica,
+    clave_candidata,
+)
 from .model import (
     ConfianzaCandidata,
     CandidateConfidence,
@@ -43,6 +52,13 @@ __all__ = [
     "SourceListSpec",
     "SourceCatalogEntry",
     "MultiSourceCatalog",
+    "AsociacionesError",
+    "Asociacion",
+    "AssociationStore",
+    "SourcesStore",
+    "MAX_RECHAZOS_POR_CANAL",
+    "clave_logica",
+    "clave_candidata",
 ]
 
 # English aliases.

@@ -35,9 +35,11 @@ from thetvview.player.capabilities import KIND_SUBTITLES
 from thetvview.player.router import NoCompatibleBackend
 from thetvview.player.session import EndReason, SessionRegistry
 
+from . import icons
 from .tracks import SECTION_LABELS
 
 from . import colors
+from . import filters as filters_mod
 from . import icons
 from .actions import Action, P, V
 from .errormsg import (
@@ -181,6 +183,20 @@ def _mostrar_error(app, err, *, retry=None, diagnose=None) -> None:  # noqa: ANN
         fn(err, retry=retry, diagnose=diagnose)
         return
     app.status.show(err.cuerpo(), error=True)
+
+
+def _error_dominio(app, exc: BaseException, *, retry=None, diagnose=None) -> None:  # noqa: ANN001
+    """Presenta un fallo de backend (Fase 8 · U-02) con las acciones que existen.
+
+    Las Fases 3 a 7 validan y rechazan con su propio vocabulario, y ninguna
+    pantalla debería traducir eso a mano: este es el único camino. Delega en
+    :func:`~thetvview.ui.domain_errors.describe_domain_error` y degrada igual que
+    :func:`_mostrar_error`, para que un doble de prueba sin ``show_error`` siga
+    viendo el mensaje en la barra en vez de romperse.
+    """
+    from .domain_errors import describe_domain_error
+
+    _mostrar_error(app, describe_domain_error(exc), retry=retry, diagnose=diagnose)
 
 
 def _error_xtream(name: str, que: str, exc: BaseException):
@@ -675,7 +691,77 @@ class ChannelsScreen(Screen):
         self._labels_favs: set[str] = set()
         self._search_texts: list[str] | None = None
         self._search_src: list[Channel] | None = None
+        # --- Filtros de búsqueda (U-05) ------------------------------------
+        #
+        # `filtros` es una lista de `(campo, valor)` tal como los escribe
+        # `ui.filters`; `orden` es `None` (como viene en la lista) o una clave
+        # de `filters.ORDENES`. Están **vacíos por omisión**: la búsqueda de
+        # siempre —`q in texto`— sigue siendo lo que pasa si el usuario no
+        # toca nada, y por eso va por su propio camino, sin preguntar al
+        # backend.
+        self.filtros: list[tuple[str, str]] = []
+        self.orden: str | None = None
+        self._indice: filters_mod.IndiceFiltros | None = None
         self._apply_filter()
+
+    # --- Filtros (U-05) ------------------------------------------------------
+
+    def filtros_activos(self) -> dict[str, str]:
+        """`{campo: valor}` de lo que está puesto, para las filas del modal."""
+        return {clave: valor for clave, valor in self.filtros}
+
+    def filtros_legibles(self) -> list[str]:
+        """Las frases de los filtros activos, para confirmarlos por su nombre."""
+        return [filters_mod.frase_de(clave, valor)
+                for clave, valor in self.filtros]
+
+    def _indice_de_filtros(self) -> filters_mod.IndiceFiltros:
+        """El motor, que se reconstruye si cambian los canales o la guía.
+
+        Un `IndiceFiltros` con la lista de la pantalla de antes contaría sobre
+        canales que ya no están, y daría un número que no corresponde con lo
+        que hay en pantalla. Se compara por **identidad**, no por contenido:
+        recargar la lista produce otra lista con los mismos canales, y
+        reconstruirse en ese caso tiraría a la basura todo lo contado.
+        """
+        ctx = (self.app.contexto_de_reglas()
+               if hasattr(self.app, "contexto_de_reglas") else {})
+        epg = ctx.get("epg")
+        indice_epg = ctx.get("indice_epg")
+        if (self._indice is None
+                or self._indice.fuente is not self.channels
+                or self._indice.epg is not epg):
+            self._indice = filters_mod.IndiceFiltros(
+                self.channels, epg=epg, indice_epg=indice_epg)
+        else:
+            self._indice.indice_epg = indice_epg
+        return self._indice
+
+    def poner_filtros(self, filtros=None, orden=...,  # noqa: ANN001
+                      ) -> int:
+        """Cambia los filtros o el orden y vuelve a filtrar. Devuelve la cuenta.
+
+        El canal seleccionado se conserva si sigue entrando en el filtro: al
+        cambiar un filtro, saltar al primer resultado es lo que más molesta,
+        porque el cursor se va justo de la fila que estabas mirando.
+        """
+        if filtros is not None:
+            self.filtros = list(filtros)
+        if orden is not ...:
+            self.orden = orden
+        self._apply_filter(keep_selection=True)
+        return len(self.visible_idx)
+
+    def limpiar_filtros(self) -> int:
+        """Quita todos los filtros y deja el orden como estaba.
+
+        El **orden no es un filtro**: no quita canales, sólo los mueve, y
+        mezclarlo con «quitar todos los filtros» haría que un `X` cambiara
+        algo que el usuario no pidió.
+        """
+        self.filtros = []
+        self._apply_filter(keep_selection=True)
+        return len(self.visible_idx)
 
     def header_context(self) -> str:
         return f"{icons.ICON_TV} Canales · {len(self.visible_idx)}"
@@ -786,6 +872,19 @@ class ChannelsScreen(Screen):
             pos = bajo.find(q, pos + salta)
         return rangos
 
+    def _visibles_por_texto(self, q: str) -> list[int]:
+        """Índices cuyo texto indexado contiene `q`. El camino de siempre.
+
+        Un `q in texto` por canal es una búsqueda en C sobre una cadena ya en
+        minúsculas: con 90 000 canales son microsegundos. Es lo que hace que
+        escribir sea fluido, y por eso **no se pregunta al backend** cuando no
+        hay filtros puestos (U-05).
+        """
+        if not q:
+            return list(range(len(self.channels)))
+        textos = self._search_texts_for(self.channels)
+        return [i for i, text in enumerate(textos) if q in text]
+
     def _apply_filter(self, keep_selection: bool = False) -> None:
         prev_pos = self.list.selected if keep_selection else -1
         prev_idx = (
@@ -797,33 +896,33 @@ class ChannelsScreen(Screen):
         fav_urls = self._refresh_fav_snapshot(channels)
         all_labels = self._labels_for(channels, fav_urls)
         q = self.query.casefold()
-        if not q:
-            self.visible_idx = list(range(len(channels)))
-            # Copia defensiva: set_items no debe compartir la lista con la caché.
-            shown = list(all_labels)
+
+        if self.filtros or self.orden is not None:
+            # Con filtros —o con un orden elegido— el motor es quien dice qué
+            # canales salen. El texto se le pasa como filtro más, así que las
+            # dos cosas se cumplen a la vez y no hay que elegir una.
+            #
+            # El orden entra aquí y no en el camino rápido porque ordenar la
+            # lista entera **sin** ningún filtro puesto es el uso más corriente
+            # de los cuatro: si sólo se aplicara con filtros, `o` no haría nada
+            # en la mitad de las veces.
+            visibles = self._indice_de_filtros().resuelve(
+                self.filtros, q, self.orden)
         else:
-            texts = self._search_texts_for(channels)
-            visible: list[int] = []
-            shown = []
-            rangos: list[list[tuple[int, int]]] = []
-            append_v = visible.append
-            append_l = shown.append
-            append_r = rangos.append
-            for i, text in enumerate(texts):
-                if q in text:
-                    append_v(i)
-                    etiqueta = all_labels[i]
-                    append_l(etiqueta)
-                    # La coincidencia se resalta en **la etiqueta que se
-                    # ve**, no en el texto indexado (nombre + grupo): los
-                    # índices de aquél no valen sobre ésta (FR-SRC-06).
-                    append_r(self._coincidencias(etiqueta, q))
-            self.visible_idx = visible
-        self.list.set_items(shown, keep_selection=True)
+            visibles = self._visibles_por_texto(q)
+
+        # Copia defensiva: `set_items` no debe compartir la lista con la caché.
+        self.visible_idx = visibles
+        self.list.set_items([all_labels[i] for i in visibles],
+                            keep_selection=True)
         if not q:
             self.list.set_ranges(None)
         else:
-            self.list.set_ranges(rangos)
+            # La coincidencia se resalta en **la etiqueta que se ve**, no en
+            # el texto indexado (nombre + grupo): los índices de aquél no
+            # valen sobre ésta (FR-SRC-06).
+            self.list.set_ranges(
+                [self._coincidencias(all_labels[i], q) for i in visibles])
         if prev_idx is not None:
             try:
                 # index() es C-level y evita el bucle Python por tecla.
@@ -854,6 +953,10 @@ class ChannelsScreen(Screen):
             self.channels = [c for c in fresh.channels if (c.group or None) == self.group]
         else:
             self.channels = list(fresh.channels)
+        # `canales` es una lista nueva, así que el motor de filtros queda con
+        # la de antes: se suelta para que no cuente sobre canales que ya no
+        # están (U-05).
+        self._indice = None
         # Re-etiquetar conservando la query actual.
         self._apply_filter()
         if ident is not None:
@@ -870,8 +973,10 @@ class ChannelsScreen(Screen):
         if self.searching:
             return "Escribir filtra · Enter confirmar · Ctrl-U limpiar · Esc salir"
         return (
-            "↑/↓ · Enter ▶ · / Buscar · g Grupos · "
-            "f ★ · e EPG · R Actualizar · r Recientes · p Reproductor · ? Ayuda · t Tema · Esc ←"
+            "↑/↓ · Enter ▶ · / Buscar · F Filtros · s Fuentes · "
+            "o Orden · g Grupos · f ★ · e EPG · c Colecciones · "
+            "C Colecciones · R Actualizar · r Recientes · p Reproductor · "
+            "? Ayuda · t Tema · Esc ←"
         )
 
     def actions(self) -> list[Action]:
@@ -889,15 +994,27 @@ class ChannelsScreen(Screen):
             ]
         channel = self.current_channel()
         hay = channel is not None
-        return [
+        acciones = [
             Action("Enter", V.VER, P.PRIMARIA, enabled=hay),
             Action("/", V.BUSCAR, P.FRECUENTE),
             Action("f", _favorite_label(self._fav_urls, channel), P.CONTEXTUAL, enabled=hay),
             Action("g", V.GRUPO, P.ORGANIZACION),
             Action("e", V.EPG, P.SECUNDARIA, enabled=hay),
+            Action("c", V.COLECCIONES, P.SECUNDARIA),
+            Action("C", V.COLECCIONES, P.CONTEXTUAL, enabled=hay),
+            Action("s", V.FUENTES, P.CONTEXTUAL, enabled=hay),
             Action("Esc", V.VOLVER, P.NAVEGACION),
             Action("?", V.AYUDA, P.AYUDA, essential=True),
         ]
+        # `F` y `o` siempre: abrir el constructor sin filtros puestos y poner
+        # el primero es el camino normal, no una excepción. `X` sólo con
+        # filtros: anunciar «quitar filtros» sobre una lista sin filtros es
+        # un botón que no hace nada (§35).
+        extras = [Action("F", V.FILTROS, P.FRECUENTE)]
+        if self.filtros:
+            extras.append(Action("X", V.LIMPIAR, P.CONTEXTUAL))
+        extras.append(Action("o", V.ORDEN, P.CONTEXTUAL))
+        return acciones[:2] + extras + acciones[2:]
 
     def handle_mouse(self, mx: int, my: int, screen) -> bool:  # noqa: ANN001
         # Solo en modo lista (sidebar). Calcular si click está en lista
@@ -988,6 +1105,14 @@ class ChannelsScreen(Screen):
         if key == ord("/"):
             self.searching = True
             return None
+        if key == ord("F"):
+            # El constructor de filtros. Sin filtros puestos entra directo a
+            # añadir el primero (App.search_filters).
+            return {"action": "search_filters", "screen": self}
+        if key == ord("X"):
+            return {"action": "clear_search_filters", "screen": self}
+        if key == ord("o"):
+            return {"action": "search_order", "screen": self}
         if key == ord("R") or key == _KEY_F5:
             # 'r' queda para Recientes (global); 'R'/F5 recarga la fuente
             # porque los canales de una URL pueden cambiar sin aviso.
@@ -1008,6 +1133,30 @@ class ChannelsScreen(Screen):
                 "channel": channel,
                 "epg_url": self.playlist.epg_url,
             }
+        if key == ord("c"):
+            # Las colecciones agrupan canales, así que se abren desde aquí:
+            # es la pantalla donde el usuario está mirando justo los canales
+            # que quiere agrupar.
+            return {"action": "show_collections"}
+        if key == ord("C"):
+            # Mayúscula: no «abre la lista», sino «elige en cuáles está este
+            # canal». Con `c` minúscula al lado, la diferencia tiene que
+            # poder leerse en el pie, no sólo reconocerse en la tecla.
+            canal = self.current_channel()
+            if canal is None:
+                _warn(self.app, "No hay canal debajo del cursor.")
+                return None
+            return {"action": "channel_collections", "channel": canal}
+        if key == ord("s"):
+            # Fuentes del canal (U-06): qué otra lista lo tiene y cuál se usa.
+            canal = self.current_channel()
+            if canal is None:
+                _warn(self.app, "No hay canal debajo del cursor.")
+                return None
+            return {"action": "channel_sources", "channel": canal}
+        if key == ord("P"):
+            # Programar grabación (U-10): abrir el planificador.
+            return {"action": "show_scheduler"}
         if key in (curses.KEY_ENTER, 10, 13):
             channel = self.current_channel()
             if channel is None:
@@ -1021,12 +1170,25 @@ class ChannelsScreen(Screen):
     def _title_text(self) -> str:
         total = len(self.channels)
         shown = len(self.visible_idx)
-        suffix = f" · {shown}/{total}" if self.query else f" ({total} canales)"
+        # Con filtros puestos el «N/M» solo no dice bastante: hay que ver
+        # *por qué* la lista ha encogido, o el usuario no sabe si está
+        # buscando lo que cree.
+        if self.query or self.filtros:
+            suffix = f" · {shown}/{total}"
+        else:
+            suffix = f" ({total} canales)"
         grp = ""
         if self.group_filtered:
             grp = f" · [{self.group}]" if self.group else " · [sin grupo]"
+        filtros = ""
+        if self.filtros:
+            frases = self.filtros_legibles()
+            filtros = " · " + " · ".join(frases)
+        orden = ""
+        if self.orden is not None:
+            orden = f" · {filters_mod.orden_legible(self.orden)}"
         star = " ★" if self._has_fav else ""
-        return f"{self.playlist.name}{grp}{suffix}{star}"
+        return (f"{self.playlist.name}{grp}{suffix}{filtros}{orden}{star}")
 
     def _render_detail_panel(self, stdscr: curses.window, x: int, y: int, w: int, h: int) -> None:
         """Panel derecho: info del canal seleccionado + EPG preview."""
@@ -1611,6 +1773,299 @@ class RecentsScreen(Screen):
             )
         else:
             self.list.render(stdscr, 1, 0, self.app.body_height(), max_x)
+
+
+def _miembros_editables(col) -> str | None:  # noqa: ANN001
+    """Por qué no se pueden tocar los canales de `col`; `None` si sí se puede.
+
+    Vive aquí y no en la pantalla ni en `App` porque **los dos** necesitan
+    decir exactamente lo mismo: la nota de la lista de casillas y el aviso al
+    pulsar la tecla. Si cada uno escribiera su frase, el usuario leería dos
+    explicaciones distintas para el mismo «no».
+
+    La razón de fondo no es un permiso, es una consecuencia: los canales de una
+    colección inteligente los decide su regla, así que quitar uno a mano sería
+    deshacerlo hasta la siguiente evaluación.
+    """
+    tipo = getattr(col, "type", "")
+    if tipo == "manual":
+        return None
+    nombre = getattr(col, "name", "") or "(sin nombre)"
+    if tipo == "smart":
+        return (f"«{nombre}» la decide una regla: sus canales no se eligen a mano.")
+    return f"«{nombre}» es una vista de la app, no una colección tuya."
+
+
+def _catalogo_de(app) -> list[Channel]:  # noqa: ANN001
+    """Canales que la pantalla de colecciones puede considerar existentes.
+
+    Lo que hay en memoria, no lo que hay en disco: una colección guarda
+    *referencias* a canales, y resolverlas necesita los canales. Sin lista
+    cargada se devuelve una lista vacía, que es exactamente lo que la pantalla
+    puede afirmar con honestidad.
+    """
+    fn = getattr(app, "catalogo_canales", None)
+    if not callable(fn):
+        return []
+    try:
+        return list(fn() or [])
+    except Exception:
+        return []
+
+
+class CollectionsScreen(Screen):
+    """Colecciones (Fase 4 · C-07) — la lista de lo que el usuario agrupó.
+
+    Lo único que esta pantalla tiene que resolver bien es una pregunta que el
+    pie no puede contestar: **¿qué es esto?** Una colección puede ser un montón
+    de canales que él eligió a mano, el resultado de una regla que se recalcula
+    sola, o una vista de la app (Favoritos, Recientes) que no contiene nada
+    propio. Por eso el tipo va **en la fila** (§ plan U-03) y no en el pie: el
+    pie describe la acción que se puede hacer, la fila describe la fila.
+
+    De ahí salen las dos decisiones que parecen arbitrarias y no lo son:
+
+    - Las colecciones **del sistema no se editan ni se borran**. No es un
+      capricho: son vistas derivadas, y renombrar «Favoritos» no renombra
+      nada, promete algo que no ocurre.
+    - Su contador dice **«vista derivada»** y no «0 canales». `evaluar_coleccion`
+      devuelve vacío para `system` sin reglas, así que un contador ingenuo
+      enseñaría un cero que es mentira: no tiene cero canales, tiene los que
+      tenga la vista.
+
+    Las **referencias obsoletas** (un canal que ya no está en ninguna lista) se
+    avisan y se siguen mostrando. Una colección no se cae porque un canal
+    desapareció: si se cayera, el usuario perdería el resto por un hueco (C-07).
+    """
+
+    title = "Colecciones"
+
+    #: Cómo se dice cada tipo **en la fila**. Es el dato que decide si el
+    #: usuario puede esperar que la lista cambie sola, y por eso tiene icono y
+    #: palabra: no basta con una letra.
+    TIPOS: dict[str, tuple[str, str]] = {
+        "manual": ("manual", icons.ICON_STAR_OFF),
+        "smart": ("inteligente", icons.ICON_SEARCH),
+        "system": ("del sistema", icons.ICON_STAR),
+    }
+
+    #: Un tipo desconocido (un `collections.json` editado a mano, por ejemplo)
+    #: no puede borrarse de la lista: se muestra como es y se avisa, en vez de
+    #: inventar un cuarto tipo o esconder la fila.
+    TIPO_DESCONOCIDO = ("tipo desconocido", icons.ICON_CHEVRON)
+
+    def header_context(self) -> str:
+        total = len(self.collections)
+        plural = "colección" if total == 1 else "colecciones"
+        return f"{icons.ICON_LIST} Colecciones · {total} {plural}"
+
+    def __init__(self, app, catalogo: list[Channel] | None = None) -> None:  # noqa: ANN001
+        super().__init__(app)
+        self.list = ScrollableList()
+        #: Catálogo **fijo** mientras la pantalla viva. No se pide a `App` en
+        #: cada tecla: el gestor de colecciones cachea por `id()` de la lista,
+        #: y una lista nueva en cada llamada no cachea nada (evaluaría la
+        #: colección entera del catálogo por cada tecla).
+        self.catalogo: list[Channel] = (
+            list(catalogo) if catalogo is not None else _catalogo_de(app)
+        )
+        self.collections: list = []
+        #: cid → (texto de la segunda columna, referencias obsoletas).
+        self._detalles: dict[str, tuple[str, int]] = {}
+        self.reload()
+
+    # -- datos --------------------------------------------------------------
+    def reload(self) -> None:
+        """Relee las colecciones y vuelve a contar. Idempotente."""
+        try:
+            self.collections = list(self.manager.listar())
+        except Exception as exc:
+            # Un `collections.json` ilegible no puede impedir abrir la app:
+            # se dice y se sigue con la lista vacía (degradar > tumbar).
+            self.collections = []
+            _warn(self.app, f"No se pudieron leer las colecciones: {exc}")
+        self._detalles = {c.id: self._detalle(c) for c in self.collections}
+        self.list.set_items(self._filas(), self._contadores())
+
+    @property
+    def manager(self):
+        return getattr(self.app, "collections", None)
+
+    def current(self):
+        if not self.collections:
+            return None
+        return self.collections[self.list.selected]
+
+    def _tipo_de(self, col) -> tuple[str, str]:  # noqa: ANN001
+        return self.TIPOS.get(getattr(col, "type", ""), self.TIPO_DESCONOCIDO)
+
+    def _detalle(self, col) -> tuple[str, int]:  # noqa: ANN001
+        """Segunda columna y número de referencias obsoletas de una colección.
+
+        Todo lo que aquí puede fallar (regla corrupta, canal que ya no está,
+        catálogo que aún no se ha cargado) se convierte en un texto que explica
+        el estado, nunca en una excepción: la lista tiene que poder pintarse
+        aunque la última colección guardada sea inválida.
+        """
+        manager = self.manager
+        tipo = getattr(col, "type", "")
+        if tipo == "system":
+            # Sin catálogo no hay nada que contar, y con él tampoco: lo que
+            # hay es la vista, no sus canales.
+            return ("vista derivada", 0)
+        if manager is None:
+            return ("—", 0)
+        try:
+            miembros = manager.miembros(col.id, self.catalogo)
+        except Exception:
+            miembros = []
+        obsoletas = 0
+        if tipo == "manual" and self.catalogo:
+            # **Sólo con catálogo.** Sin ninguna lista en memoria, todas las
+            # referencias parecen obsoletas, y avisar de eso sería inventar un
+            # problema que el usuario resuelve abriendo su lista. Aquí no se
+            # sabe nada, y la pantalla no dice que sí (C-07 avisa de hechos,
+            # no de sospechas).
+            try:
+                obsoletas = len(manager.obsolete_refs(col.id, self.catalogo))
+            except Exception:
+                obsoletas = 0
+        n = len(miembros)
+        texto = "1 canal" if n == 1 else f"{n} canales"
+        if obsoletas:
+            # En singular y plural, porque «1 referencia obsoleta» y «2
+            # referencias obsoletas» no son el mismo aviso.
+            sufijo = "referencia obsoleta" if obsoletas == 1 else "referencias obsoletas"
+            texto = f"{texto} · {obsoletas} {sufijo}"
+        return (texto, obsoletas)
+
+    def _filas(self) -> list[str]:
+        filas = []
+        for col in self.collections:
+            tipo, icono = self._tipo_de(col)
+            filas.append(f"{icono} {col.name} · {tipo}")
+        return filas
+
+    def _contadores(self) -> list[str]:
+        return [self._detalles.get(c.id, ("—", 0))[0] for c in self.collections]
+
+    # -- catálogo de acciones ----------------------------------------------
+    def shortcuts(self) -> str:
+        if not self.collections:
+            # Sin filas no hay nada que abrir, renombrar ni borrar, y `shortcuts`
+            # es la verdad: anunciar teclas que no hacen nada es exactamente lo
+            # que la barra no puede hacer (§10). `Esc` y `?` sí se anuncian, y
+            # `Esc` sí se declara: salir siempre tiene que estar a mano.
+            return "a Nueva · ? Ayuda · t Tema · Esc Volver · q Salir"
+        return (
+            "↑/↓ mover · Enter Detalle · a Nueva · e Renombrar · d Borrar"
+            " · m Miembros · R Regla · ? Ayuda · t Tema · Esc Volver"
+            " · q Salir"
+        )
+
+    def actions(self) -> list[Action]:
+        col = self.current()
+        if not self.collections:
+            return [
+                Action("a", V.NUEVA, P.FRECUENTE),
+                Action("Esc", V.VOLVER, P.NAVEGACION),
+                Action("?", V.AYUDA, P.AYUDA, essential=True),
+            ]
+        # Una vista derivada no se renombra ni se borra. La tecla **no**
+        # desaparece: se marca `enabled=False`, que es la forma de decir «aquí
+        # no hay nada sobre lo que actuar» sin mentir sobre la tecla (§8).
+        editable = col is not None and getattr(col, "type", "") != "system"
+        # Quitar canales es otra cosa: sólo lo admite una colección **manual**.
+        # En una inteligente los canales los decide la regla, así que `m`
+        # ofrecería sacar un canal que volvería en la siguiente evaluación.
+        manual = col is not None and getattr(col, "type", "") == "manual"
+        return [
+            Action("Enter", V.DETALLE, P.PRIMARIA),
+            Action("a", V.NUEVA, P.FRECUENTE),
+            Action("e", V.RENOMBRAR, P.ORGANIZACION, enabled=editable),
+            Action("d", V.BORRAR, P.ORGANIZACION, enabled=editable),
+            Action("m", V.MIEMBROS, P.ORGANIZACION, enabled=manual),
+            # `R` convierte una manual en inteligente y cambia la regla de una
+            # inteligente. No se ofrece en una vista derivada: no hay nada que
+            # decidir en algo que ya está decidido por la app.
+            Action("R", V.REGLA, P.ORGANIZACION, enabled=editable),
+            Action("Esc", V.VOLVER, P.NAVEGACION),
+            Action("?", V.AYUDA, P.AYUDA, essential=True),
+        ]
+
+    def handle_key(self, key: int) -> dict | None:
+        rows = self.app.body_height()
+        if self.list.handle_key(key, rows):
+            return None
+        col = self.current()
+        if key == ord("a"):
+            return {"action": "add_collection"}
+        if key == ord("e"):
+            if col is None:
+                _warn(self.app, "No hay colección que renombrar.")
+                return None
+            if getattr(col, "type", "") == "system":
+                # No es un veto silencioso: se explica por qué no se puede.
+                _warn(
+                    self.app,
+                    f"«{col.name}» es una vista de la app, no una colección tuya. "
+                    "No se renombra.",
+                )
+                return None
+            return {"action": "rename_collection", "cid": col.id}
+        if key == ord("d"):
+            if col is None:
+                _warn(self.app, "No hay colección que borrar.")
+                return None
+            if getattr(col, "type", "") == "system":
+                _warn(
+                    self.app,
+                    f"«{col.name}» es una vista de la app, no una colección tuya. "
+                    "No se borra.",
+                )
+                return None
+            return {"action": "delete_collection", "cid": col.id}
+        if key == ord("m"):
+            if col is None:
+                _warn(self.app, "No hay colección cuyos miembros gestionar.")
+                return None
+            bloqueo = _miembros_editables(col)
+            if bloqueo:
+                _warn(self.app, bloqueo)
+                return None
+            return {"action": "collection_members", "cid": col.id}
+        if key == ord("R"):
+            if col is None:
+                _warn(self.app, "No hay colección a la que darle una regla.")
+                return None
+            if getattr(col, "type", "") == "system":
+                _warn(
+                    self.app,
+                    f"«{col.name}» es una vista de la app, no una colección tuya. "
+                    "No se le pone regla: sus canales ya estándecided por la app.",
+                )
+                return None
+            return {"action": "collection_rule", "cid": col.id}
+        if key in (curses.KEY_ENTER, 10, 13):
+            if col is None:
+                _warn(self.app, "No hay colección que abrir.")
+                return None
+            return {"action": "show_collection", "cid": col.id}
+        return None
+
+    def render(self, stdscr: curses.window) -> None:
+        max_y, max_x = stdscr.getmaxyx()
+        if not self.collections:
+            # La CTA anuncia `a`, que existe y abre el modal de alta (§23).
+            EmptyState.render(
+                stdscr, max_y // 2, max_x,
+                icons.ICON_LIST,
+                "No hay colecciones",
+                "Agrupa canales en una colección para verlos juntos.",
+                "[A] Nueva colección",
+            )
+            return
+        self.list.render(stdscr, 1, 0, self.app.body_height(), max_x)
 
 
 class GroupsScreen(Screen):
@@ -4509,3 +4964,243 @@ def options_kinds(options, kind: str | None = None) -> list[str]:  # noqa: ANN00
         disponibles = options.selectable_kinds
         return [kind] if kind in disponibles else []
     return list(options.selectable_kinds)
+
+
+class SchedulerScreen(Screen):
+    """Pantalla del planificador de grabaciones (U-10).
+
+    Muestra las tareas programadas, permite crear nuevas (con formulario),
+    cancelar futuras y borrar completadas/canceladas. El scheduler vive en
+    ``app._scheduler`` y delega la captura en el grabador de Fase 6.
+    """
+
+    title = "Planificador"
+
+    def __init__(self, app) -> None:  # noqa: ANN001
+        super().__init__(app)
+        self.tasks: list = []
+        self.selected: int = 0
+        self._first_row: int = 0
+        self.reload()
+
+    def reload(self) -> None:
+        scheduler = getattr(self.app, "_scheduler", None)
+        if scheduler is None:
+            self.tasks = []
+        else:
+            try:
+                self.tasks = scheduler.tasks_list()
+            except Exception:
+                self.tasks = []
+        if self.selected >= len(self.tasks):
+            self.selected = max(0, len(self.tasks) - 1)
+        self._clamp_scroll()
+
+    def current_task(self):
+        if not self.tasks:
+            return None
+        return self.tasks[self.selected]
+
+    def _visible_rows(self, max_y: int) -> int:
+        row_h = 4
+        start_y = 1
+        available = max_y - start_y - 2
+        if available <= 0:
+            return 1
+        return max(1, available // row_h)
+
+    def _clamp_scroll(self) -> None:
+        if not self.tasks:
+            self._first_row = 0
+            return
+        try:
+            max_y, _ = self.app.stdscr.getmaxyx()
+        except Exception:
+            return
+        rows = self._visible_rows(max_y)
+        if self.selected < self._first_row:
+            self._first_row = self.selected
+        elif self.selected >= self._first_row + rows:
+            self._first_row = self.selected - rows + 1
+        max_row = max(0, len(self.tasks) - rows)
+        self._first_row = max(0, min(self._first_row, max_row))
+
+    def header_context(self) -> str:
+        return f"{icons.ICON_TIME} Planificador · {len(self.tasks)}"
+
+    def shortcuts(self) -> str:
+        if not self.tasks:
+            return "a Añadir · r Recientes · ? Ayuda · t Tema · q Salir"
+        return "↑/↓ · Enter Ver · a Añadir · c Cancelar · d Borrar · r Recientes · ? Ayuda · t Tema · q Salir"
+
+    def actions(self) -> list:
+        if not self.tasks:
+            return [
+                Action("a", V.ANADIR, P.FRECUENTE),
+                Action("?", V.AYUDA, P.AYUDA, essential=True),
+            ]
+        return [
+            Action("Enter", V.VER, P.PRIMARIA),
+            Action("a", V.ANADIR, P.FRECUENTE),
+            Action("c", V.CANCELAR, P.CONTEXTUAL),
+            Action("d", V.BORRAR, P.CONTEXTUAL),
+            Action("r", V.RECIENTES, P.NAVEGACION),
+            Action("?", V.AYUDA, P.AYUDA, essential=True),
+        ]
+
+    def handle_key(self, key: int) -> dict | None:
+        if not self.tasks:
+            if key == ord("a"):
+                return {"action": "add_scheduled_task"}
+            if key == ord("r"):
+                return {"action": "show_recents"}
+            return None
+
+        rows = self.app.body_height()
+        max_y, _ = self.app.stdscr.getmaxyx()
+
+        if key == curses.KEY_UP:
+            self.selected = max(0, self.selected - 1)
+        elif key == curses.KEY_DOWN:
+            self.selected = min(len(self.tasks) - 1, self.selected + 1)
+        elif key == ord("a"):
+            return {"action": "add_scheduled_task"}
+        elif key == ord("c"):
+            task = self.current_task()
+            if task is None:
+                return None
+            return {"action": "cancel_scheduled_task", "task_id": task.task_id}
+        elif key == ord("d"):
+            task = self.current_task()
+            if task is None:
+                return None
+            return {"action": "remove_scheduled_task", "task_id": task.task_id}
+        elif key == ord("r"):
+            return {"action": "show_recents"}
+        elif key in (curses.KEY_ENTER, 10, 13):
+            task = self.current_task()
+            if task is None:
+                return None
+            return {"action": "show_scheduled_task", "task_id": task.task_id}
+        else:
+            return None
+
+        self._clamp_scroll()
+        return None
+
+    def render(self, stdscr: curses.window) -> None:
+        max_y, max_x = stdscr.getmaxyx()
+        if not self.tasks:
+            EmptyState.render(
+                stdscr, max_y // 2, max_x,
+                icons.ICON_TIME,
+                "No hay grabaciones programadas",
+                "Programa una grabación para que se inicie automáticamente.",
+                "[A] Añadir grabación programada",
+            )
+            return
+
+        row_h = 4
+        start_y = 1
+        visible_rows = self._visible_rows(max_y)
+
+        for i, task in enumerate(self.tasks):
+            row = i // 1
+            if row < self._first_row:
+                continue
+            if row >= self._first_row + visible_rows:
+                break
+
+            y = start_y + (row - self._first_row) * row_h
+            if y + row_h > max_y - 2:
+                break
+
+            selected = i == self.selected
+
+            # Badge de estado
+            status = getattr(task, "status", None)
+            status_text = getattr(status, "value", str(status)) if status else "?"
+
+            # Hora de inicio
+            start_iso = getattr(task, "presentation_time", None) or ""
+            if start_iso:
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(start_iso)
+                    start_str = dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    start_str = start_iso[:16]
+            else:
+                start_str = "--"
+
+            # Duración
+            duration = int(getattr(task, "duration_seconds", 0) or 0)
+            if duration >= 3600:
+                dur_str = f"{duration // 3600}h {(duration % 3600) // 60}min"
+            elif duration >= 60:
+                dur_str = f"{duration // 60}min"
+            else:
+                dur_str = f"{duration}s"
+
+            # Canal / fuente
+            channel_id = getattr(task, "channel_id", None) or getattr(task, "source", None) or "?"
+
+            # Colores según estado
+            if selected:
+                attr = colors.pair(colors.PAIR_SELECTED) | curses.A_BOLD
+                status_attr = colors.pair(colors.PAIR_SELECTED) | curses.A_BOLD
+            elif status_text == "running":
+                attr = colors.pair(colors.PAIR_SUCCESS) | curses.A_BOLD
+                status_attr = colors.pair(colors.PAIR_SUCCESS) | curses.A_BOLD
+            elif status_text in ("completed",):
+                attr = colors.pair(colors.PAIR_NORMAL)
+                status_attr = colors.pair(colors.PAIR_DIM)
+            elif status_text in ("failed", "missed"):
+                attr = colors.pair(colors.PAIR_DANGER)
+                status_attr = colors.pair(colors.PAIR_DANGER) | curses.A_BOLD
+            elif status_text in ("cancelled", "skipped"):
+                attr = colors.pair(colors.PAIR_DIM)
+                status_attr = colors.pair(colors.PAIR_DIM)
+            else:
+                attr = colors.pair(colors.PAIR_NORMAL)
+                status_attr = colors.pair(colors.PAIR_PRIMARY)
+
+            # Fondo si está seleccionado
+            if selected:
+                try:
+                    for r in range(row_h):
+                        if y + r < max_y - 2:
+                            stdscr.addstr(y + r, 0, " " * max_x, colors.pair(colors.PAIR_SELECTED))
+                except curses.error:
+                    pass
+
+            # Badge de estado
+            badge = f"[{status_text.upper()}]"
+            try:
+                stdscr.addstr(y, 2, badge, status_attr)
+                stdscr.addstr(y, 2 + len(badge) + 1, f" {start_str}", attr)
+                stdscr.addstr(y, max_x - len(dur_str) - 3, dur_str, attr | curses.A_DIM)
+            except curses.error:
+                pass
+
+            # Canal / fuente
+            try:
+                stdscr.addstr(y + 1, 4, f" {channel_id}"[:max(0, max_x - 5)], attr | curses.A_DIM)
+            except curses.error:
+                pass
+
+            # Mensaje si hay uno
+            message = getattr(task, "message", None)
+            if message:
+                try:
+                    stdscr.addstr(y + 2, 4, f" {message}"[:max(0, max_x - 5)],
+                                  colors.pair(colors.PAIR_DIM) if not selected else colors.pair(colors.PAIR_SELECTED) | curses.A_DIM)
+                except curses.error:
+                    pass
+
+            # Separador
+            try:
+                stdscr.addstr(y + row_h - 1, 2, "─" * max(0, max_x - 4),
+                              colors.pair(colors.PAIR_BORDER) | curses.A_DIM)
+            except curses.error:
+                pass

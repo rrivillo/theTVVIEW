@@ -81,9 +81,19 @@ class V:
     FAVORITO = "Favorito"
     QUITAR = "Quitar"
     EDITAR = "Editar"
+    #: Ficha de una fila, **sin cambiar de pantalla** (Fase 8 · U-03: la
+    #: colección seleccionada). Los chips de `Enter` son verbos en el resto de
+    #: la app («Ver», «Abrir», «Confirmar»): un sustantivo ahí rompe la lectura,
+    #: y «Abrir» sugeriría una pantalla nueva cuando lo que se abre es un modal.
+    DETALLE = "Detalle"
     ACTUALIZAR = "Actualizar"
     HORARIO = "Horario"
     VOLVER = "Volver"
+    #: Cerrar un modal **cuyos cambios ya están guardados**. No es `CANCELAR`:
+    #: cancelar deshace, y aquí `Esc` no deshace nada — lo que el usuario ve
+    #: marcado está en disco. Que el pie diga «Cancelar» sobre una lista que
+    #: acaba de guardar sería prometer una vuelta atrás que no existe (§35).
+    CERRAR = "Cerrar"
     AYUDA = "Ayuda"
     # --- las que exigen las pantallas (§9, §34, §36) ---
     ARCHIVO = "Archivo"  # catch-up: Enter Ver|Archivo
@@ -114,6 +124,48 @@ class V:
     #: cualquier etiqueta fuera de este vocabulario, y sin ella el pie del
     #: modal de error no podría anunciar su propia acción.
     REINTENTAR = "Reintentar"
+    # --- Fase 8: capa de UI de los backends ya cerrados (§P2.6 U-01) ---
+    #: Colecciones (Fase 4). El pie nombra el destino de la acción; `COLECCION`
+    #: es el singular para cuando la acción es sobre una fila concreta.
+    COLECCIONES = "Colecciones"
+    COLECCION = "Colección"
+    #: «Crear una colección» no es «añadir un canal a una lista»: la etiqueta
+    #: dice **qué** se crea, no sólo que se crea algo. `NUEVA` y `RENOMBRAR`
+    #: existen para que el chip del pie y la pista de `shortcuts()` puedan
+    #: decir lo mismo: si el pie dice «Editar» y la pista dice «Renombrar»,
+    #: uno de los dos está mintiendo (§10).
+    NUEVA = "Nueva"
+    RENOMBRAR = "Renombrar"
+    #: Los canales que tiene una colección, para quitar alguno. `GRUPO` no
+    #: servía: allí es el `group-title` de la lista, y aquí no hay tal cosa.
+    MIEMBROS = "Miembros"
+    #: La condición que decide qué canales entran (U-04). En minúscula habría
+    #: chocado con `r` (recientes) en otras pantallas: mayúscula, como `C`.
+    REGLA = "Regla"
+    #: Fuentes del canal (Fases 5A/5B): el modal que explica qué fuente se
+    #: usaría y por qué. El plural es el verbo de la acción.
+    FUENTES = "Fuentes"
+    #: Búsqueda (Fase 8 · U-05). Los ocho filtros que el backend ya sabía
+    #: responder; la búsqueda de texto sigue siendo `/`.
+    FILTROS = "Filtros"
+    #: El orden de la lista. Va aparte de `FILTROS` porque **no quita
+    #: canales**: es otra pregunta, y si compartieran modal, «quitar todos»
+    #: movería también el orden sin que nadie lo pidiera.
+    ORDEN = "Orden"
+    #: Grabación manual (Fase 6) y planificador (Fase 7). `DETENER` ya existe
+    #: para «Detener» el reproductor, así que la grabación se distingue por el
+    #: verbo completo y no por una palabra que ya significa otra cosa.
+    GRABAR = "Grabar"
+    PROGRAMAR = "Programar"
+    PROGRAMACIONES = "Grabaciones"
+    #: Estados de la grabación en curso: la acción announce que se puede
+    #: consultar, no que la grabación continúa en segundo plano (R-09).
+    ESTADO = "Estado"
+    #: Reglas de una colección inteligente: `EDITAR` cubre editar el nombre y
+    #: los miembros; la regla es otra operación y merece su propia etiqueta.
+    REGLA = "Regla"
+    #: Filtros del buscador avanzado (Fase 3, S-09).
+    FILTROS = "Filtros"
 
 
 #: Conjunto cerrado de etiquetas permitidas (§21). `validate()` lo comprueba.

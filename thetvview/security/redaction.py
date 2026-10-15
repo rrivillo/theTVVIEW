@@ -54,7 +54,30 @@ _QUERY_RE = re.compile(
 _USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^/@\s]+)@")
 
 # /live/u/p/id.ext · /movie/u/p/id.ext · /series/u/p/id.ext (Xtream)
+#
+# Este es el patrón **estrecho**: sólo las tres rutas que Xtream define así,
+# con el usuario y la contraseña en los dos primeros segmentos. Gobierna si hay
+# que **reescribir la URL en disco** (favoritos y recientes), y por eso no se
+# ensancha: un falso positivo ahí deja un favorito inservible reescrito en el
+# archivo del usuario, y perder un favorito es peor que dejar una contraseña en
+# un log. La redacción de texto usa el patrón amplio de abajo.
 _XTREAM_PATH_RE = re.compile(r"(?i)(/(?:live|movie|series)/)[^/?#]+/[^/?#]+/")
+
+#: Rutas de stream con credenciales embebidas en el path, más allá de Xtream:
+#: ``/hls/u/p/id.m3u8``, ``/streaming/u/p/…``, ``/panel/stream/u/p/…``. Los
+#: paneles de IPTV sirven estas formas a diario y antes de la Fase 8 se
+#: imprimían enteras en logs, modales y mensajes de error.
+#:
+#: Este patrón es **más amplio y también más ruidoso**: puede redactar un
+#: segmento que no sea una credencial. Por eso se usa **sólo** para
+#: :func:`redact_text` y :func:`contains_secret`, donde un ``***`` de más
+#: cuesta información en la presentación pero no rompe nada. La lista de
+#: prefijos es cerrada a propósito: añadir un prefijo genérico como ``api`` o
+#: ``panel`` empezaría a tapar rutas normales.
+_STREAM_PATH_RE = re.compile(
+    r"(?i)(/(?:live|movie|series|hls|stream|streaming|play|vod|timeshift|catchup)"
+    r"/)[^/?#]+/[^/?#]+/"
+)
 
 # Authorization: Bearer <jwt>  |  Authorization: Basic <b64>
 _AUTH_HEADER_RE = re.compile(r"(?i)\b(authorization\s*[:=]\s*)(\S+(?:[ \t]+\S+)?)")
@@ -86,7 +109,7 @@ def redact_text(text: str) -> str:
         return text
     out = _QUERY_RE.sub(r"\1" + REDACTED, text)
     out = _USERINFO_RE.sub(r"\1" + REDACTED + "@", out)
-    out = _XTREAM_PATH_RE.sub(r"\1" + REDACTED + "/" + REDACTED + "/", out)
+    out = _STREAM_PATH_RE.sub(r"\1" + REDACTED + "/" + REDACTED + "/", out)
     out = _AUTH_HEADER_RE.sub(r"\1" + REDACTED, out)
     out = _BEARER_RE.sub(r"\1" + REDACTED, out)
     out = _COOKIE_RE.sub(r"\1" + REDACTED, out)
@@ -138,7 +161,7 @@ def contains_secret(text: str) -> bool:
         return True
     if _USERINFO_RE.search(text):
         return True
-    if _XTREAM_PATH_RE.search(text):
+    if _STREAM_PATH_RE.search(text):
         return True
     if _BEARER_RE.search(text):
         return True
@@ -156,6 +179,15 @@ def contains_embedded_login(text: str) -> bool:
     Un ``?token=…`` **no** cuenta: es lo único que permite reproducir una
     lista M3U, así que enmascararlo rompería favoritos y recientes sin
     aportar nada.
+
+    **Usa el patrón estrecho a propósito.** Este predicado gobierna
+    :func:`needs_redaction_for_storage`, y quienes **reescriben** la URL en
+    disco son :mod:`thetvview.favorites` y :mod:`thetvview.recents`: un ``True``
+    aquí no sólo tapa una credencial, deja la URL guardada inservible.
+    Ampliarlo a rutas como ``/hls/u/p/…`` para «cubrir más» rompería canales
+    que el usuario ya tenía guardados, y eso es pérdida de datos, no seguridad.
+    Las rutas que no son de Xtream sí se redactan en texto, logs y modales (ver
+    :func:`redact_text`), que es donde tapar de más no rompe nada.
     """
     if not text:
         return False
