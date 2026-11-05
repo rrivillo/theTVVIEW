@@ -5949,6 +5949,17 @@ class App:
             total = len(lines)
 
             border = colors.pair(colors.PAIR_MODAL_BORDER)
+            # Fondo opaco: el rectángulo entero se pinta antes que nada. Sin
+            # esto, las filas y columnas que ninguna línea de texto alcanza
+            # dejan ver la pantalla de atrás y el modal se ve translúcido —
+            # justo el renglón que queda debajo del título y las dos columnas
+            # pegadas al borde.
+            fondo = colors.pair(colors.PAIR_NORMAL)
+            for r in range(by, by + box_h):
+                try:
+                    stdscr.addstr(r, bx, " " * box_w, fondo)
+                except curses.error:
+                    pass
             try:
                 stdscr.addstr(by, bx,
                               icons.BOX_D_TL + icons.BOX_D_H * (box_w - 2) + icons.BOX_D_TR,
@@ -5974,12 +5985,6 @@ class App:
                 row = by + 2 + i
                 if row >= by + box_h - 2:
                     break
-                # Limpiar la fila antes de escribir.
-                try:
-                    stdscr.addstr(row, bx + 2, " " * inner_w,
-                                  colors.pair(colors.PAIR_NORMAL))
-                except curses.error:
-                    pass
                 if idx >= total:
                     continue
                 style, text = lines[idx]
@@ -6010,24 +6015,25 @@ class App:
                 except curses.error:
                     pass
 
-            # Pie: pista de scroll + cómo cerrar.
-            if total > inner_h:
-                pos = f" {min(offset + inner_h, total)}/{total} "
-                try:
-                    stdscr.addstr(by + box_h - 2, bx + box_w - len(pos) - 2, pos,
-                                  colors.pair(colors.PAIR_DIM) | curses.A_DIM)
-                except curses.error:
-                    pass
-                hint = "↑/↓ leer"
-            else:
-                hint = "Ayuda completa"
-            close = "Esc/q/? cerrar"
-            foot = f"{hint} · {close}"
+            # Pie: pista de scroll + cómo cerrar. El contador va alineado a la
+            # derecha y **sólo si no pisa la pista**: en una caja estrecha se
+            # omite en vez de encimarse (§46).
+            hint = "↑/↓ leer" if total > inner_h else "Ayuda completa"
+            foot = f"{hint} · Esc/q/? cerrar"
             try:
                 stdscr.addstr(by + box_h - 2, bx + 2, foot[:inner_w],
-                              colors.pair(colors.PAIR_DIM))
+                              colors.pair(colors.PAIR_MUTED))
             except curses.error:
                 pass
+            if total > inner_h:
+                pos = f"{min(offset + inner_h, total)}/{total}"
+                px = bx + box_w - len(pos) - 2
+                if px >= bx + 2 + len(foot) + 1:
+                    try:
+                        stdscr.addstr(by + box_h - 2, px, pos,
+                                      colors.pair(colors.PAIR_MUTED) | curses.A_BOLD)
+                    except curses.error:
+                        pass
             stdscr.refresh()
             return inner_h, total, box_h
 
